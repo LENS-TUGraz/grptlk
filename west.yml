@@ -1,0 +1,15 @@
+manifest:
+  version: 1.2
+
+  self:
+    path: grptlk
+
+  remotes:
+    - name: lens
+      url-base: git@github.com:LENS-TUGraz
+
+  projects:
+    - name: sdk-nrf
+      path: nrf
+      remote: lens
+      revision: v3.1.0-grptlk
