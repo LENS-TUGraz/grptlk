@@ -10,3 +10,6 @@ ehthumbs_vista.db
 .directory
 .Trash-*
 .nfs*
+build
+build-*
+build_*

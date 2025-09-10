@@ -13,3 +13,4 @@ manifest:
       path: nrf
       remote: lens
       revision: v3.1.0-grptlk
+      import: true
