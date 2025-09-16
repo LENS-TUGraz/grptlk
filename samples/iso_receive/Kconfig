@@ -1,0 +1,9 @@
+menuconfig GRPTLK
+	 bool "GRPTLK [EXPERIMENTAL]"
+	 select EXPERIMENTAL
+
+if GRPTLK
+# TODO: Add GRPTLK specific configurations here
+endif # GRPTLK
+	  
+source "Kconfig.zephyr"

@@ -1,5 +1,0 @@
-{
-    "nrf-connect.applications": [
-        "${workspaceFolder}/samples/iso_broadcast"
-    ]
-}
