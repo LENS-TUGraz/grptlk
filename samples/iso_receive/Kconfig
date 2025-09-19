@@ -1,6 +1,7 @@
 menuconfig GRPTLK
-	 bool "GRPTLK [EXPERIMENTAL]"
-	 select EXPERIMENTAL
+	bool "GRPTLK [EXPERIMENTAL]"
+	select EXPERIMENTAL
+	default n
 
 if GRPTLK
 # TODO: Add GRPTLK specific configurations here
