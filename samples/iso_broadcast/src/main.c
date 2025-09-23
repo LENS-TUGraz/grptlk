@@ -215,13 +215,18 @@ int main(void)
 			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 		};
 
-		err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_HOST_TO_CTLR, &hci_path);
-		if (err != 0)
+		uint8_t dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+
+		if (chan == 0)
 		{
-			printk("Failed to setup ISO TX data path: %d\n", err);
+			dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 		}
 
-		// TODO: use BT_HCI_DATAPATH_DIR_CTLR_TO_HOST for all BISes > 0
+		err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
+		if (err != 0)
+		{
+			printk("Failed to setup ISO data path: %d\n", err);
+		}
 
 		printk("Setting data path complete chan %u.\n", chan);
 	}
