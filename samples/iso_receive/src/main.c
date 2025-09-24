@@ -342,21 +342,17 @@ int main(void)
 				.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 			};
 
-			/* Setup all BISes for RX */
-			err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_CTLR_TO_HOST, &hci_path);
+			uint8_t dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+
+			if (chan == 0)
+			{
+				dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+			}
+
+			err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
 			if (err != 0)
 			{
 				printk("Failed to setup ISO RX data path: %d\n", err);
-			}
-
-			/* Setup all BISes != BIS0 also for TX */
-			if (chan > 0)
-			{
-				err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_HOST_TO_CTLR, &hci_path);
-				if (err != 0)
-				{
-					printk("Failed to setup ISO TX data path: %d\n", err);
-				}
 			}
 
 			printk("Setting data path complete chan %u.\n", chan);
