@@ -83,10 +83,54 @@ static struct bt_le_per_adv_sync_cb sync_callbacks = {
 	.biginfo = biginfo_cb,
 };
 
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
+						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
+						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+static uint16_t seq_num;
+static uint32_t iso_send_count = 0U;
+static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
+
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	printk("ISO Channel %p sent data\n", chan);
+	int err;
+	struct net_buf *buf;
+
+	if (iso_send_count > 4) {
+		return;
+	}
+
+	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
+	if (!buf)
+	{
+		printk("Data buffer allocate timeout\n");
+		return;
+	}
+
+	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+	// put 0xdeadbeef into iso_data
+	sys_put_le32(0xdeadbeef, &iso_data[0]);
+	// sys_put_le32(iso_send_count, &iso_data[0]);
+	iso_data[4] = 0x01; /* from BIG creator */
+	iso_data[5] = 0x00; /* BIS index */
+	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+	err = bt_iso_chan_send(chan, buf, seq_num);
+	if (err < 0)
+	{
+		printk("Unable to broadcast data on channel %p : %d", chan, err);
+		net_buf_unref(buf);
+		return;
+	}
+
+	printk("TX: seq_num: %d - payload: %d\n", seq_num, iso_send_count);
+
+	iso_send_count++;
+	seq_num++;
 }
+
+static struct bt_iso_chan *bis[];
+
+static uint32_t iso_recv_count = 0U;
 
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 					 struct net_buf *buf)
@@ -101,9 +145,17 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		from_big_creator = buf->data[4];
 		bis_index = buf->data[5];
 
+		if (iso_recv_count < 12) {
 		printk("Incoming data on BIS %u %s with payload: %u\n",
 			   bis_index, from_big_creator ? "from big creator" : "from other receiver", count);
+		}
 	}
+	if (iso_recv_count > 10)
+	{
+		iso_sent(bis[1]);
+	}
+
+	iso_recv_count++;
 }
 
 static void iso_connected(struct bt_iso_chan *chan)

@@ -34,6 +34,9 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
+	// if (seq_num > 100){
+	// 	return;
+	// }
 	if (chan == bis[0])
 	{
 		int err;
