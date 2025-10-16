@@ -32,6 +32,8 @@ static K_SEM_DEFINE(sem_per_big_info, 0, 1);
 static K_SEM_DEFINE(sem_big_sync, 0, BIS_ISO_CHAN_COUNT);
 static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
 
+static bool iso_datapaths_setup = false;
+
 static void scan_recv(const struct bt_le_scan_recv_info *info,
 					  struct net_buf_simple *buf)
 {
@@ -96,10 +98,6 @@ static void iso_sent(struct bt_iso_chan *chan)
 	int err;
 	struct net_buf *buf;
 
-	if (iso_send_count > 4) {
-		return;
-	}
-
 	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 	if (!buf)
 	{
@@ -108,11 +106,13 @@ static void iso_sent(struct bt_iso_chan *chan)
 	}
 
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	// put 0xdeadbeef into iso_data
-	sys_put_le32(0xdeadbeef, &iso_data[0]);
 	// sys_put_le32(iso_send_count, &iso_data[0]);
-	iso_data[4] = 0x01; /* from BIG creator */
-	iso_data[5] = 0x00; /* BIS index */
+	iso_data[0] = 0xDE;
+	iso_data[1] = 0xAD;
+	iso_data[2] = 0xBE;
+	iso_data[3] = 0xEF;
+	iso_data[4] = 0x00; /* from BIG creator */
+	iso_data[5] = (uint8_t)(iso_send_count % 255); /* BIS index */
 	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0)
@@ -145,12 +145,12 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		from_big_creator = buf->data[4];
 		bis_index = buf->data[5];
 
-		if (iso_recv_count < 12) {
-		printk("Incoming data on BIS %u %s with payload: %u\n",
-			   bis_index, from_big_creator ? "from big creator" : "from other receiver", count);
-		}
+		// if (iso_recv_count < 12) {
+		// printk("Incoming data on BIS %u %s with payload: %u\n",
+		// 	   bis_index, from_big_creator ? "from big creator" : "from other receiver", count);
+		// }
 	}
-	if (iso_recv_count > 10)
+	if (iso_datapaths_setup)
 	{
 		iso_sent(bis[1]);
 	}
@@ -185,6 +185,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
+	.rtn = 2,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 
@@ -408,6 +409,8 @@ int main(void)
 
 			printk("Setting data path complete chan %u.\n", chan);
 		}
+
+		iso_datapaths_setup = true;
 
 		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
 		{
