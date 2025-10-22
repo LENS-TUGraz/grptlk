@@ -4,7 +4,19 @@ menuconfig GRPTLK
 	default n
 
 if GRPTLK
-# TODO: Add GRPTLK specific configurations here
+
+choice GRPTLK_ROLE
+    bool "GRPTLK Role"
+    default GRPTLK_BCST
+
+config GRPTLK_BCST
+    bool "GRPTLK Broadcaster Role"
+
+config GRPTLK_RECV
+    bool "GRPTLK Receiver Role"
+
+endchoice
+
 endif # GRPTLK
-	  
+
 source "Kconfig.zephyr"

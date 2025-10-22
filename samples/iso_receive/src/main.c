@@ -93,8 +93,12 @@ static uint16_t seq_num;
 static uint32_t iso_send_count = 0U;
 static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
 
+static struct bt_iso_chan *bis[];
+
 static void iso_sent(struct bt_iso_chan *chan)
 {
+	iso_datapaths_setup = false; // todo: shitty alignment for sending
+
 	int err;
 	struct net_buf *buf;
 
@@ -128,8 +132,6 @@ static void iso_sent(struct bt_iso_chan *chan)
 	seq_num++;
 }
 
-static struct bt_iso_chan *bis[];
-
 static uint32_t iso_recv_count = 0U;
 
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
@@ -144,15 +146,10 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		count = sys_get_le32(buf->data);
 		from_big_creator = buf->data[4];
 		bis_index = buf->data[5];
-
-		// if (iso_recv_count < 12) {
-		// printk("Incoming data on BIS %u %s with payload: %u\n",
-		// 	   bis_index, from_big_creator ? "from big creator" : "from other receiver", count);
-		// }
 	}
 	if (iso_datapaths_setup)
 	{
-		iso_sent(bis[1]);
+		iso_sent(bis[1]); // only call once to start!
 	}
 
 	iso_recv_count++;
@@ -401,7 +398,7 @@ int main(void)
 				dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
 			}
 
-			err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
+			err = bt_iso_setup_data_path(bis[chan], dir, &hci_path);
 			if (err != 0)
 			{
 				printk("Failed to setup ISO RX data path: %d\n", err);
