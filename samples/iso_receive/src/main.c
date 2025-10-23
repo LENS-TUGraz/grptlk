@@ -6,6 +6,8 @@
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
+#include <math.h>
+#include "lc3.h"
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 #define NAME_LEN 30
@@ -33,6 +35,21 @@ static K_SEM_DEFINE(sem_big_sync, 0, BIS_ISO_CHAN_COUNT);
 static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
 
 static bool iso_datapaths_setup = false;
+
+lc3_encoder_t lc3_encoder;
+lc3_encoder_mem_16k_t lc3_encoder_mem;
+
+#define BROADCAST_SAMPLE_RATE 16000
+#define MAX_SAMPLE_RATE 16000
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+
+static int freq_hz;
+static int frame_duration_us;
+static int frames_per_sdu;
+static int octets_per_frame;
+
+// static K_SEM_DEFINE(lc3_encoder_sem, 0U, 1U);
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
 					  struct net_buf_simple *buf)
@@ -95,12 +112,41 @@ static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
 
 static struct bt_iso_chan *bis[];
 
+static int16_t send_pcm_data[MAX_NUM_SAMPLES];
+
+#define AUDIO_VOLUME (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
+#define AUDIO_TONE_FREQUENCY_HZ 1600
+
+/**
+ * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
+ *
+ * @param buf Destination buffer
+ * @param length_us Length of the buffer in microseconds
+ * @param frequency_hz frequency in Hz
+ * @param sample_rate_hz sample-rate in Hz.
+ */
+static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
+{
+	const int sine_period_samples = sample_rate_hz / frequency_hz;
+	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
+	const float step = 2 * 3.1415f / sine_period_samples;
+
+	for (unsigned int i = 0; i < num_samples; i++)
+	{
+		const float sample = sinf(i * step);
+
+		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
+	}
+}
+
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	iso_datapaths_setup = false; // todo: shitty alignment for sending
 
 	int err;
+	int ret;
 	struct net_buf *buf;
+	// uint8_t lc3_encoded_buffer[40] = {0xFF};
 
 	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 	if (!buf)
@@ -109,14 +155,25 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
+	if (lc3_encoder == NULL)
+	{
+		printk("LC3 encoder not setup, cannot encode data.\n");
+		net_buf_unref(buf);
+		return;
+	}
+
+	// memset(iso_data, 0, sizeof(iso_data));
+
+	ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
+					 octets_per_frame, iso_data);
+	if (ret == -1)
+	{
+		printk("LC3 encoder failed - wrong parameters?: %d", ret);
+		net_buf_unref(buf);
+		return;
+	}
+
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	// sys_put_le32(iso_send_count, &iso_data[0]);
-	iso_data[0] = 0xDE;
-	iso_data[1] = 0xAD;
-	iso_data[2] = 0xBE;
-	iso_data[3] = 0xEF;
-	iso_data[4] = 0x00; /* from BIG creator */
-	iso_data[5] = (uint8_t)(iso_send_count % 255); /* BIS index */
 	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0)
@@ -149,6 +206,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	}
 	if (iso_datapaths_setup)
 	{
+		// k_sem_give(&lc3_encoder_sem);
 		iso_sent(bis[1]); // only call once to start!
 	}
 
@@ -230,6 +288,36 @@ static void reset_semaphores(void)
 	k_sem_reset(&sem_big_sync_lost);
 }
 
+// static void init_lc3_thread(void *arg1, void *arg2, void *arg3)
+// {
+
+// 	printk("Initializing lc3 encoder\n");
+// 	frame_duration_us = 10000;
+// 	freq_hz = 16000;
+// 	octets_per_frame = 40;
+// 	frames_per_sdu = 1;
+
+// 	fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+
+// 	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0,
+// 									&lc3_encoder_mem);
+
+// 	if (lc3_encoder == NULL)
+// 	{
+// 		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+// 		return;
+// 	}
+
+// 	// k_sem_take(&lc3_encoder_sem, K_FOREVER);
+// 	// iso_sent(bis[1]);
+// }
+
+// #define LC3_ENCODER_STACK_SIZE 4 * 4096
+// #define LC3_ENCODER_PRIORITY 5
+
+// K_THREAD_DEFINE(encoder, LC3_ENCODER_STACK_SIZE, init_lc3_thread, NULL, NULL, NULL,
+// 				LC3_ENCODER_PRIORITY, 0, -1);
+
 int main(void)
 {
 	struct bt_le_per_adv_sync_param sync_create_param;
@@ -239,6 +327,23 @@ int main(void)
 	int err;
 
 	printk("Starting GRPTLK Receiver\n");
+
+	printk("Initializing lc3 encoder\n");
+	frame_duration_us = 10000;
+	freq_hz = 16000;
+	octets_per_frame = 40;
+	frames_per_sdu = 1;
+
+	fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+
+	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0,
+									&lc3_encoder_mem);
+
+	if (lc3_encoder == NULL)
+	{
+		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+		return -EIO;
+	}
 
 	/* Initialize the Bluetooth Subsystem */
 	err = bt_enable(NULL);
