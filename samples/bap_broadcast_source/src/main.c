@@ -22,7 +22,7 @@
 #define TOTAL_BUF_NEEDED (BROADCAST_ENQUEUE_COUNT * CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT)
 
 static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
-	BT_AUDIO_LOCATION_FRONT_CENTER | BT_AUDIO_LOCATION_BACK_CENTER,
+	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
 #define BROADCAST_SAMPLE_RATE 16000
@@ -240,9 +240,9 @@ static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 	struct bt_bap_broadcast_source_param create_param = {0};
 	const size_t streams_per_subgroup = ARRAY_SIZE(stream_params) / ARRAY_SIZE(subgroup_param);
 	uint8_t front_center[] = {BT_AUDIO_CODEC_DATA(BT_AUDIO_CODEC_CFG_CHAN_ALLOC,
-												  BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_CENTER))};
+												  BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_LEFT))};
 	uint8_t back_center[] = {BT_AUDIO_CODEC_DATA(BT_AUDIO_CODEC_CFG_CHAN_ALLOC,
-												 BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_BACK_CENTER))};
+												 BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_RIGHT))};
 	int err;
 
 	for (size_t i = 0U; i < ARRAY_SIZE(subgroup_param); i++)
