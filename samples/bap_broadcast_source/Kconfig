@@ -19,4 +19,5 @@ endchoice
 
 endif # GRPTLK
 
+rsource "src/drivers/Kconfig"
 source "Kconfig.zephyr"

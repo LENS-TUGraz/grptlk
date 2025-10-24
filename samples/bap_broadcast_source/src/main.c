@@ -17,6 +17,8 @@
 #include <zephyr/sys/util.h>
 #include <math.h>
 #include "lc3.h"
+#include <zephyr/drivers/i2s.h>
+#include "max9867.h"
 
 #define BROADCAST_ENQUEUE_COUNT 3U
 #define TOTAL_BUF_NEEDED (BROADCAST_ENQUEUE_COUNT * CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT)
@@ -32,6 +34,50 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 
 #define AUDIO_VOLUME (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
 #define AUDIO_TONE_FREQUENCY_HZ 800
+
+#define SAMPLE_NO 16
+#define NUM_BUFFERS 32
+#define PREALLOC_BUFFERS 8
+#define BLOCK_SIZE (sizeof(data))
+
+static int16_t send_pcm_data[MAX_NUM_SAMPLES];
+static int16_t data[SAMPLE_NO * 2] = {};
+
+#define MEM_SLAB_CACHE_ATTR
+
+static char MEM_SLAB_CACHE_ATTR __aligned(WB_UP(32))
+	_k_mem_slab_buf_tx_0_mem_slab[(NUM_BUFFERS)*WB_UP(BLOCK_SIZE)];
+
+static STRUCT_SECTION_ITERABLE(k_mem_slab, tx_0_mem_slab) =
+	Z_MEM_SLAB_INITIALIZER(tx_0_mem_slab, _k_mem_slab_buf_tx_0_mem_slab,
+						   WB_UP(BLOCK_SIZE), NUM_BUFFERS);
+
+/* Stereo frame = L + R, 16-bit each */
+#define I2S_STEREO_FRAME_BYTES (2u * sizeof(int16_t))
+#define I2S_BLOCK_FRAMES (BLOCK_SIZE / I2S_STEREO_FRAME_BYTES)
+
+/* How many PCM samples we actually filled in send_pcm_data */
+static const size_t send_pcm_samples =
+	(MAX_FRAME_DURATION_US * BROADCAST_SAMPLE_RATE) / USEC_PER_SEC;
+
+/* Playback read index into send_pcm_data (mono) */
+static size_t send_pcm_rd = 0;
+
+/* Fill a TX block (stereo-interleaved) from send_pcm_data (mono) */
+static inline void i2s_fill_block_from_send_pcm(int16_t *dst_stereo, size_t frames)
+{
+	for (size_t i = 0; i < frames; i++)
+	{
+		int16_t s = send_pcm_data[send_pcm_rd++];
+		if (send_pcm_rd >= send_pcm_samples)
+		{
+			send_pcm_rd = 0;
+		}
+		/* L, R */
+		*dst_stereo++ = s;
+		*dst_stereo++ = s;
+	}
+}
 
 /**
  * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
@@ -68,7 +114,7 @@ static struct bt_bap_broadcast_source *broadcast_source;
 NET_BUF_POOL_FIXED_DEFINE(tx_pool, TOTAL_BUF_NEEDED, BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
-static int16_t send_pcm_data[MAX_NUM_SAMPLES];
+
 static bool stopping;
 
 static K_SEM_DEFINE(sem_started, 0U, 1U);
@@ -300,6 +346,109 @@ int main(void)
 	struct bt_le_ext_adv *adv;
 	int err;
 
+	for (size_t i = 0U; i < ARRAY_SIZE(send_pcm_data); i++)
+	{
+		/* Initialize mock data */
+		send_pcm_data[i] = i;
+	}
+
+	k_thread_start(encoder);
+
+	struct i2s_config i2s_cfg;
+	const struct device *dev_i2s = DEVICE_DT_GET(DT_ALIAS(i2s_node0));
+
+	err = max9867_init();
+	if (err)
+	{
+		printk("MAX9867 init failed: %d\n", err);
+		return err;
+	}
+
+	if (!device_is_ready(dev_i2s))
+	{
+		printk("I2S device not ready\n");
+		return -ENODEV;
+	}
+
+	/* Configure I2S stream */
+	i2s_cfg.word_size = 16U;
+	i2s_cfg.channels = 2U;
+	i2s_cfg.format = I2S_FMT_DATA_FORMAT_I2S;
+	i2s_cfg.frame_clk_freq = 16000;
+	i2s_cfg.block_size = BLOCK_SIZE;
+	i2s_cfg.timeout = 2000;
+	i2s_cfg.options = I2S_OPT_FRAME_CLK_SLAVE | I2S_OPT_BIT_CLK_SLAVE;
+	i2s_cfg.mem_slab = &tx_0_mem_slab;
+
+	err = i2s_configure(dev_i2s, I2S_DIR_TX, &i2s_cfg);
+	if (err < 0)
+	{
+		printk("Failed to configure I2S stream\n");
+		return err;
+	}
+
+	/* ---- I2S: pre-queue a few TX blocks with the sine ---- */
+	for (int i = 0; i < PREALLOC_BUFFERS; i++)
+	{
+		void *tx_block;
+		int ret = k_mem_slab_alloc(&tx_0_mem_slab, &tx_block, K_FOREVER);
+		if (ret < 0)
+		{
+			printk("I2S: slab alloc failed %d\n", ret);
+			return ret;
+		}
+
+		/* Fill one block worth of stereo frames from send_pcm_data */
+		i2s_fill_block_from_send_pcm((int16_t *)tx_block, I2S_BLOCK_FRAMES);
+
+		/* Queue the block; driver takes ownership and will free it after TX */
+		ret = i2s_write(dev_i2s, tx_block, BLOCK_SIZE);
+		if (ret < 0)
+		{
+			printk("I2S: write prequeue %d failed: %d\n", i, ret);
+			/* Only free on write failure; otherwise driver frees it */
+			k_mem_slab_free(&tx_0_mem_slab, &tx_block);
+			return ret;
+		}
+	}
+
+	/* Start transmission (must be in READY and have data queued) */
+	int ret = i2s_trigger(dev_i2s, I2S_DIR_TX, I2S_TRIGGER_START);
+	if (ret < 0)
+	{
+		printk("I2S: start failed: %d\n", ret);
+		return ret;
+	}
+
+	/* ---- I2S: keep the queue filled ---- */
+	while (1)
+	{
+		void *tx_block;
+
+		/* Try grab a fresh TX block; if none, yield briefly */
+		ret = k_mem_slab_alloc(&tx_0_mem_slab, &tx_block, K_NO_WAIT);
+		if (ret < 0)
+		{
+			k_msleep(1);
+			continue;
+		}
+
+		i2s_fill_block_from_send_pcm((int16_t *)tx_block, I2S_BLOCK_FRAMES);
+
+		/* Keep retrying on EAGAIN (bus busy); driver frees on success */
+		while ((ret = i2s_write(dev_i2s, tx_block, BLOCK_SIZE)) < 0)
+		{
+			if (ret == -EAGAIN)
+			{
+				k_msleep(1);
+				continue;
+			}
+			printk("I2S: write failed: %d\n", ret);
+			k_mem_slab_free(&tx_0_mem_slab, &tx_block);
+			return ret;
+		}
+	}
+
 	err = bt_enable(NULL);
 	if (err)
 	{
@@ -314,14 +463,6 @@ int main(void)
 		printk("Failed to register broadcast source callbacks (err %d)\n", err);
 		return 0;
 	}
-
-	for (size_t i = 0U; i < ARRAY_SIZE(send_pcm_data); i++)
-	{
-		/* Initialize mock data */
-		send_pcm_data[i] = i;
-	}
-
-	k_thread_start(encoder);
 
 	while (true)
 	{
