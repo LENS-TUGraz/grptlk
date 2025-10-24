@@ -63,6 +63,52 @@ static const size_t send_pcm_samples =
 /* Playback read index into send_pcm_data (mono) */
 static size_t send_pcm_rd = 0;
 
+/* ---------- audio format (keep these near your other defines) ---------- */
+#define SAMPLE_RATE_HZ      16000
+#define CHANNELS            2
+#define SAMPLE_BYTES        2   /* 16-bit */
+
+/* Use 10 ms I/O blocks to keep queues moving */
+#define BLOCK_MS            10
+#define BLOCK_BYTES         ((SAMPLE_RATE_HZ * CHANNELS * SAMPLE_BYTES * BLOCK_MS) / 1000)
+
+/* Use one shared slab for both RX and TX (zero-copy) */
+#define SLAB_BLOCKS         12  /* 12 * 10 ms = 120 ms total buffering */
+K_MEM_SLAB_DEFINE_STATIC(i2s_slab, BLOCK_BYTES, SLAB_BLOCKS, 4);
+
+/* ---- Audio format ---- */
+#define SAMPLE_RATE_HZ      16000
+#define CHANNELS            2
+#define SAMPLE_BYTES        2   /* 16-bit */
+
+/* Driver RX block = 10 ms of audio (helps keep RX queue draining) */
+#define BLOCK_MS            10
+#define BLOCK_BYTES         ((SAMPLE_RATE_HZ * CHANNELS * SAMPLE_BYTES * BLOCK_MS) / 1000)
+
+/* RX queue backing storage (driver allocates from this slab) */
+#define RX_BLOCK_COUNT      8   /* 8 * 10 ms = 80 ms buffering in driver */
+K_MEM_SLAB_DEFINE_STATIC(rx_mem_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
+
+/* 1 second circular buffer in RAM to store captured audio */
+#define RING_MS             1000
+#define RING_BYTES          ((SAMPLE_RATE_HZ * CHANNELS * SAMPLE_BYTES * RING_MS) / 1000)
+static uint8_t mic_ring[RING_BYTES];
+static volatile size_t mic_wr = 0; /* write index into ring (bytes) */
+
+static const struct device *i2s = DEVICE_DT_GET(DT_ALIAS(i2s_node0)); /* match your DTS alias */
+
+/* Copy helper that wraps into mic_ring */
+static void ring_write(const uint8_t *src, size_t n)
+{
+    size_t first = MIN(n, RING_BYTES - mic_wr);
+    memcpy(&mic_ring[mic_wr], src, first);
+    size_t remaining = n - first;
+    if (remaining) {
+        memcpy(&mic_ring[0], src + first, remaining);
+    }
+    mic_wr = (mic_wr + n) % RING_BYTES;
+}
+
 /* Fill a TX block (stereo-interleaved) from send_pcm_data (mono) */
 static inline void i2s_fill_block_from_send_pcm(int16_t *dst_stereo, size_t frames)
 {
@@ -370,6 +416,59 @@ int main(void)
 		return -ENODEV;
 	}
 
+
+	/* Configure RX in SLAVE mode (codec provides BCLK/LRCLK) */
+    struct i2s_config rx_cfg = {
+        .word_size      = 16,                       /* bits per sample */
+        .channels       = CHANNELS,
+        .format         = I2S_FMT_DATA_FORMAT_I2S, /* standard I2S */
+        .options        = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+        .frame_clk_freq = SAMPLE_RATE_HZ,          /* sample rate (informational in slave) */
+        .mem_slab       = &rx_mem_slab,            /* driver’s RX queue backing store */
+        .block_size     = BLOCK_BYTES,             /* one 10 ms block */
+        .timeout        = 1000,                    /* ms: read timeout */
+    };
+
+	err = i2s_configure(i2s, I2S_DIR_RX, &rx_cfg);
+if (err) {
+    printk("i2s_configure RX failed: %d\n", err);
+    return err;
+}
+
+/* Do NOT call PREPARE here */
+err = i2s_trigger(i2s, I2S_DIR_RX, I2S_TRIGGER_START);
+if (err) {
+    printk("RX START failed: %d\n", err);
+    return err;
+}
+
+
+    printk("Capturing mic audio into 1s ring buffer...\n");
+
+    /* Scratch buffer big enough for one RX block */
+    uint8_t block_buf[BLOCK_BYTES];
+
+    while (1) {
+        size_t got = sizeof(block_buf);
+        /* Copies one RX block from the driver into block_buf, and frees it internally */
+        err = i2s_buf_read(i2s, block_buf, &got);
+        if (err == 0) {
+            /* Store into circular buffer */
+            ring_write(block_buf, got);
+			// printk("Captured %x %x %x %x ...\n", block_buf[0], block_buf[1], block_buf[2], block_buf[3]);
+        } else if (err == -EAGAIN || err == -EBUSY) {
+            /* No block ready yet / busy, try again shortly */
+            k_sleep(K_USEC(200));
+        } else if (err == -ETIMEDOUT) {
+            /* Driver timeout (depends on cfg.timeout); keep trying */
+            continue;
+        } else {
+            printk("i2s_buf_read error: %d\n", err);
+            break;
+        }
+    }
+
+
 	/* Configure I2S stream */
 	i2s_cfg.word_size = 16U;
 	i2s_cfg.channels = 2U;
@@ -419,6 +518,7 @@ int main(void)
 		printk("I2S: start failed: %d\n", ret);
 		return ret;
 	}
+
 
 	/* ---- I2S: keep the queue filled ---- */
 	while (1)
