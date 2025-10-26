@@ -115,21 +115,21 @@ int max9867_init()
 	}
 	LOG_DBG("Digital mic disabled!");
 
-	err = reg_write(MAX9867_REG_MODE, 0x4C);
+	err = reg_write(MAX9867_REG_MODE, 0x17);
 	if (err) {
 		LOG_ERR("Failed to set mode configuration register!");
 		return -EFAULT;
 	}
 	LOG_DBG("Mode configuration registers set to capacitorless!");
 
-	err = reg_write(MAX9867_REG_L_VOL, 0x11);
+	err = reg_write(MAX9867_REG_L_VOL, 0x17);
 	if (err) {
 		LOG_ERR("Failed to set left volume register!");
 		return -EFAULT;
 	}
 	LOG_DBG("Left volume register set!");
 
-	err = reg_write(MAX9867_REG_R_VOL, 0x11);
+	err = reg_write(MAX9867_REG_R_VOL, 0x22);
 	if (err) {
 		LOG_ERR("Failed to set right volume register!");
 		return -EFAULT;
