@@ -1,0 +1,23 @@
+menuconfig GRPTLK
+	bool "GRPTLK [EXPERIMENTAL]"
+	select EXPERIMENTAL
+	default n
+
+if GRPTLK
+
+choice GRPTLK_ROLE
+    bool "GRPTLK Role"
+    default GRPTLK_BCST
+
+config GRPTLK_BCST
+    bool "GRPTLK Broadcaster Role"
+
+config GRPTLK_RECV
+    bool "GRPTLK Receiver Role"
+
+endchoice
+
+endif # GRPTLK
+
+rsource "src/drivers/Kconfig"
+source "Kconfig.zephyr"
