@@ -6,8 +6,10 @@
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/drivers/i2s.h>
 #include <math.h>
 #include "lc3.h"
+#include "max9867.h"
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 #define NAME_LEN 30
@@ -20,6 +22,33 @@
 #define PA_RETRY_COUNT 6
 
 #define BIS_ISO_CHAN_COUNT 3
+
+static const struct device *i2s_dev;
+
+/* --------------------------- Audio & I2S format --------------------------- */
+
+#define SAMPLE_RATE_HZ 16000 /* 16 kHz */
+#define CHANNELS 2			 /* stereo */
+#define SAMPLE_BYTES 2		 /* 16-bit */
+
+#define BLOCK_MS 10
+#define FRAMES_PER_BLOCK ((SAMPLE_RATE_HZ * BLOCK_MS) / 1000)	 /* 160 frames */
+#define BLOCK_BYTES (FRAMES_PER_BLOCK * CHANNELS * SAMPLE_BYTES) /* 640 B */
+
+/* RX: slab used by the I2S driver (we consume via i2s_buf_read) */
+#define RX_BLOCK_COUNT 24 /* 240 ms RX buffering */
+K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
+
+/* dedicated stacks and TCBs for RX/TX/LC3 threads */
+K_THREAD_STACK_DEFINE(rx_stack, 4096);
+static struct k_thread rx_thread;
+
+/* LC3 needs 10 ms @ 16 kHz = 160 mono samples */
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * SAMPLE_RATE_HZ) / USEC_PER_SEC) /* 160 */
+static int16_t send_pcm_data[MAX_NUM_SAMPLES];	
+
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * MAX_NUM_SAMPLES, 16, 4);
 
 static bool per_adv_found;
 static bool per_adv_lost;
@@ -42,7 +71,7 @@ lc3_encoder_mem_16k_t lc3_encoder_mem;
 #define BROADCAST_SAMPLE_RATE 16000
 #define MAX_SAMPLE_RATE 16000
 #define MAX_FRAME_DURATION_US 10000
-#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+// #define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
 
 static int freq_hz;
 static int frame_duration_us;
@@ -125,19 +154,19 @@ static int16_t send_pcm_data[MAX_NUM_SAMPLES];
  * @param frequency_hz frequency in Hz
  * @param sample_rate_hz sample-rate in Hz.
  */
-static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
-{
-	const int sine_period_samples = sample_rate_hz / frequency_hz;
-	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
-	const float step = 2 * 3.1415f / sine_period_samples;
+// static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
+// {
+// 	const int sine_period_samples = sample_rate_hz / frequency_hz;
+// 	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
+// 	const float step = 2 * 3.1415f / sine_period_samples;
 
-	for (unsigned int i = 0; i < num_samples; i++)
-	{
-		const float sample = sinf(i * step);
+// 	for (unsigned int i = 0; i < num_samples; i++)
+// 	{
+// 		const float sample = sinf(i * step);
 
-		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
-	}
-}
+// 		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
+// 	}
+// }
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
@@ -146,7 +175,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 	int err;
 	int ret;
 	struct net_buf *buf;
-	// uint8_t lc3_encoded_buffer[40] = {0xFF};
+	// static uint8_t lc3_encoded_buffer[40] = {0x00};
 
 	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 	if (!buf)
@@ -164,17 +193,46 @@ static void iso_sent(struct bt_iso_chan *chan)
 
 	// memset(iso_data, 0, sizeof(iso_data));
 
-	ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
-					 octets_per_frame, iso_data);
+	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+
+	/* Try to get a fresh 10 ms mono frame; otherwise keep previous data */
+	int16_t frame[MAX_NUM_SAMPLES];
+	if (k_msgq_get(&pcm_msgq, frame, K_MSEC(2)) == 0)
+	{
+		memcpy(send_pcm_data, frame, sizeof(frame));
+	}
+
+	// printk("send_pcm_data: %x%x%x%x\n", send_pcm_data[0], send_pcm_data[1], send_pcm_data[2], send_pcm_data[3], send_pcm_data[4]);
+	/* else: keep last send_pcm_data contents (avoids popping to silence) */
+
+	uint8_t lc3_encoded_buffer[CONFIG_BT_ISO_TX_MTU];
+	ret = lc3_encode(lc3_encoder,
+						 LC3_PCM_FORMAT_S16,
+						 send_pcm_data, 1,
+						 octets_per_frame,
+						 lc3_encoded_buffer);
 	if (ret == -1)
 	{
-		printk("LC3 encoder failed - wrong parameters?: %d", ret);
+		printk("LC3 encode failed\n");
 		net_buf_unref(buf);
 		return;
 	}
 
-	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+	net_buf_add_mem(buf, lc3_encoded_buffer, sizeof(lc3_encoded_buffer));
+
+
+
+	// ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
+	// 				 octets_per_frame, iso_data);
+	// if (ret == -1)
+	// {
+	// 	printk("LC3 encoder failed - wrong parameters?: %d", ret);
+	// 	net_buf_unref(buf);
+	// 	return;
+	// }
+
+	
+	// net_buf_add_mem(buf, iso_data, sizeof(iso_data));
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0)
 	{
@@ -183,7 +241,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	printk("TX: seq_num: %d - payload: %d\n", seq_num, iso_send_count);
+	// printk("TX: seq_num: %d - payload: %d\n", seq_num, iso_send_count);
 
 	iso_send_count++;
 	seq_num++;
@@ -318,6 +376,54 @@ static void reset_semaphores(void)
 // K_THREAD_DEFINE(encoder, LC3_ENCODER_STACK_SIZE, init_lc3_thread, NULL, NULL, NULL,
 // 				LC3_ENCODER_PRIORITY, 0, -1);
 
+static inline void downmix_stereo_block_to_mono(const int16_t *stereo, int16_t *mono)
+{
+	for (size_t i = 0; i < FRAMES_PER_BLOCK; i++)
+	{
+		int32_t L = stereo[2 * i + 0];
+		int32_t R = stereo[2 * i + 1];
+		mono[i] = (int16_t)((L + R) / 2);
+	}
+}
+
+static void rx_thread_fn(void *p1, void *p2, void *p3)
+{
+	int err;
+	uint8_t stereo_buf[BLOCK_BYTES];
+	int16_t mono_frame[MAX_NUM_SAMPLES];
+
+	printk("RX thread: capturing mic audio...\n");
+	while (1)
+	{
+		size_t got = sizeof(stereo_buf);
+		err = i2s_buf_read(i2s_dev, stereo_buf, &got);
+		if (err == 0 && got == BLOCK_BYTES)
+		{
+			// printk("Received MIC Data: %x %x %x %x ...\n",
+			// 	   stereo_buf[0], stereo_buf[1], stereo_buf[2], stereo_buf[3]);
+			/* Downmix to mono (10 ms) and queue for LC3 */
+			downmix_stereo_block_to_mono((const int16_t *)stereo_buf, mono_frame);
+			if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0)
+			{
+				int16_t drop[MAX_NUM_SAMPLES];
+				(void)k_msgq_get(&pcm_msgq, drop, K_NO_WAIT);
+				(void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
+			}
+		}
+		else if (err == -EAGAIN || err == -EBUSY || err == -ETIMEDOUT)
+		{
+			k_usleep(200);
+		}
+		else
+		{
+			printk("i2s_buf_read error: %d\n", err);
+			break;
+		}
+
+
+	}
+}
+
 int main(void)
 {
 	struct bt_le_per_adv_sync_param sync_create_param;
@@ -328,13 +434,68 @@ int main(void)
 
 	printk("Starting GRPTLK Receiver\n");
 
+	/* Initialize the Bluetooth Subsystem */
+	err = bt_enable(NULL);
+	if (err)
+	{
+		printk("Bluetooth init failed (err %d)\n", err);
+		return 0;
+	}
+
+	/* Init codec (board support) */
+	err = max9867_init();
+	if (err)
+	{
+		printk("MAX9867 init failed: %d\n", err);
+		return 0;
+	}
+
+	i2s_dev = DEVICE_DT_GET(DT_ALIAS(i2s_node0));
+	if (!device_is_ready(i2s_dev))
+	{
+		printk("I2S not ready\n");
+		return 0;
+	}
+
+	struct i2s_config rx_cfg = {
+		.word_size = 16,
+		.channels = CHANNELS,
+		.format = I2S_FMT_DATA_FORMAT_I2S,
+		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+		.frame_clk_freq = SAMPLE_RATE_HZ,
+		.mem_slab = &rx_slab,
+		.block_size = BLOCK_BYTES,
+		.timeout = 1000,
+	};
+
+	err = i2s_configure(i2s_dev, I2S_DIR_RX, &rx_cfg);
+	if (err)
+	{
+		printk("I2S RX cfg failed: %d\n", err);
+		return 0;
+	}
+
+	/* Start BOTH directions together (prevents nrfx I2S state errors). */
+	err = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+	if (err)
+	{
+		printk("I2S DIR_RX START failed: %d\n", err);
+		return 0;
+	}
+
+	k_tid_t rx_tid = k_thread_create(&rx_thread, rx_stack, K_THREAD_STACK_SIZEOF(rx_stack),
+									 rx_thread_fn, NULL, NULL, NULL,
+									 K_PRIO_PREEMPT(4), 0, K_NO_WAIT);
+	k_thread_name_set(rx_tid, "i2s_rx");
+
 	printk("Initializing lc3 encoder\n");
 	frame_duration_us = 10000;
 	freq_hz = 16000;
 	octets_per_frame = 40;
 	frames_per_sdu = 1;
 
-	fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+	// fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+	memset(send_pcm_data, 0, sizeof(send_pcm_data));
 
 	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0,
 									&lc3_encoder_mem);
@@ -343,14 +504,6 @@ int main(void)
 	{
 		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
 		return -EIO;
-	}
-
-	/* Initialize the Bluetooth Subsystem */
-	err = bt_enable(NULL);
-	if (err)
-	{
-		printk("Bluetooth init failed (err %d)\n", err);
-		return 0;
 	}
 
 	printk("Scan callbacks register...");
