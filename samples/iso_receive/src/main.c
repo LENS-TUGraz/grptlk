@@ -19,7 +19,7 @@
 
 #define PA_RETRY_COUNT 6
 
-#define BIS_ISO_CHAN_COUNT 3
+#define BIS_ISO_CHAN_COUNT 5
 
 static bool per_adv_found;
 static bool per_adv_lost;
@@ -139,6 +139,8 @@ static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, in
 	}
 }
 
+static uint8_t payload_ctr = 0;
+
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	iso_datapaths_setup = false; // todo: shitty alignment for sending
@@ -162,16 +164,21 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	// memset(iso_data, 0, sizeof(iso_data));
+	memset(iso_data, 0x30 + payload_ctr, sizeof(iso_data));
 
-	ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
-					 octets_per_frame, iso_data);
-	if (ret == -1)
+	if (++payload_ctr > 0x3)
 	{
-		printk("LC3 encoder failed - wrong parameters?: %d", ret);
-		net_buf_unref(buf);
-		return;
+		payload_ctr = 0;
 	}
+
+	// ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
+	// 				 octets_per_frame, iso_data);
+	// if (ret == -1)
+	// {
+	// 	printk("LC3 encoder failed - wrong parameters?: %d", ret);
+	// 	net_buf_unref(buf);
+	// 	return;
+	// }
 
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
@@ -183,7 +190,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	printk("TX: seq_num: %d - payload: %d\n", seq_num, iso_send_count);
+	printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
 
 	iso_send_count++;
 	seq_num++;
@@ -198,6 +205,9 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	uint8_t from_big_creator = 0;
 	uint8_t bis_index = 0;
 
+	printk("RX: chan %p len %u seq_num %u ts %u flags 0x%02x\n",
+		   chan, buf->len, info->seq_num, info->ts, info->flags);
+
 	if (buf->len == CONFIG_BT_ISO_TX_MTU)
 	{
 		count = sys_get_le32(buf->data);
@@ -207,7 +217,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	if (iso_datapaths_setup)
 	{
 		// k_sem_give(&lc3_encoder_sem);
-		iso_sent(bis[1]); // only call once to start!
+		iso_sent(bis[2]); // only call once to start!
 	}
 
 	iso_recv_count++;
@@ -262,12 +272,22 @@ static struct bt_iso_chan bis_iso_chan[] = {
 		.ops = &iso_ops,
 		.qos = &bis_iso_qos,
 	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
 };
 
 static struct bt_iso_chan *bis[] = {
 	&bis_iso_chan[0],
 	&bis_iso_chan[1],
 	&bis_iso_chan[2],
+	&bis_iso_chan[3],
+	&bis_iso_chan[4],
 };
 
 static struct bt_iso_big_sync_param big_sync_param = {

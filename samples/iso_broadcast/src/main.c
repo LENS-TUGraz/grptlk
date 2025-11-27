@@ -5,7 +5,7 @@
 #define BIG_SDU_INTERVAL_US (10000)
 #define BUF_ALLOC_TIMEOUT_US (BIG_SDU_INTERVAL_US * 2U)
 
-#define BIS_ISO_CHAN_COUNT 3
+#define BIS_ISO_CHAN_COUNT 5
 NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
 						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
@@ -105,12 +105,22 @@ static struct bt_iso_chan bis_iso_chan[] = {
 		.ops = &iso_ops,
 		.qos = &bis_iso_qos,
 	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
 };
 
 static struct bt_iso_chan *bis[] = {
 	&bis_iso_chan[0],
 	&bis_iso_chan[1],
 	&bis_iso_chan[2],
+	&bis_iso_chan[3],
+	&bis_iso_chan[4],
 };
 
 static struct bt_iso_big_create_param big_create_param = {
