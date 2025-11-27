@@ -164,9 +164,9 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	memset(iso_data, 0x30 + payload_ctr, sizeof(iso_data));
+	memset(iso_data, 0x20 + payload_ctr, sizeof(iso_data));
 
-	if (++payload_ctr > 0x3)
+	if (++payload_ctr > 0x2)
 	{
 		payload_ctr = 0;
 	}
@@ -217,7 +217,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	if (iso_datapaths_setup)
 	{
 		// k_sem_give(&lc3_encoder_sem);
-		iso_sent(bis[2]); // only call once to start!
+		iso_sent(bis[1]); // only call once to start!
 	}
 
 	iso_recv_count++;
