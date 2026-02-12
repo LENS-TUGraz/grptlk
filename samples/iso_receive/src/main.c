@@ -9,6 +9,12 @@
 #include <math.h>
 #include "lc3.h"
 
+/* ------------------------------------------------------------------------------- */
+/* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE BROADCASTER  */
+/* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is downlink/rx) */
+#define UPLINK_BIS 3
+/* ------------------------------------------------------------------------------- */
+
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 #define NAME_LEN 30
 
@@ -164,9 +170,8 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	memset(iso_data, 0x20 + payload_ctr, sizeof(iso_data));
-
-	if (++payload_ctr > 0x2)
+	memset(iso_data, 0x50 + payload_ctr, sizeof(iso_data));
+	if (++payload_ctr > 0x5)
 	{
 		payload_ctr = 0;
 	}
@@ -216,8 +221,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	}
 	if (iso_datapaths_setup)
 	{
-		// k_sem_give(&lc3_encoder_sem);
-		iso_sent(bis[1]); // only call once to start!
+		iso_sent(bis[UPLINK_BIS - 1]);
 	}
 
 	iso_recv_count++;
@@ -250,7 +254,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 2,
+	.rtn = 1,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 

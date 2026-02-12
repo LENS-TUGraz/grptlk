@@ -69,8 +69,19 @@ static void iso_sent(struct bt_iso_chan *chan)
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 					 struct net_buf *buf)
 {
-	printk("ISO Channel %p received data: len %u, seq_num %u, ts %u, flags 0x%02x\n", chan,
-		   buf->len, info->seq_num, info->ts, info->flags);
+	printk("ISO Channel %p: ", chan);
+
+	if (buf->len > 0) {
+		uint16_t print_len = (buf->len > 16) ? 16 : buf->len;
+		printk("payload: ");
+		for (uint16_t i = 0; i < print_len; i++) {
+			printk("%02X ", buf->data[i]);
+		}
+		if (buf->len > 16) {
+			printk("... [%u more]", buf->len - 16);
+		}
+	}
+	printk("\n");
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -83,7 +94,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 2,
+	.rtn = 1,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 
