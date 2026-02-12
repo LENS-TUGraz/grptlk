@@ -5,7 +5,7 @@
 #define BIG_SDU_INTERVAL_US (10000)
 #define BUF_ALLOC_TIMEOUT_US (BIG_SDU_INTERVAL_US * 2U)
 
-#define BIS_ISO_CHAN_COUNT 3
+#define BIS_ISO_CHAN_COUNT 5
 NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
 						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
@@ -69,8 +69,19 @@ static void iso_sent(struct bt_iso_chan *chan)
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 					 struct net_buf *buf)
 {
-	printk("ISO Channel %p received data: len %u, seq_num %u, ts %u, flags 0x%02x\n", chan,
-		   buf->len, info->seq_num, info->ts, info->flags);
+	printk("ISO Channel %p: ", chan);
+
+	if (buf->len > 0) {
+		uint16_t print_len = (buf->len > 16) ? 16 : buf->len;
+		printk("payload: ");
+		for (uint16_t i = 0; i < print_len; i++) {
+			printk("%02X ", buf->data[i]);
+		}
+		if (buf->len > 16) {
+			printk("... [%u more]", buf->len - 16);
+		}
+	}
+	printk("\n");
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -83,7 +94,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 0,
+	.rtn = 1,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 
@@ -105,12 +116,22 @@ static struct bt_iso_chan bis_iso_chan[] = {
 		.ops = &iso_ops,
 		.qos = &bis_iso_qos,
 	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
 };
 
 static struct bt_iso_chan *bis[] = {
 	&bis_iso_chan[0],
 	&bis_iso_chan[1],
 	&bis_iso_chan[2],
+	&bis_iso_chan[3],
+	&bis_iso_chan[4],
 };
 
 static struct bt_iso_big_create_param big_create_param = {
@@ -215,13 +236,18 @@ int main(void)
 			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 		};
 
-		err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_HOST_TO_CTLR, &hci_path);
-		if (err != 0)
+		uint8_t dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+
+		if (chan == 0)
 		{
-			printk("Failed to setup ISO TX data path: %d\n", err);
+			dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 		}
 
-		// TODO: use BT_HCI_DATAPATH_DIR_CTLR_TO_HOST for all BISes > 0
+		err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
+		if (err != 0)
+		{
+			printk("Failed to setup ISO data path: %d\n", err);
+		}
 
 		printk("Setting data path complete chan %u.\n", chan);
 	}

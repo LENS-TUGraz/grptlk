@@ -6,6 +6,14 @@
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
+#include <math.h>
+#include "lc3.h"
+
+/* ------------------------------------------------------------------------------- */
+/* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE BROADCASTER  */
+/* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is downlink/rx) */
+#define UPLINK_BIS 3
+/* ------------------------------------------------------------------------------- */
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 #define NAME_LEN 30
@@ -17,7 +25,7 @@
 
 #define PA_RETRY_COUNT 6
 
-#define BIS_ISO_CHAN_COUNT 3
+#define BIS_ISO_CHAN_COUNT 5
 
 static bool per_adv_found;
 static bool per_adv_lost;
@@ -31,6 +39,23 @@ static K_SEM_DEFINE(sem_per_sync_lost, 0, 1);
 static K_SEM_DEFINE(sem_per_big_info, 0, 1);
 static K_SEM_DEFINE(sem_big_sync, 0, BIS_ISO_CHAN_COUNT);
 static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
+
+static bool iso_datapaths_setup = false;
+
+lc3_encoder_t lc3_encoder;
+lc3_encoder_mem_16k_t lc3_encoder_mem;
+
+#define BROADCAST_SAMPLE_RATE 16000
+#define MAX_SAMPLE_RATE 16000
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+
+static int freq_hz;
+static int frame_duration_us;
+static int frames_per_sdu;
+static int octets_per_frame;
+
+// static K_SEM_DEFINE(lc3_encoder_sem, 0U, 1U);
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
 					  struct net_buf_simple *buf)
@@ -83,10 +108,100 @@ static struct bt_le_per_adv_sync_cb sync_callbacks = {
 	.biginfo = biginfo_cb,
 };
 
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
+						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
+						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
+
+static uint16_t seq_num;
+static uint32_t iso_send_count = 0U;
+static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
+
+static struct bt_iso_chan *bis[];
+
+static int16_t send_pcm_data[MAX_NUM_SAMPLES];
+
+#define AUDIO_VOLUME (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
+#define AUDIO_TONE_FREQUENCY_HZ 1600
+
+/**
+ * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
+ *
+ * @param buf Destination buffer
+ * @param length_us Length of the buffer in microseconds
+ * @param frequency_hz frequency in Hz
+ * @param sample_rate_hz sample-rate in Hz.
+ */
+static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
+{
+	const int sine_period_samples = sample_rate_hz / frequency_hz;
+	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
+	const float step = 2 * 3.1415f / sine_period_samples;
+
+	for (unsigned int i = 0; i < num_samples; i++)
+	{
+		const float sample = sinf(i * step);
+
+		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
+	}
+}
+
+static uint8_t payload_ctr = 0;
+
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	printk("ISO Channel %p sent data\n", chan);
+	iso_datapaths_setup = false; // todo: shitty alignment for sending
+
+	int err;
+	int ret;
+	struct net_buf *buf;
+	// uint8_t lc3_encoded_buffer[40] = {0xFF};
+
+	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
+	if (!buf)
+	{
+		printk("Data buffer allocate timeout\n");
+		return;
+	}
+
+	if (lc3_encoder == NULL)
+	{
+		printk("LC3 encoder not setup, cannot encode data.\n");
+		net_buf_unref(buf);
+		return;
+	}
+
+	memset(iso_data, 0x50 + payload_ctr, sizeof(iso_data));
+	if (++payload_ctr > 0x5)
+	{
+		payload_ctr = 0;
+	}
+
+	// ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
+	// 				 octets_per_frame, iso_data);
+	// if (ret == -1)
+	// {
+	// 	printk("LC3 encoder failed - wrong parameters?: %d", ret);
+	// 	net_buf_unref(buf);
+	// 	return;
+	// }
+
+	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+	net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+	err = bt_iso_chan_send(chan, buf, seq_num);
+	if (err < 0)
+	{
+		printk("Unable to broadcast data on channel %p : %d", chan, err);
+		net_buf_unref(buf);
+		return;
+	}
+
+	printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
+
+	iso_send_count++;
+	seq_num++;
 }
+
+static uint32_t iso_recv_count = 0U;
 
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 					 struct net_buf *buf)
@@ -95,15 +210,21 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	uint8_t from_big_creator = 0;
 	uint8_t bis_index = 0;
 
+	printk("RX: chan %p len %u seq_num %u ts %u flags 0x%02x\n",
+		   chan, buf->len, info->seq_num, info->ts, info->flags);
+
 	if (buf->len == CONFIG_BT_ISO_TX_MTU)
 	{
 		count = sys_get_le32(buf->data);
 		from_big_creator = buf->data[4];
 		bis_index = buf->data[5];
-
-		printk("Incoming data on BIS %u %s with payload: %u\n",
-			   bis_index, from_big_creator ? "from big creator" : "from other receiver", count);
 	}
+	if (iso_datapaths_setup)
+	{
+		iso_sent(bis[UPLINK_BIS - 1]);
+	}
+
+	iso_recv_count++;
 }
 
 static void iso_connected(struct bt_iso_chan *chan)
@@ -133,7 +254,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 0,
+	.rtn = 1,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 
@@ -155,12 +276,22 @@ static struct bt_iso_chan bis_iso_chan[] = {
 		.ops = &iso_ops,
 		.qos = &bis_iso_qos,
 	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
+	{
+		.ops = &iso_ops,
+		.qos = &bis_iso_qos,
+	},
 };
 
 static struct bt_iso_chan *bis[] = {
 	&bis_iso_chan[0],
 	&bis_iso_chan[1],
 	&bis_iso_chan[2],
+	&bis_iso_chan[3],
+	&bis_iso_chan[4],
 };
 
 static struct bt_iso_big_sync_param big_sync_param = {
@@ -181,6 +312,36 @@ static void reset_semaphores(void)
 	k_sem_reset(&sem_big_sync_lost);
 }
 
+// static void init_lc3_thread(void *arg1, void *arg2, void *arg3)
+// {
+
+// 	printk("Initializing lc3 encoder\n");
+// 	frame_duration_us = 10000;
+// 	freq_hz = 16000;
+// 	octets_per_frame = 40;
+// 	frames_per_sdu = 1;
+
+// 	fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+
+// 	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0,
+// 									&lc3_encoder_mem);
+
+// 	if (lc3_encoder == NULL)
+// 	{
+// 		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+// 		return;
+// 	}
+
+// 	// k_sem_take(&lc3_encoder_sem, K_FOREVER);
+// 	// iso_sent(bis[1]);
+// }
+
+// #define LC3_ENCODER_STACK_SIZE 4 * 4096
+// #define LC3_ENCODER_PRIORITY 5
+
+// K_THREAD_DEFINE(encoder, LC3_ENCODER_STACK_SIZE, init_lc3_thread, NULL, NULL, NULL,
+// 				LC3_ENCODER_PRIORITY, 0, -1);
+
 int main(void)
 {
 	struct bt_le_per_adv_sync_param sync_create_param;
@@ -190,6 +351,23 @@ int main(void)
 	int err;
 
 	printk("Starting GRPTLK Receiver\n");
+
+	printk("Initializing lc3 encoder\n");
+	frame_duration_us = 10000;
+	freq_hz = 16000;
+	octets_per_frame = 40;
+	frames_per_sdu = 1;
+
+	fill_audio_buf_sin(send_pcm_data, frame_duration_us, AUDIO_TONE_FREQUENCY_HZ, freq_hz);
+
+	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0,
+									&lc3_encoder_mem);
+
+	if (lc3_encoder == NULL)
+	{
+		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+		return -EIO;
+	}
 
 	/* Initialize the Bluetooth Subsystem */
 	err = bt_enable(NULL);
@@ -342,25 +520,23 @@ int main(void)
 				.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 			};
 
-			/* Setup all BISes for RX */
-			err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_CTLR_TO_HOST, &hci_path);
+			uint8_t dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+
+			if (chan == 0)
+			{
+				dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+			}
+
+			err = bt_iso_setup_data_path(bis[chan], dir, &hci_path);
 			if (err != 0)
 			{
 				printk("Failed to setup ISO RX data path: %d\n", err);
 			}
 
-			/* Setup all BISes != BIS0 also for TX */
-			if (chan > 0)
-			{
-				err = bt_iso_setup_data_path(&bis_iso_chan[chan], BT_HCI_DATAPATH_DIR_HOST_TO_CTLR, &hci_path);
-				if (err != 0)
-				{
-					printk("Failed to setup ISO TX data path: %d\n", err);
-				}
-			}
-
 			printk("Setting data path complete chan %u.\n", chan);
 		}
+
+		iso_datapaths_setup = true;
 
 		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
 		{
