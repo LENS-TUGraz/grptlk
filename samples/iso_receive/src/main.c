@@ -12,7 +12,7 @@
 /* ------------------------------------------------------------------------------- */
 /* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE BROADCASTER  */
 /* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is downlink/rx) */
-#define UPLINK_BIS 3
+#define UPLINK_BIS 2
 /* ------------------------------------------------------------------------------- */
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
@@ -170,11 +170,8 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	memset(iso_data, 0x50 + payload_ctr, sizeof(iso_data));
-	if (++payload_ctr > 0x5)
-	{
-		payload_ctr = 0;
-	}
+	memset(iso_data, payload_ctr, sizeof(iso_data));
+	payload_ctr++;
 
 	// ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
 	// 				 octets_per_frame, iso_data);
@@ -195,7 +192,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
+	// printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
 
 	iso_send_count++;
 	seq_num++;
@@ -210,8 +207,21 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	uint8_t from_big_creator = 0;
 	uint8_t bis_index = 0;
 
-	printk("RX: chan %p len %u seq_num %u ts %u flags 0x%02x\n",
-		   chan, buf->len, info->seq_num, info->ts, info->flags);
+	// printk("RX: chan %p len %u seq_num %u ts %u flags 0x%02x\n",
+	// 	   chan, buf->len, info->seq_num, info->ts, info->flags);
+
+	printk("ISO_RECV RX %p: ", chan);
+	if (buf->len > 0) {
+		uint16_t print_len = (buf->len > 16) ? 16 : buf->len;
+		printk("payload: ");
+		for (uint16_t i = 0; i < print_len; i++) {
+			printk("%02X ", buf->data[i]);
+		}
+		if (buf->len > 16) {
+			printk("... [%u more]", buf->len - 16);
+		}
+	}
+	printk("\n");
 
 	if (buf->len == CONFIG_BT_ISO_TX_MTU)
 	{
