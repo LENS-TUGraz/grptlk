@@ -49,9 +49,10 @@ static void iso_sent(struct bt_iso_chan *chan)
 		}
 
 		net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-		sys_put_le32(iso_send_count, &iso_data[0]);
-		iso_data[4] = 0x01; /* from BIG creator */
-		iso_data[5] = 0x00; /* BIS index */
+		// sys_put_le32(iso_send_count, &iso_data[0]);
+		// iso_data[4] = 0x01; /* from BIG creator */
+		// iso_data[5] = 0x00; /* BIS index */
+		memset(iso_data, 1, sizeof(iso_data));
 		net_buf_add_mem(buf, iso_data, sizeof(iso_data));
 		err = bt_iso_chan_send(chan, buf, seq_num);
 		if (err < 0)
@@ -96,7 +97,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 5,
+	.rtn = 2,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 

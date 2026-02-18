@@ -12,7 +12,7 @@
 /* ------------------------------------------------------------------------------- */
 /* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE BROADCASTER  */
 /* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is downlink/rx) */
-#define UPLINK_BIS 2
+#define UPLINK_BIS 3
 /* ------------------------------------------------------------------------------- */
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
