@@ -6,7 +6,9 @@
 #define BUF_ALLOC_TIMEOUT_US (BIG_SDU_INTERVAL_US * 2U)
 
 #define BIS_ISO_CHAN_COUNT 5
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
+#define NUM_PRIME_PACKETS 2
+
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
 						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
@@ -252,6 +254,7 @@ int main(void)
 		printk("Setting data path complete chan %u.\n", chan);
 	}
 
-	/* Start Streaming */
-	iso_sent(bis[0]);
+	for (int i = 0; i < NUM_PRIME_PACKETS; i++) {
+		iso_sent(bis[0]);
+	}
 }
