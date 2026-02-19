@@ -18,6 +18,7 @@
 #include "lc3.h"
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/i2s.h>
 #include "drivers/max9867.h"
 
 /* -------------------------------------------------------------------------- */
@@ -130,6 +131,73 @@ static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
 /*                               Volume Control                               */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/*                               I2S / Audio Output                           */
+/* -------------------------------------------------------------------------- */
+
+static const struct device *i2s_dev;
+
+#define SAMPLE_RATE_HZ 16000
+#define CHANNELS 2			 /* stereo */
+#define SAMPLE_BYTES 2		 /* 16-bit */
+#define BLOCK_MS 10
+#define FRAMES_PER_BLOCK ((SAMPLE_RATE_HZ * BLOCK_MS) / 1000)	 /* 160 frames */
+#define BLOCK_BYTES (FRAMES_PER_BLOCK * CHANNELS * SAMPLE_BYTES) /* 640 B */
+
+/* TX: slab fed to i2s_write (driver frees after TX) */
+#define TX_BLOCK_COUNT 4
+K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
+
+/* Queue for passing decoded audio to I2S TX */
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 4, 4);
+
+/* I2S TX Thread */
+static void tx_thread_fn(void *p1, void *p2, void *p3)
+{
+	int err;
+	int ret;
+	printk("TX thread: running\n");
+
+	while (1)
+	{
+		uint8_t in[BLOCK_BYTES];
+		/* Check for decoded audio - non-blocking */
+		/* If no audio ready (e.g. not coupled or packet drop), send silence */
+		if (k_msgq_get(&tx_msgq, in, K_NO_WAIT) != 0) {
+			memset(in, 0, BLOCK_BYTES);
+		}
+
+		void *txblk;
+		/* Block until a slab is free (throttles thread to I2S consumption rate) */
+		err = k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER);
+		if (err) {
+			printk("TX slab alloc failed\n");
+			continue;
+		}
+		memcpy(txblk, in, BLOCK_BYTES);
+
+		/* Blocking write to I2S */
+		while ((ret = i2s_write(i2s_dev, txblk, BLOCK_BYTES)) == -EAGAIN)
+		{
+			k_msleep(1);
+		}
+		if (ret < 0)
+		{
+			printk("I2S TX write failed: %d\n", ret);
+			k_mem_slab_free(&tx_slab, &txblk);
+		}
+		/* success: driver frees txblk after sending */
+	}
+}
+
+
+K_THREAD_STACK_DEFINE(tx_stack, 2048);
+static struct k_thread tx_thread_data;
+
+/* -------------------------------------------------------------------------- */
+/*                               Volume Control                               */
+/* -------------------------------------------------------------------------- */
+
 static const struct adc_dt_spec pot = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), potentiometer);
 static const struct gpio_dt_spec p1_09_en = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), enable_gpios);
 
@@ -227,6 +295,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
     int ret;
     uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
+	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2]; /* 160 * 2 */
     
     /* 16_2_1 implies 40 bytes per frame */
     int octets_per_frame = preset_active.qos.sdu;
@@ -250,12 +319,26 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
         if (ret != 0) {
             printk("LC3 decode failed: %d\n", ret);
+			/* Send silence on failure? */
+			memset(stereo_buf, 0, sizeof(stereo_buf));
         } else {
-            /* Successfully decoded */
-            /* Print first sample to verify audio content */
-            printk("Decoded Frame: %d samples. First sample: %d\n", 
-                   PCM_SAMPLES_PER_FRAME, recv_pcm_data[0]);
+            /* Successfully decoded - recv_pcm_data contains 160 mono samples */
+            
+			/* Upmix Mono to Stereo for MAX9867 (L=R) */
+			for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+				stereo_buf[2 * i] = recv_pcm_data[i];     /* Left */
+				stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
+			}
         }
+		
+		/* Push to I2S TX queue */
+		/* If queue is full, we drop the oldest or just block? 
+		   Since we are real-time, we should try to keep up. 
+		   K_NO_WAIT and ignore error effectively drops if full. */
+		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
+			/* Queue full - audio glitch inevitable */
+			// printk("TX Q Full\n");
+		}
     }
 }
 
@@ -539,6 +622,61 @@ int main(void)
 		printk("MAX9867 init failed: %d\n", err);
 		/* Continue anyway, maybe just using internal audio or debug */
 	}
+
+	/* --- I2S Setup --- */
+	i2s_dev = DEVICE_DT_GET(DT_ALIAS(i2s_node0));
+	if (!device_is_ready(i2s_dev))
+	{
+		printk("I2S not ready\n");
+		return -EIO;
+	}
+
+	struct i2s_config tx_cfg = {
+		.word_size = 16,
+		.channels = CHANNELS,
+		.format = I2S_FMT_DATA_FORMAT_I2S,
+		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+		.frame_clk_freq = SAMPLE_RATE_HZ,
+		.mem_slab = &tx_slab,
+		.block_size = BLOCK_BYTES,
+		.timeout = 1000,
+	};
+
+	err = i2s_configure(i2s_dev, I2S_DIR_TX, &tx_cfg);
+	if (err)
+	{
+		printk("I2S TX cfg failed: %d\n", err);
+		return -EIO;
+	}
+
+	/* Prefill silent TX blocks so I2S has data to start with */
+	for (int i = 0; i < 2; i++)
+	{
+		void *txblk;
+		if (k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER) == 0) {
+			memset(txblk, 0, BLOCK_BYTES);
+			err = i2s_write(i2s_dev, txblk, BLOCK_BYTES);
+			if (err < 0) {
+				printk("I2S prefill failed: %d\n", err);
+				k_mem_slab_free(&tx_slab, &txblk);
+			}
+		}
+	}
+
+	/* Start I2S TX */
+	err = i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+	if (err)
+	{
+		printk("I2S DIR_TX START failed: %d\n", err);
+		return -EIO;
+	}
+
+	/* Start I2S TX Thread */
+	k_thread_create(&tx_thread_data, tx_stack,
+					K_THREAD_STACK_SIZEOF(tx_stack),
+					tx_thread_fn, NULL, NULL, NULL,
+					6, 0, K_NO_WAIT);
+	k_thread_name_set(&tx_thread_data, "i2s_tx");
 
 	/* --- LC3 Setup --- */
 	printk("Initializing lc3 decoder\n");
