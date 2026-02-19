@@ -1,14 +1,73 @@
+#include "lc3.h"
 #include <stdint.h>
+#include <zephyr/bluetooth/audio/audio.h>
+#include <zephyr/bluetooth/audio/bap.h>
+#include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
-#include <zephyr/bluetooth/audio/audio.h>
-#include <zephyr/bluetooth/audio/bap.h>
-#include <zephyr/bluetooth/audio/bap_lc3_preset.h>
+/* -------------------------------------------------------------------------- */
+/*                               Configuration                                */
+/* -------------------------------------------------------------------------- */
 
+/* Active BAP Preset */
+/* We use the 16_2_1 preset: 16 kHz, 10 ms framing, 40 octets per frame.
+ * This macro defines the QoS and Codec Configuration used by the stack.
+ * All other audio parameters (buffer sizes, encoder setup) are derived from
+ * this.
+ */
+static struct bt_bap_lc3_preset preset_active =
+    BT_BAP_LC3_BROADCAST_PRESET_16_2_1(BT_AUDIO_LOCATION_FRONT_LEFT |
+                                           BT_AUDIO_LOCATION_FRONT_RIGHT,
+                                       BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
+
+/* Derived Audio Parameters */
+/*
+ * 16_2_1 => 16000 Hz, 10000 us duration.
+ * Samples per frame = (16000 * 10000) / 1000000 = 160.
+ * We must use a constant for the array size.
+ */
+#define PCM_SAMPLES_PER_FRAME 160
+
+/* Encoder Thread Configuration */
+#define ENCODER_STACK_SIZE 4096
+#define ENCODER_PRIORITY 5
+
+/* ISO / BAP Configuration */
 #define NUM_PRIME_PACKETS 2
 
+/* -------------------------------------------------------------------------- */
+/*                               Globals & Objects                            */
+/* -------------------------------------------------------------------------- */
+
+/* BAP Objects */
+static struct bt_bap_broadcast_source *broadcast_source;
+static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+
+static const struct bt_data ad[] = {
+    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
+            sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
+/* LC3 Encoder Objects */
+static lc3_encoder_t lc3_encoder;
+static lc3_encoder_mem_16k_t lc3_encoder_mem;
+static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
+
+/* Encoder Thread Objects */
+K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
+static struct k_thread encoder_thread_data;
+static uint8_t audio_ctr = 0;
+
+/* Encoded Audio FIFO */
+/* Size of 2 ensures double buffering: one being sent, one being prepared.
+ * This minimizes latency (keeping buffer shallow) while preventing underruns.
+ * For true low latency, this queue should be kept as empty as possible.
+ */
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
+
+/* ISO / BAP Objects */
 NET_BUF_POOL_FIXED_DEFINE(
     bis_tx_pool, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT *NUM_PRIME_PACKETS,
     BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU), CONFIG_BT_CONN_TX_USER_DATA_SIZE,
@@ -16,10 +75,81 @@ NET_BUF_POOL_FIXED_DEFINE(
 
 static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
 
-static struct bt_iso_chan *bis[];
+static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+static struct bt_iso_chan
+    bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 
 static uint16_t seq_num;
 static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
+
+static struct bt_iso_big_create_param big_create_param = {
+    .num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
+    .bis_channels = bis,
+    .packing = BT_ISO_PACKING_SEQUENTIAL,
+    .framing = BT_ISO_FRAMING_UNFRAMED,
+};
+
+static struct bt_iso_chan_io_qos iso_rx_qos;
+static struct bt_iso_chan_io_qos iso_tx_qos = {
+    .sdu = CONFIG_BT_ISO_TX_MTU,
+    .phy = BT_GAP_LE_PHY_2M,
+};
+
+static struct bt_iso_chan_qos bis_iso_qos = {
+    .tx = &iso_tx_qos,
+    .rx = &iso_rx_qos,
+};
+
+/* -------------------------------------------------------------------------- */
+/*                               Encoder Thread                               */
+/* -------------------------------------------------------------------------- */
+
+static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
+  int ret;
+  uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
+
+  /* Extract encoding parameters from the active BAP preset */
+  /* Note: These must match the lc3_setup_encoder parameters used in main */
+  /* 16_2_1 implies 40 bytes per frame */
+  int octets_per_frame = preset_active.qos.sdu;
+
+  while (1) {
+    /* In a real app with I2S microphone input:
+       - This thread would block waiting for a full PCM buffer from the I2S
+       driver (via k_msgq_get or k_sem_take).
+       - This ensures the encoding rate matches the hardware sampling rate
+       exactly (16kHz).
+       - Without I2S blocking, this loop runs as fast as the consumer drains the
+       queue.
+     */
+
+    /*
+     * Throttle generation to avoid buffer overrun if the consumption is slow
+     * (though k_msgq_put blocking handles this too)
+     */
+
+    memset(send_pcm_data, audio_ctr++, sizeof(send_pcm_data));
+
+    ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
+                     octets_per_frame, encoded_buf);
+
+    if (ret == -1) {
+      printk("LC3 encode failed in thread\n");
+      k_sleep(K_MSEC(10));
+      continue;
+    }
+
+    /* Push to queue, blocking if full (flow control) */
+    ret = k_msgq_put(&lc3_encoded_q, encoded_buf, K_FOREVER);
+    if (ret != 0) {
+      printk("Failed to put encoded frame: %d\n", ret);
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               ISO Callbacks                                */
+/* -------------------------------------------------------------------------- */
 
 static void iso_connected(struct bt_iso_chan *chan) {
   printk("ISO Channel %p connected\n", chan);
@@ -43,8 +173,21 @@ static void iso_sent(struct bt_iso_chan *chan) {
     }
 
     net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-    memset(iso_data, 1, sizeof(iso_data));
-    net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+
+    int ret;
+    uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
+
+    /* Fetch already encoded frame from queue (non-blocking) */
+    ret = k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT);
+    if (ret == 0) {
+      net_buf_add_mem(buf, enc_data, sizeof(enc_data));
+    } else {
+      /* Underrun: Send silence or dummy data */
+      // printk("TX underrun!\n");
+      memset(iso_data, 0, sizeof(iso_data));
+      net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+    }
+
     err = bt_iso_chan_send(chan, buf, seq_num);
     if (err < 0) {
       printk("Unable to broadcast data on channel %p : %d\n", chan, err);
@@ -68,40 +211,9 @@ static struct bt_iso_chan_ops iso_ops = {
     .recv = iso_recv,
 };
 
-static struct bt_iso_chan_io_qos iso_rx_qos;
-static struct bt_iso_chan_io_qos iso_tx_qos = {
-    .sdu = CONFIG_BT_ISO_TX_MTU,
-    .rtn = 0,
-    .phy = BT_GAP_LE_PHY_2M,
-};
-
-static struct bt_iso_chan_qos bis_iso_qos = {
-    .tx = &iso_tx_qos,
-    .rx = &iso_rx_qos,
-};
-
-static struct bt_iso_chan
-    bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
-static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
-
-static struct bt_iso_big_create_param big_create_param = {
-    .num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
-    .bis_channels = bis,
-    .packing = BT_ISO_PACKING_SEQUENTIAL,
-    .framing = BT_ISO_FRAMING_UNFRAMED,
-};
-
-static const struct bt_data ad[] = {
-    BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-            sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
-
-static struct bt_bap_broadcast_source *broadcast_source;
-static struct bt_bap_lc3_preset preset_active =
-    BT_BAP_LC3_BROADCAST_PRESET_16_2_1(BT_AUDIO_LOCATION_FRONT_LEFT |
-                                           BT_AUDIO_LOCATION_FRONT_RIGHT,
-                                       BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+/* -------------------------------------------------------------------------- */
+/*                               Setup Helpers                                */
+/* -------------------------------------------------------------------------- */
 
 static int setup_broadcast_source(struct bt_bap_broadcast_source **source) {
   struct bt_bap_broadcast_source_stream_param
@@ -261,6 +373,10 @@ static void prime_and_start_iso_transmission(void) {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/*                               Main Function                                */
+/* -------------------------------------------------------------------------- */
+
 int main(void) {
   struct bt_le_ext_adv *adv;
   struct bt_iso_big *big;
@@ -268,6 +384,30 @@ int main(void) {
 
   printk("Starting GRPTLK Broadcaster\n");
 
+  /* --- LC3 Setup --- */
+  printk("Initializing lc3 encoder\n");
+  memset(send_pcm_data, 0, sizeof(send_pcm_data));
+
+  /* Using parameters derived from the active BAP preset
+     - Dur: preset_active.qos.interval (10ms for 16_2_1)
+     - Hz:  16000 (implied by 16_2_1, cannot be easily extracted at runtime
+     without parsing)
+  */
+  lc3_encoder =
+      lc3_setup_encoder(preset_active.qos.interval, 16000, 0, &lc3_encoder_mem);
+
+  if (lc3_encoder == NULL) {
+    printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+    return -EIO;
+  }
+
+  /* Start encoding thread */
+  k_thread_create(&encoder_thread_data, encoder_stack,
+                  K_THREAD_STACK_SIZEOF(encoder_stack), encoder_thread_func,
+                  NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
+  k_thread_name_set(&encoder_thread_data, "lc3_encoder");
+
+  /* --- Bluetooth Setup --- */
   err = bt_enable(NULL);
   if (err) {
     printk("Bluetooth init failed (err %d)\n", err);
