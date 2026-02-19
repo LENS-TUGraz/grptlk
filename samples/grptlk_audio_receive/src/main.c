@@ -16,6 +16,9 @@
 #include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 #include <zephyr/sys/byteorder.h>
 #include "lc3.h"
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/i2c.h>
+#include "drivers/max9867.h"
 
 /* -------------------------------------------------------------------------- */
 /*                               Configuration                                */
@@ -122,6 +125,99 @@ static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 
 static uint16_t seq_num;
 static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
+
+/* -------------------------------------------------------------------------- */
+/*                               Volume Control                               */
+/* -------------------------------------------------------------------------- */
+
+static const struct adc_dt_spec pot = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), potentiometer);
+static const struct gpio_dt_spec p1_09_en = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), enable_gpios);
+
+void volume_control_thread(void *p1, void *p2, void *p3)
+{
+/* --- Tuning knobs --- */
+#define POT_MUTE_ON_MV 100	/* mute when <= 0.10 V */
+#define POT_MUTE_OFF_MV 120 /* unmute when >= 0.12 V (hysteresis) */
+#define POT_MAX_MV 3300		/* clamp top of range */
+#define MAX_VOL_Q15 13668	/* cap at ~50% */
+
+	static bool muted = true;
+
+	int err;
+	int16_t sample;
+	struct adc_sequence seq = {0}; 
+
+	/* Initialize sequence from DT spec, then point it to our buffer */
+	adc_sequence_init_dt(&pot, &seq);
+	seq.buffer = &sample;
+	seq.buffer_size = sizeof(sample);
+
+	while (1)
+	{
+		err = adc_read_dt(&pot, &seq);
+		if (err)
+		{
+			printk("adc_read_dt() failed: %d\n", err);
+			k_sleep(K_MSEC(200));
+			continue;
+		}
+
+		int32_t mv = sample; /* promote to 32-bit for conversion helpers */
+		err = adc_raw_to_millivolts_dt(&pot, &mv);
+		if (err)
+		{
+			printk("adc_raw_to_millivolts_dt() failed: %d (raw=%d)\n", err, sample);
+			k_sleep(K_MSEC(200));
+			continue;
+		}
+
+		/* --- NEW: enable pin high iff pot > 0 mV --- */
+		if (mv > 0)
+		{
+			gpio_pin_set_dt(&p1_09_en, 1); /* enable/high */
+		}
+		else
+		{
+			gpio_pin_set_dt(&p1_09_en, 0); /* disable/low */
+		}
+
+		/* Hysteretic mute */
+		if (mv <= POT_MUTE_ON_MV)
+		{
+			if (!muted)
+			{
+				max9867_set_mute(true);
+				muted = true;
+			}
+			k_sleep(K_MSEC(100));
+			continue;
+		}
+		else if (muted && mv >= POT_MUTE_OFF_MV)
+		{
+			max9867_set_mute(false);
+			muted = false;
+		}
+
+		/* Scale [POT_MUTE_OFF_MV..POT_MAX_MV] -> [0..MAX_VOL_Q15] */
+		if (mv > POT_MAX_MV)
+			mv = POT_MAX_MV;
+		int32_t span = POT_MAX_MV - POT_MUTE_OFF_MV;
+		int32_t mv_rel = (mv - POT_MUTE_OFF_MV);
+		uint16_t vol_q15 = (uint16_t)((mv_rel * (int32_t)MAX_VOL_Q15 + span / 2) / span);
+
+		(void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
+
+		// int vol_pct = (int)((vol_q15 * 100 + MAX_VOL_Q15 / 2) / MAX_VOL_Q15);
+		// printk("pot=%ld mV  vol_q15=%u  vol=%d%%  muted=%d  en=%d\n",
+		// 	   (long)mv, vol_q15, vol_pct, (int)muted,
+		// 	   gpio_pin_get_dt(&p1_09_en));
+
+		k_sleep(K_MSEC(100));
+	}
+}
+
+K_THREAD_DEFINE(vol_thread_id, 1024, volume_control_thread, NULL, NULL, NULL,
+				7, 0, 0);
 
 /* -------------------------------------------------------------------------- */
 /*                               Decoder Thread                               */
@@ -414,6 +510,35 @@ int main(void)
 	int err;
 
 	printk("Starting GRPTLK Receiver\n");
+
+	/* --- Volume Control Setup --- */
+	if (!adc_is_ready_dt(&pot))
+	{
+		printk("ADC device not ready\n");
+		return -EIO;
+	}
+	err = adc_channel_setup_dt(&pot);
+	if (err)
+	{
+		printk("adc_channel_setup_dt() failed: %d\n", err);
+		return -EIO;
+	}
+
+	if (!gpio_is_ready_dt(&p1_09_en))
+	{
+		printk("P1.09 GPIO not ready\n");
+	}
+	else
+	{
+		gpio_pin_configure_dt(&p1_09_en, GPIO_OUTPUT_INACTIVE);
+	}
+
+	err = max9867_init();
+	if (err)
+	{
+		printk("MAX9867 init failed: %d\n", err);
+		/* Continue anyway, maybe just using internal audio or debug */
+	}
 
 	/* --- LC3 Setup --- */
 	printk("Initializing lc3 decoder\n");
