@@ -1,19 +1,20 @@
+#include <stdint.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
-#define BIG_SDU_INTERVAL_US (10000)
-#define BUF_ALLOC_TIMEOUT_US (BIG_SDU_INTERVAL_US * 2U)
+#include <zephyr/bluetooth/audio/audio.h>
+#include <zephyr/bluetooth/audio/bap.h>
+#include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 
-#define BIS_ISO_CHAN_COUNT 5
 #define NUM_PRIME_PACKETS 2
 
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT * NUM_PRIME_PACKETS,
 						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
-static K_SEM_DEFINE(sem_big_cmplt, 0, BIS_ISO_CHAN_COUNT);
-static K_SEM_DEFINE(sem_big_term, 0, BIS_ISO_CHAN_COUNT);
+static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
+static K_SEM_DEFINE(sem_big_term, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
 
 static struct bt_iso_chan *bis[];
 
@@ -41,7 +42,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		int err;
 		struct net_buf *buf;
 
-		buf = net_buf_alloc(&bis_tx_pool, K_USEC(BUF_ALLOC_TIMEOUT_US));
+		buf = net_buf_alloc(&bis_tx_pool, K_FOREVER);
 		if (!buf)
 		{
 			printk("Data buffer allocate timeout\n");
@@ -97,7 +98,7 @@ static struct bt_iso_chan_ops iso_ops = {
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 2,
+	.rtn = 0,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 
@@ -138,10 +139,8 @@ static struct bt_iso_chan *bis[] = {
 };
 
 static struct bt_iso_big_create_param big_create_param = {
-	.num_bis = BIS_ISO_CHAN_COUNT,
+	.num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
 	.bis_channels = bis,
-	.interval = BIG_SDU_INTERVAL_US,
-	.latency = 10,
 	.packing = BT_ISO_PACKING_SEQUENTIAL,
 	.framing = BT_ISO_FRAMING_UNFRAMED,
 };
@@ -149,6 +148,61 @@ static struct bt_iso_big_create_param big_create_param = {
 static const struct bt_data ad[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+
+static struct bt_bap_broadcast_source *broadcast_source;
+static struct bt_bap_lc3_preset preset_active =
+	BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
+		BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
+		BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
+struct broadcast_source_stream
+{
+	struct bt_bap_stream stream;
+	uint16_t seq_num;
+	size_t sent_cnt;
+	// lc3_encoder_t lc3_encoder;
+	// lc3_encoder_mem_16k_t lc3_encoder_mem;
+} streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+
+static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
+{
+	struct bt_bap_broadcast_source_stream_param
+		stream_params[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+	struct bt_bap_broadcast_source_subgroup_param
+		subgroup_param[1];
+	struct bt_bap_broadcast_source_param create_param = {0};
+
+	const size_t streams_per_subgroup =
+		ARRAY_SIZE(stream_params) / ARRAY_SIZE(subgroup_param);
+
+	uint8_t left_loc[] = {
+		BT_AUDIO_CODEC_DATA(BT_AUDIO_CODEC_CFG_CHAN_ALLOC,
+							BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_LEFT))};
+	uint8_t right_loc[] = {
+		BT_AUDIO_CODEC_DATA(BT_AUDIO_CODEC_CFG_CHAN_ALLOC,
+							BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_RIGHT))};
+
+	for (size_t i = 0U; i < ARRAY_SIZE(subgroup_param); i++)
+	{
+		subgroup_param[i].params_count = streams_per_subgroup;
+		subgroup_param[i].params = stream_params + i * streams_per_subgroup;
+		subgroup_param[i].codec_cfg = &preset_active.codec_cfg;
+	}
+	for (size_t j = 0U; j < ARRAY_SIZE(stream_params); j++)
+	{
+		stream_params[j].stream = &streams[j].stream;
+		stream_params[j].data = (j == 0) ? left_loc : right_loc;
+		stream_params[j].data_len = (j == 0) ? sizeof(left_loc) : sizeof(right_loc);
+		// bt_bap_stream_cb_register(stream_params[j].stream, &stream_ops);
+	}
+
+	create_param.params_count = ARRAY_SIZE(subgroup_param);
+	create_param.params = subgroup_param;
+	create_param.qos = &preset_active.qos;
+	create_param.encryption = false;
+	create_param.packing = BT_ISO_PACKING_SEQUENTIAL;
+
+	return bt_bap_broadcast_source_create(&create_param, source);
+}
 
 int main(void)
 {
@@ -163,6 +217,13 @@ int main(void)
 	if (err)
 	{
 		printk("Bluetooth init failed (err %d)\n", err);
+		return 0;
+	}
+
+	err = setup_broadcast_source(&broadcast_source);
+	if (err)
+	{
+		printk("setup_broadcast_source failed: %d\n", err);
 		return 0;
 	}
 
@@ -192,6 +253,28 @@ int main(void)
 		return 0;
 	}
 
+	/* Periodic advertising data (BASE) */
+	NET_BUF_SIMPLE_DEFINE(base_buf, 128);
+	err = bt_bap_broadcast_source_get_base(broadcast_source, &base_buf);
+	if (err)
+	{
+		printk("get BASE failed: %d\n", err);
+		return 0;
+	}
+
+	struct bt_data per_ad = {
+		.type = BT_DATA_SVC_DATA16,
+		.data_len = base_buf.len,
+		.data = base_buf.data,
+	};
+
+	err = bt_le_per_adv_set_data(adv, &per_ad, 1);
+	if (err)
+	{
+		printk("set per adv data failed: %d\n", err);
+		return 0;
+	}
+
 	/* Enable Periodic Advertising */
 	err = bt_le_per_adv_start(adv);
 	if (err)
@@ -208,54 +291,62 @@ int main(void)
 		return 0;
 	}
 
-	// /* Create BIG */
-	// err = bt_iso_big_create(adv, &big_create_param, &big);
-	// if (err)
-	// {
-	// 	printk("Failed to create BIG (err %d)\n", err);
-	// 	return 0;
-	// }
+	big_create_param.bis_channels = bis;
+	big_create_param.interval = preset_active.qos.interval;
+	big_create_param.latency = preset_active.qos.latency;
 
-	// for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
-	// {
-	// 	printk("Waiting for BIG complete chan %u...\n", chan);
+	for (uint8_t chan = 0U; chan < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; chan++) {
+		bis[chan]->qos->tx->rtn = preset_active.qos.rtn;
+	}
 
-	// 	err = k_sem_take(&sem_big_cmplt, K_FOREVER);
-	// 	if (err)
-	// 	{
-	// 		printk("failed (err %d)\n", err);
-	// 		return 0;
-	// 	}
+	/* Create BIG */
+	err = bt_iso_big_create(adv, &big_create_param, &big);
+	if (err)
+	{
+		printk("Failed to create BIG (err %d)\n", err);
+		return 0;
+	}
 
-	// 	printk("BIG create complete chan %u.\n", chan);
-	// }
+	for (uint8_t chan = 0U; chan < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; chan++)
+	{
+		printk("Waiting for BIG complete chan %u...\n", chan);
 
-	// for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
-	// {
-	// 	printk("Setting data path chan %u...\n", chan);
+		err = k_sem_take(&sem_big_cmplt, K_FOREVER);
+		if (err)
+		{
+			printk("failed (err %d)\n", err);
+			return 0;
+		}
 
-	// 	const struct bt_iso_chan_path hci_path = {
-	// 		.pid = BT_ISO_DATA_PATH_HCI,
-	// 		.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
-	// 	};
+		printk("BIG create complete chan %u.\n", chan);
+	}
 
-	// 	uint8_t dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+	for (uint8_t chan = 0U; chan < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; chan++)
+	{
+		printk("Setting data path chan %u...\n", chan);
 
-	// 	if (chan == 0)
-	// 	{
-	// 		dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
-	// 	}
+		const struct bt_iso_chan_path hci_path = {
+			.pid = BT_ISO_DATA_PATH_HCI,
+			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
+		};
 
-	// 	err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
-	// 	if (err != 0)
-	// 	{
-	// 		printk("Failed to setup ISO data path: %d\n", err);
-	// 	}
+		uint8_t dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
 
-	// 	printk("Setting data path complete chan %u.\n", chan);
-	// }
+		if (chan == 0)
+		{
+			dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+		}
 
-	// for (int i = 0; i < NUM_PRIME_PACKETS; i++) {
-	// 	iso_sent(bis[0]);
-	// }
+		err = bt_iso_setup_data_path(&bis_iso_chan[chan], dir, &hci_path);
+		if (err != 0)
+		{
+			printk("Failed to setup ISO data path: %d\n", err);
+		}
+
+		printk("Setting data path complete chan %u.\n", chan);
+	}
+
+	for (int i = 0; i < NUM_PRIME_PACKETS; i++) {
+		iso_sent(bis[0]);
+	}
 }
