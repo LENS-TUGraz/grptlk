@@ -109,8 +109,12 @@ static bool iso_datapaths_setup = false;
 
 /* Encoded Audio FIFO (RX) */
 /* Queue to decouple ISO RX interrupt from decoding logic */
+struct lc3_frame {
+	uint16_t len;
+	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+};
 
-K_MSGQ_DEFINE(lc3_rx_q, CONFIG_BT_ISO_TX_MTU, 4, 4);
+K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 8, 4);
 
 /* Encoded Audio FIFO (TX) */
 /* Queue to decouple Encoder thread from ISO TX interrupt */
@@ -145,11 +149,11 @@ static const struct device *i2s_dev;
 #define BLOCK_BYTES (FRAMES_PER_BLOCK * CHANNELS * SAMPLE_BYTES) /* 640 B */
 
 /* TX: slab fed to i2s_write (driver frees after TX) */
-#define TX_BLOCK_COUNT 4
+#define TX_BLOCK_COUNT 8
 K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
 
 /* Queue for passing decoded audio to I2S TX */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 4, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
 
 /* I2S TX Thread */
 static void tx_thread_fn(void *p1, void *p2, void *p3)
@@ -161,14 +165,33 @@ static void tx_thread_fn(void *p1, void *p2, void *p3)
 	while (1)
 	{
 		uint8_t in[BLOCK_BYTES];
-		/* Check for decoded audio - non-blocking */
-		/* If no audio ready (e.g. not coupled or packet drop), send silence */
-		if (k_msgq_get(&tx_msgq, in, K_NO_WAIT) != 0) {
-			memset(in, 0, BLOCK_BYTES);
+		
+		/* --- Smart Feeder Logic --- */
+		/* Monitor I2S buffer depth via utilized slabs */
+		uint32_t free_slabs = k_mem_slab_num_free_get(&tx_slab);
+		uint32_t in_i2s = TX_BLOCK_COUNT - free_slabs;
+
+		/* If I2S has < 2 blocks (20ms), we are in danger of underrun. Feed NOW. */
+		if (in_i2s < 2) {
+			/* Try to get data non-blocking */
+			if (k_msgq_get(&tx_msgq, in, K_NO_WAIT) != 0) {
+				/* Queue empty: Insert Silence to keep I2S alive */
+				/* Only log occasionally */
+				static int sil_cnt = 0;
+				if ((sil_cnt++ % 50) == 0) printk("Injecting silence (depth=%d)\n", in_i2s);
+				memset(in, 0, BLOCK_BYTES);
+			}
+		} else {
+			/* Healthy buffer (>20ms). Wait for data to arrive. */
+			/* Use short timeout (5ms) to wake up and re-check buffer level as it drains */
+			if (k_msgq_get(&tx_msgq, in, K_MSEC(5)) != 0) {
+				continue; /* Timeout: Loop to re-eval buffer depth */
+			}
 		}
 
 		void *txblk;
-		/* Block until a slab is free (throttles thread to I2S consumption rate) */
+		/* Block until a slab is free. 
+		   Note: If in_i2s is high, this might block, which is fine (throttling). */
 		err = k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER);
 		if (err) {
 			printk("TX slab alloc failed\n");
@@ -181,12 +204,29 @@ static void tx_thread_fn(void *p1, void *p2, void *p3)
 		{
 			k_msleep(1);
 		}
+		
 		if (ret < 0)
 		{
-			printk("I2S TX write failed: %d\n", ret);
+			printk("I2S TX write failed: %d. Recovering...\n", ret);
 			k_mem_slab_free(&tx_slab, &txblk);
+			
+			/* Recovery: Trigger STOP, wait, then START */
+			i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+			k_msleep(10); // Give it time to settle
+			
+			/* We likely need to re-prefill to avoid immediate underrun again */
+			for (int k=0; k<4; k++) {
+				void *tmp;
+				if (k_mem_slab_alloc(&tx_slab, &tmp, K_NO_WAIT) == 0) {
+					memset(tmp, 0, BLOCK_BYTES);
+					if (i2s_write(i2s_dev, tmp, BLOCK_BYTES) != 0) {
+						k_mem_slab_free(&tx_slab, &tmp);
+					}
+				}
+			}
+			
+			i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
 		}
-		/* success: driver frees txblk after sending */
 	}
 }
 
@@ -294,7 +334,7 @@ K_THREAD_DEFINE(vol_thread_id, 1024, volume_control_thread, NULL, NULL, NULL,
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
     int ret;
-    uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
+    struct lc3_frame frame;
 	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2]; /* 160 * 2 */
     
     /* 16_2_1 implies 40 bytes per frame */
@@ -304,40 +344,58 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
     while (1) {
         /* Wait for encoded frame from ISO RX */
-        ret = k_msgq_get(&lc3_rx_q, encoded_buf, K_FOREVER);
-        if (ret != 0) {
-            continue;
+        /* Blocking read with Timeout */
+        /* We use a 12ms timeout (slightly > 10ms ISO interval) to detect if the radio stack
+           fails to deliver a packet entirely (e.g. sync loss). 
+           If timeout occurs, we generate PLC to keep the pipeline moving. */
+        ret = k_msgq_get(&lc3_rx_q, &frame, K_MSEC(12));
+        
+        if (ret == 0 && frame.len > 0) {
+            /* Normal Case: Packet received */
+            ret = lc3_decode(lc3_decoder,
+                             frame.data,
+                             octets_per_frame,
+                             LC3_PCM_FORMAT_S16,
+                             recv_pcm_data,
+                             1);
+                             
+            if (ret != 0) {
+                printk("LC3 decode failed: %d\n", ret);
+                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+            }
+        } else {
+            /* Timeout or Ghost Packet (len=0) - Trigger PLC */
+            /* If ret != 0, it means timeout -> PLC */
+            /* If frame.len == 0, it means Ghost Packet -> PLC */
+            // printk("PLC (reason: %s)\n", (ret != 0) ? "Timeout" : "Ghost");
+            static int plc_cnt = 0;
+            if ((plc_cnt++ % 100) == 0) printk("PLC triggered (reason: %s)\n", (ret != 0) ? "Timeout" : "Ghost");
+            
+            ret = lc3_decode(lc3_decoder,
+                             NULL, /* NULL input triggers PLC */
+                             octets_per_frame,
+                             LC3_PCM_FORMAT_S16,
+                             recv_pcm_data,
+                             1);
+                             
+            if (ret != 0) {
+                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+            }
         }
 
-        /* Decode */
-        ret = lc3_decode(lc3_decoder,
-                         encoded_buf,
-                         octets_per_frame,
-                         LC3_PCM_FORMAT_S16,
-                         recv_pcm_data,
-                         1);
-
-        if (ret != 0) {
-            printk("LC3 decode failed: %d\n", ret);
-			/* Send silence on failure? */
-			memset(stereo_buf, 0, sizeof(stereo_buf));
-        } else {
-            /* Successfully decoded - recv_pcm_data contains 160 mono samples */
-            
-			/* Upmix Mono to Stereo for MAX9867 (L=R) */
-			for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-				stereo_buf[2 * i] = recv_pcm_data[i];     /* Left */
-				stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
-			}
+        /* Upmix Mono to Stereo for MAX9867 (L=R) */
+        for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+            stereo_buf[2 * i] = recv_pcm_data[i];     /* Left */
+            stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
         }
 		
 		/* Push to I2S TX queue */
-		/* If queue is full, we drop the oldest or just block? 
-		   Since we are real-time, we should try to keep up. 
-		   K_NO_WAIT and ignore error effectively drops if full. */
 		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
 			/* Queue full - audio glitch inevitable */
-			// printk("TX Q Full\n");
+			static int overrun_cnt = 0;
+            if ((overrun_cnt++ % 100) == 0) {
+                printk("TX Queue Full (Overrun) - Dropping audio (cnt=%d)\n", overrun_cnt);
+            }
 		}
     }
 }
@@ -457,12 +515,19 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
      * Push received payload to decoder queue.
      * Use K_NO_WAIT to avoid blocking the ISR.
      */
-    if (buf->len == CONFIG_BT_ISO_TX_MTU) {
-        int ret = k_msgq_put(&lc3_rx_q, buf->data, K_NO_WAIT);
-        if (ret != 0) {
-             /* Queue full, dropping frame */
-        }
+     struct lc3_frame frame;
+
+    if (buf && buf->len == CONFIG_BT_ISO_TX_MTU && (info->flags & BT_ISO_FLAGS_VALID)) {
+        frame.len = buf->len;
+        memcpy(frame.data, buf->data, buf->len);
+    } else {
+        /* Packet Lost or Invalid - Push Empty Frame for PLC */
+        frame.len = 0;
     }
+    
+    /* Always push *something* to keep the pipeline ticking */
+    /* Note: If queue is full, we drop it. This means the decoder is too slow. */
+    k_msgq_put(&lc3_rx_q, &frame, K_NO_WAIT);
 
     /* Kickstart uplink upon first reception */
     if (iso_datapaths_setup) {
@@ -650,7 +715,9 @@ int main(void)
 	}
 
 	/* Prefill silent TX blocks so I2S has data to start with */
-	for (int i = 0; i < 2; i++)
+	/* Increase prefill to handle startup jitter */
+	/* 6 blocks = 60ms of silence cushion */
+	for (int i = 0; i < 6; i++)
 	{
 		void *txblk;
 		if (k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER) == 0) {

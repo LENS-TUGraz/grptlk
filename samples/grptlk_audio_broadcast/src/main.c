@@ -240,7 +240,10 @@ static void iso_sent(struct bt_iso_chan *chan) {
       net_buf_add_mem(buf, enc_data, sizeof(enc_data));
     } else {
       /* Underrun: Send silence or dummy data */
-      // printk("TX underrun!\n");
+      static int tx_underrun_cnt = 0;
+      if ((tx_underrun_cnt++ % 100) == 0) {
+          printk("Broadcaster TX Underrun (Queue Empty) - sending silence (cnt=%d)\n", tx_underrun_cnt);
+      }
       memset(iso_data, 0, sizeof(iso_data));
       net_buf_add_mem(buf, iso_data, sizeof(iso_data));
     }
