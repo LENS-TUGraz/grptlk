@@ -1,3 +1,7 @@
+#include <zephyr/drivers/i2s.h>
+#include <zephyr/drivers/i2c.h>
+#include "drivers/max9867.h"
+
 #include "lc3.h"
 #include <stdint.h>
 #include <zephyr/bluetooth/audio/audio.h>
@@ -29,6 +33,28 @@ static struct bt_bap_lc3_preset preset_active =
  * We must use a constant for the array size.
  */
 #define PCM_SAMPLES_PER_FRAME 160
+
+/* Audio Format (I2S) */
+#define SAMPLE_RATE_HZ 16000
+#define CHANNELS 2
+#define SAMPLE_BYTES 2
+#define BLOCK_MS 10
+#define FRAMES_PER_BLOCK ((SAMPLE_RATE_HZ * BLOCK_MS) / 1000)   /* 160 frames */
+#define BLOCK_BYTES (FRAMES_PER_BLOCK * CHANNELS * SAMPLE_BYTES) /* 640 B */
+
+/* I2S Objects */
+static const struct device *i2s_dev;
+
+/* RX Slab: I2S driver fills these */
+#define RX_BLOCK_COUNT 16
+K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
+
+/* PCM Queue (Mono frames for Encoder) */
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
+
+/* RX Thread */
+K_THREAD_STACK_DEFINE(rx_stack, 4096);
+static struct k_thread rx_thread_data;
 
 /* Encoder Thread Configuration */
 #define ENCODER_STACK_SIZE 4096
@@ -101,6 +127,50 @@ static struct bt_iso_chan_qos bis_iso_qos = {
 };
 
 /* -------------------------------------------------------------------------- */
+/*                               I2S / RX Thread                              */
+/* -------------------------------------------------------------------------- */
+
+static inline void downmix_stereo_block_to_mono(const int16_t *stereo, int16_t *mono)
+{
+    for (size_t i = 0; i < FRAMES_PER_BLOCK; i++)
+    {
+        int32_t L = stereo[2 * i + 0];
+        int32_t R = stereo[2 * i + 1];
+        mono[i] = (int16_t)((L + R) / 2);
+    }
+}
+
+static void rx_thread_func(void *p1, void *p2, void *p3)
+{
+    int err;
+    uint8_t stereo_buf[BLOCK_BYTES];
+    int16_t mono_frame[PCM_SAMPLES_PER_FRAME];
+
+    printk("RX thread started: capturing audio...\n");
+    while (1)
+    {
+        size_t got = sizeof(stereo_buf);
+        err = i2s_buf_read(i2s_dev, stereo_buf, &got);
+        if (err == 0 && got == BLOCK_BYTES)
+        {
+            downmix_stereo_block_to_mono((const int16_t *)stereo_buf, mono_frame);
+            /* Push to encoder queue (drop oldest if full) */
+            if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0)
+            {
+                int16_t drop[PCM_SAMPLES_PER_FRAME];
+                (void)k_msgq_get(&pcm_msgq, drop, K_NO_WAIT);
+                (void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
+            }
+        }
+        else if (err != -EAGAIN && err != -ETIMEDOUT)
+        {
+            printk("I2S read error: %d\n", err);
+            k_sleep(K_MSEC(10)); /* backoff */
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               Encoder Thread                               */
 /* -------------------------------------------------------------------------- */
 
@@ -114,36 +184,23 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
   int octets_per_frame = preset_active.qos.sdu;
 
   while (1) {
-    /* In a real app with I2S microphone input:
-       - This thread would block waiting for a full PCM buffer from the I2S
-       driver (via k_msgq_get or k_sem_take).
-       - This ensures the encoding rate matches the hardware sampling rate
-       exactly (16kHz).
-       - Without I2S blocking, this loop runs as fast as the consumer drains the
-       queue.
-     */
-
-    /*
-     * Throttle generation to avoid buffer overrun if the consumption is slow
-     * (though k_msgq_put blocking handles this too)
-     */
-
-    memset(send_pcm_data, audio_ctr++, sizeof(send_pcm_data));
+    /* Wait for PCM frame (from I2S RX thread) */
+    /* This naturally paces the encoder at the audio sample rate */
+    ret = k_msgq_get(&pcm_msgq, send_pcm_data, K_FOREVER);
+    if (ret != 0) {
+        continue;
+    }
 
     ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
                      octets_per_frame, encoded_buf);
 
     if (ret == -1) {
       printk("LC3 encode failed in thread\n");
-      k_sleep(K_MSEC(10));
       continue;
     }
 
-    /* Push to queue, blocking if full (flow control) */
-    ret = k_msgq_put(&lc3_encoded_q, encoded_buf, K_FOREVER);
-    if (ret != 0) {
-      printk("Failed to put encoded frame: %d\n", ret);
-    }
+    /* Push to ISO TX queue */
+    k_msgq_put(&lc3_encoded_q, encoded_buf, K_FOREVER);
   }
 }
 
@@ -383,6 +440,51 @@ int main(void) {
   int err;
 
   printk("Starting GRPTLK Broadcaster\n");
+
+  /* --- Audio Setup --- */
+  printk("Initializing MAX9867 codec...\n");
+  err = max9867_init();
+  if (err) {
+      printk("MAX9867 init failed: %d\n", err);
+      /* Proceed anyway? Or return error? For robustness let's return error but maybe continue if just verifying logic without hardware? */
+      /* Real HW: Return error. BSIM: Might fail if I2C simulated? Assuming BSIM handles it via mocks or real I2C model. */
+      /* If using custom driver in BSIM, it might need I2C model. */
+      return err;
+  }
+
+  i2s_dev = DEVICE_DT_GET(DT_ALIAS(i2s_node0));
+  if (!device_is_ready(i2s_dev)) {
+      printk("I2S device not ready\n");
+      return -ENODEV;
+  }
+
+  struct i2s_config rx_cfg = {
+      .word_size = 16,
+      .channels = CHANNELS,
+      .format = I2S_FMT_DATA_FORMAT_I2S,
+      .options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+      .frame_clk_freq = SAMPLE_RATE_HZ,
+      .mem_slab = &rx_slab,
+      .block_size = BLOCK_BYTES,
+      .timeout = 2000,
+  };
+
+  err = i2s_configure(i2s_dev, I2S_DIR_RX, &rx_cfg);
+  if (err) {
+      printk("I2S configure failed: %d\n", err);
+      return err;
+  }
+
+  err = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+  if (err) {
+      printk("I2S start failed: %d\n", err);
+      return err;
+  }
+
+  /* Start RX thread */
+  k_thread_create(&rx_thread_data, rx_stack, K_THREAD_STACK_SIZEOF(rx_stack),
+                  rx_thread_func, NULL, NULL, NULL, 5, 0, K_NO_WAIT);
+  k_thread_name_set(&rx_thread_data, "i2s_rx");
 
   /* --- LC3 Setup --- */
   printk("Initializing lc3 encoder\n");
