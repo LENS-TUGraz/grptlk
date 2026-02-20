@@ -75,7 +75,7 @@ int max9867_init()
 	}
 	LOG_DBG("Set master mode and BCLK to 64x LRCLK");
 
-	err = reg_write(MAX9867_REG_SIDETONE, 0x46);
+	err = reg_write(MAX9867_REG_SIDETONE, 0x80);
 	if (err) {
 		LOG_ERR("Failed to disable sidetone!");
 		return -EFAULT;

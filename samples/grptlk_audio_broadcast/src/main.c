@@ -76,9 +76,11 @@ static const struct bt_data ad[] = {
             sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
-/* LC3 Encoder Objects */
+/* LC3 Codec Objects */
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
+static lc3_decoder_t lc3_decoder;
+static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
 
 /* Encoder Thread Objects */
@@ -261,7 +263,21 @@ static void iso_sent(struct bt_iso_chan *chan) {
 
 static void iso_recv(struct bt_iso_chan *chan,
                      const struct bt_iso_recv_info *info, struct net_buf *buf) {
-  printk("ISO_BROADCAST RX %p: len %u\n", chan, buf->len);
+  int16_t recv_pcm_data[PCM_SAMPLES_PER_FRAME];
+  int err;
+
+  if (buf->len == 0 || !(info->flags & BT_ISO_FLAGS_VALID)) {
+    /* PLC */
+    err = lc3_decode(lc3_decoder, NULL, preset_active.qos.sdu, LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+  } else {
+    err = lc3_decode(lc3_decoder, buf->data, buf->len, LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+  }
+
+  if (err == 0) {
+      printk("Uplink RX Decoded: %i %i %i %i\n", recv_pcm_data[0], recv_pcm_data[1], recv_pcm_data[2], recv_pcm_data[3]);
+  } else {
+      printk("Uplink RX Decode Error: %d\n", err);
+  }
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -503,6 +519,14 @@ int main(void) {
 
   if (lc3_encoder == NULL) {
     printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+    return -EIO;
+  }
+  
+  lc3_decoder = 
+      lc3_setup_decoder(preset_active.qos.interval, 16000, 0, &lc3_decoder_mem);
+
+  if (lc3_decoder == NULL) {
+    printk("ERROR: Failed to setup LC3 decoder\n");
     return -EIO;
   }
 

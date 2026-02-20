@@ -155,6 +155,17 @@ K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
 /* Queue for passing decoded audio to I2S TX */
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
 
+/* RX Slab: I2S driver fills these */
+#define RX_BLOCK_COUNT 4
+K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
+
+/* PCM Queue (Mono frames for Encoder) */
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 4, 4);
+
+/* RX Thread */
+K_THREAD_STACK_DEFINE(rx_stack, 2048);
+static struct k_thread rx_thread_data;
+
 /* I2S TX Thread */
 static void tx_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -401,6 +412,51 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 }
 
 /* -------------------------------------------------------------------------- */
+/*                               I2S RX Thread                                */
+/* -------------------------------------------------------------------------- */
+
+static inline void downmix_stereo_block_to_mono(const int16_t *stereo, int16_t *mono)
+{
+    for (size_t i = 0; i < FRAMES_PER_BLOCK; i++)
+    {
+        int32_t L = stereo[2 * i + 0];
+        int32_t R = stereo[2 * i + 1];
+        mono[i] = (int16_t)((L + R) / 2);
+    }
+}
+
+static void rx_thread_func(void *p1, void *p2, void *p3)
+{
+    int err;
+    uint8_t stereo_buf[BLOCK_BYTES];
+    int16_t mono_frame[PCM_SAMPLES_PER_FRAME];
+
+    printk("RX thread started: capturing audio...\n");
+    while (1)
+    {
+        size_t got = sizeof(stereo_buf);
+        err = i2s_buf_read(i2s_dev, stereo_buf, &got);
+        if (err == 0 && got == BLOCK_BYTES)
+        {
+            downmix_stereo_block_to_mono((const int16_t *)stereo_buf, mono_frame);
+            
+            /* Push to encoder queue (drop oldest if full) */
+            if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0)
+            {
+                int16_t drop[PCM_SAMPLES_PER_FRAME];
+                (void)k_msgq_get(&pcm_msgq, drop, K_NO_WAIT);
+                (void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
+            }
+        }
+        else if (err != -EAGAIN && err != -ETIMEDOUT)
+        {
+            printk("I2S read error: %d\n", err);
+            k_sleep(K_MSEC(10)); /* backoff */
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               Encoder Thread                               */
 /* -------------------------------------------------------------------------- */
 
@@ -409,23 +465,15 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
     int ret;
     uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
     int octets_per_frame = preset_active.qos.sdu;
-    static int frame_count = 0;
 
     printk("Encoder thread started\n");
 
     while (1) {
-        /* Generate Dummy Audio (Sine Wave) */
-        /* 160 samples per 10ms frame at 16kHz */
-        /* Simple sine wave generation */
-        for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-            /* Generate a tone around 400Hz */
-            /* (2 * PI * 400 * t) / 16000 */
-            /* Using a simplified approximation or just a counter for verification if math.h is an issue, 
-               but we have math.h included in other samples. 
-               Let's use a simple counter pattern that wraps to check continuity, simpler than sin/cos overhead. */
-             tx_pcm_data[i] = (int16_t)((frame_count + i) & 0x3FFF); 
+        /* Wait for PCM frame (from I2S RX thread) */
+        ret = k_msgq_get(&pcm_msgq, tx_pcm_data, K_FOREVER);
+        if (ret != 0) {
+            continue;
         }
-        frame_count += PCM_SAMPLES_PER_FRAME;
 
         /* Encode */
         ret = lc3_encode(lc3_encoder,
@@ -439,18 +487,11 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
             printk("LC3 encode failed: %d\n", ret);
         } else {
             /* Push to TX Queue */
-            /* We block if queue is full to throttle the encoder to the ISO interval */
-            /* But actually, we should time this. 
-               However, in the broadcaster, we relied on queue blocking or k_sleep.
-               For this receiver, let's throttle to 10ms roughly or rely on queue backpressure.
-               Queue size is 4. If we run free, we fill it instantly.
-               Let's add a k_sleep(K_MSEC(10)) to mimic real audio source. */
-            
             k_msgq_put(&lc3_tx_q, encoded_buf, K_FOREVER);
-            k_sleep(K_USEC(10000)); /* 10ms interval */
         }
     }
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*                               ISO Callbacks                                */
@@ -714,6 +755,24 @@ int main(void)
 		return -EIO;
 	}
 
+	struct i2s_config rx_cfg = {
+		.word_size = 16,
+		.channels = CHANNELS,
+		.format = I2S_FMT_DATA_FORMAT_I2S,
+		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+		.frame_clk_freq = SAMPLE_RATE_HZ,
+		.mem_slab = &rx_slab,
+		.block_size = BLOCK_BYTES,
+		.timeout = 2000,
+	};
+
+	err = i2s_configure(i2s_dev, I2S_DIR_RX, &rx_cfg);
+	if (err)
+	{
+		printk("I2S RX cfg failed: %d\n", err);
+		return -EIO;
+	}
+
 	/* Prefill silent TX blocks so I2S has data to start with */
 	/* Increase prefill to handle startup jitter */
 	/* 6 blocks = 60ms of silence cushion */
@@ -730,20 +789,28 @@ int main(void)
 		}
 	}
 
-	/* Start I2S TX */
-	err = i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
-	if (err)
-	{
-		printk("I2S DIR_TX START failed: %d\n", err);
-		return -EIO;
-	}
-
 	/* Start I2S TX Thread */
 	k_thread_create(&tx_thread_data, tx_stack,
 					K_THREAD_STACK_SIZEOF(tx_stack),
 					tx_thread_fn, NULL, NULL, NULL,
 					6, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "i2s_tx");
+
+	/* Trigger both RX and TX to start simultaneously */
+	err = i2s_trigger(i2s_dev, I2S_DIR_BOTH, I2S_TRIGGER_START);
+	if (err)
+	{
+		printk("I2S DIR_BOTH START failed: %d\n", err);
+		return -EIO;
+	}
+
+	/* Start I2S RX Thread */
+	k_thread_create(&rx_thread_data, rx_stack,
+					K_THREAD_STACK_SIZEOF(rx_stack),
+					rx_thread_func, NULL, NULL, NULL,
+					5, 0, K_NO_WAIT);
+	k_thread_name_set(&rx_thread_data, "i2s_rx");
+
 
 	/* --- LC3 Setup --- */
 	printk("Initializing lc3 decoder\n");
