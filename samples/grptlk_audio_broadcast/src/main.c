@@ -1,3 +1,7 @@
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/i2c.h>
 #include "drivers/max9867.h"
@@ -49,12 +53,23 @@ static const struct device *i2s_dev;
 #define RX_BLOCK_COUNT 16
 K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
 
+/* TX Slab: I2S driver reads from these (speaker output) */
+#define TX_BLOCK_COUNT 8
+K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
+
 /* PCM Queue (Mono frames for Encoder) */
 K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
+
+/* Queue for passing decoded uplink audio to I2S TX (speaker) */
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
 
 /* RX Thread */
 K_THREAD_STACK_DEFINE(rx_stack, 4096);
 static struct k_thread rx_thread_data;
+
+/* TX Thread */
+K_THREAD_STACK_DEFINE(tx_stack, 2048);
+static struct k_thread tx_thread_data;
 
 /* Encoder Thread Configuration */
 #define ENCODER_STACK_SIZE 4096
@@ -142,6 +157,69 @@ static inline void downmix_stereo_block_to_mono(const int16_t *stereo, int16_t *
     }
 }
 
+/* I2S TX Thread: feeds decoded uplink audio to the speaker */
+static void tx_thread_fn(void *p1, void *p2, void *p3)
+{
+    int err;
+    int ret;
+    printk("TX thread: running\n");
+
+    while (1) {
+        uint8_t in[BLOCK_BYTES];
+
+        /* Monitor I2S buffer depth via utilized slabs */
+        uint32_t free_slabs = k_mem_slab_num_free_get(&tx_slab);
+        uint32_t in_i2s = TX_BLOCK_COUNT - free_slabs;
+
+        /* If I2S has < 2 blocks (20 ms), feed immediately to avoid underrun */
+        if (in_i2s < 2) {
+            if (k_msgq_get(&tx_msgq, in, K_NO_WAIT) != 0) {
+                static int sil_cnt = 0;
+                if ((sil_cnt++ % 50) == 0) {
+                    printk("Uplink TX: injecting silence (depth=%d)\n", in_i2s);
+                }
+                memset(in, 0, BLOCK_BYTES);
+            }
+        } else {
+            if (k_msgq_get(&tx_msgq, in, K_MSEC(5)) != 0) {
+                continue;
+            }
+        }
+
+        void *txblk;
+        err = k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER);
+        if (err) {
+            printk("TX slab alloc failed\n");
+            continue;
+        }
+        memcpy(txblk, in, BLOCK_BYTES);
+
+        while ((ret = i2s_write(i2s_dev, txblk, BLOCK_BYTES)) == -EAGAIN) {
+            k_msleep(1);
+        }
+
+        if (ret < 0) {
+            printk("I2S TX write failed: %d. Recovering...\n", ret);
+            k_mem_slab_free(&tx_slab, &txblk);
+
+            i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+            k_msleep(10);
+
+            for (int k = 0; k < 4; k++) {
+                void *tmp;
+                if (k_mem_slab_alloc(&tx_slab, &tmp, K_NO_WAIT) == 0) {
+                    memset(tmp, 0, BLOCK_BYTES);
+                    if (i2s_write(i2s_dev, tmp, BLOCK_BYTES) != 0) {
+                        k_mem_slab_free(&tx_slab, &tmp);
+                    }
+                }
+            }
+
+            i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
+        }
+    }
+}
+
 static void rx_thread_func(void *p1, void *p2, void *p3)
 {
     int err;
@@ -205,6 +283,80 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
     k_msgq_put(&lc3_encoded_q, encoded_buf, K_FOREVER);
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/*                               Volume Control                               */
+/* -------------------------------------------------------------------------- */
+
+static const struct adc_dt_spec pot = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), potentiometer);
+static const struct gpio_dt_spec p1_09_en = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), enable_gpios);
+
+void volume_control_thread(void *p1, void *p2, void *p3)
+{
+#define POT_MUTE_ON_MV  100
+#define POT_MUTE_OFF_MV 120
+#define POT_MAX_MV      3300
+#define MAX_VOL_Q15     13668
+
+    static bool muted = true;
+
+    int err;
+    int16_t sample;
+    struct adc_sequence seq = {0};
+
+    adc_sequence_init_dt(&pot, &seq);
+    seq.buffer = &sample;
+    seq.buffer_size = sizeof(sample);
+
+    while (1) {
+        err = adc_read_dt(&pot, &seq);
+        if (err) {
+            printk("adc_read_dt() failed: %d\n", err);
+            k_sleep(K_MSEC(200));
+            continue;
+        }
+
+        int32_t mv = sample;
+        err = adc_raw_to_millivolts_dt(&pot, &mv);
+        if (err) {
+            printk("adc_raw_to_millivolts_dt() failed: %d (raw=%d)\n", err, sample);
+            k_sleep(K_MSEC(200));
+            continue;
+        }
+
+        if (mv > 0) {
+            gpio_pin_set_dt(&p1_09_en, 1);
+        } else {
+            gpio_pin_set_dt(&p1_09_en, 0);
+        }
+
+        if (mv <= POT_MUTE_ON_MV) {
+            if (!muted) {
+                max9867_set_mute(true);
+                muted = true;
+            }
+            k_sleep(K_MSEC(100));
+            continue;
+        } else if (muted && mv >= POT_MUTE_OFF_MV) {
+            max9867_set_mute(false);
+            muted = false;
+        }
+
+        if (mv > POT_MAX_MV) {
+            mv = POT_MAX_MV;
+        }
+        int32_t span = POT_MAX_MV - POT_MUTE_OFF_MV;
+        int32_t mv_rel = (mv - POT_MUTE_OFF_MV);
+        uint16_t vol_q15 = (uint16_t)((mv_rel * (int32_t)MAX_VOL_Q15 + span / 2) / span);
+
+        (void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
+
+        k_sleep(K_MSEC(100));
+    }
+}
+
+K_THREAD_DEFINE(vol_thread_id, 1024, volume_control_thread, NULL, NULL, NULL,
+                7, 0, 0);
 
 /* -------------------------------------------------------------------------- */
 /*                               ISO Callbacks                                */
@@ -274,9 +426,23 @@ static void iso_recv(struct bt_iso_chan *chan,
   }
 
   if (err == 0) {
-      printk("Uplink RX Decoded: %i %i %i %i\n", recv_pcm_data[0], recv_pcm_data[1], recv_pcm_data[2], recv_pcm_data[3]);
+      /* Upmix decoded mono to stereo and push to I2S TX (speaker) */
+      int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2];
+      for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+          stereo_buf[2 * i]     = recv_pcm_data[i]; /* Left  */
+          stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
+      }
+      if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
+          static int overrun_cnt = 0;
+          if ((overrun_cnt++ % 100) == 0) {
+              printk("Uplink TX queue full - dropping frame (cnt=%d)\n", overrun_cnt);
+          }
+      }
   } else {
-      printk("Uplink RX Decode Error: %d\n", err);
+      static int decode_err_cnt = 0;
+      if ((decode_err_cnt++ % 100) == 0) {
+          printk("Uplink RX Decode Error: %d (cnt=%d)\n", err, decode_err_cnt);
+      }
   }
 }
 
@@ -460,6 +626,23 @@ int main(void) {
 
   printk("Starting GRPTLK Broadcaster\n");
 
+  /* --- Volume Control Setup --- */
+  if (!adc_is_ready_dt(&pot)) {
+      printk("ADC device not ready\n");
+      return -EIO;
+  }
+  err = adc_channel_setup_dt(&pot);
+  if (err) {
+      printk("adc_channel_setup_dt() failed: %d\n", err);
+      return -EIO;
+  }
+
+  if (!gpio_is_ready_dt(&p1_09_en)) {
+      printk("P1.09 GPIO not ready\n");
+  } else {
+      gpio_pin_configure_dt(&p1_09_en, GPIO_OUTPUT_INACTIVE);
+  }
+
   /* --- Audio Setup --- */
   printk("Initializing MAX9867 codec...\n");
   err = max9867_init();
@@ -494,7 +677,42 @@ int main(void) {
       return err;
   }
 
-  err = i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+  struct i2s_config tx_cfg = {
+      .word_size = 16,
+      .channels = CHANNELS,
+      .format = I2S_FMT_DATA_FORMAT_I2S,
+      .options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+      .frame_clk_freq = SAMPLE_RATE_HZ,
+      .mem_slab = &tx_slab,
+      .block_size = BLOCK_BYTES,
+      .timeout = 1000,
+  };
+
+  err = i2s_configure(i2s_dev, I2S_DIR_TX, &tx_cfg);
+  if (err) {
+      printk("I2S TX configure failed: %d\n", err);
+      return err;
+  }
+
+  /* Prefill silent TX blocks so I2S has data to start with (60 ms cushion) */
+  for (int i = 0; i < 6; i++) {
+      void *txblk;
+      if (k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER) == 0) {
+          memset(txblk, 0, BLOCK_BYTES);
+          err = i2s_write(i2s_dev, txblk, BLOCK_BYTES);
+          if (err < 0) {
+              printk("I2S TX prefill failed: %d\n", err);
+              k_mem_slab_free(&tx_slab, &txblk);
+          }
+      }
+  }
+
+  /* Start TX thread before triggering I2S */
+  k_thread_create(&tx_thread_data, tx_stack, K_THREAD_STACK_SIZEOF(tx_stack),
+                  tx_thread_fn, NULL, NULL, NULL, 6, 0, K_NO_WAIT);
+  k_thread_name_set(&tx_thread_data, "i2s_tx");
+
+  err = i2s_trigger(i2s_dev, I2S_DIR_BOTH, I2S_TRIGGER_START);
   if (err) {
       printk("I2S start failed: %d\n", err);
       return err;
