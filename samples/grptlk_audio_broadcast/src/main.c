@@ -63,6 +63,11 @@ K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
 /* Queue for passing decoded uplink audio to I2S TX (speaker) */
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
 
+/* Mono uplink mix fed back to the encoder for conference loopback.
+ * Depth 2 = double-buffered at 10 ms each; one frame being consumed
+ * by the encoder while the decoder produces the next. */
+K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 4);
+
 /* Uplink Decoder: encoded frames queued from iso_recv, decoded in a thread */
 struct uplink_frame {
     uint16_t len;
@@ -74,7 +79,7 @@ struct k_msgq uplink_rx_q[NUM_RX_BIS];
 char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][8 * sizeof(struct uplink_frame)];
 K_SEM_DEFINE(uplink_rx_sem, 0, 100);
 
-K_THREAD_STACK_DEFINE(uplink_dec_stack, 4096);
+K_THREAD_STACK_DEFINE(uplink_dec_stack, 6144);
 static struct k_thread uplink_dec_thread_data;
 
 /* RX Thread */
@@ -284,6 +289,19 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
         continue;
     }
 
+    /* Mix in uplink loopback (conference bridge) if a frame is ready.
+     * K_NO_WAIT: if the decoder hasn't produced yet (no remote senders,
+     * or timing slip), encode mic-only audio without blocking. */
+    int16_t uplink_mono[PCM_SAMPLES_PER_FRAME];
+    if (k_msgq_get(&uplink_mix_q, uplink_mono, K_NO_WAIT) == 0) {
+        for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+            int32_t s = (int32_t)send_pcm_data[i] + (int32_t)uplink_mono[i];
+            if (s > 32767)       { s = 32767; }
+            else if (s < -32768) { s = -32768; }
+            send_pcm_data[i] = (int16_t)s;
+        }
+    }
+
     ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
                      octets_per_frame, encoded_buf);
 
@@ -356,7 +374,22 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
             stereo_buf[2 * i]     = (int16_t)sample; /* Left  */
             stereo_buf[2 * i + 1] = (int16_t)sample; /* Right */
         }
-        
+
+        /* Publish clipped mono mix for conference loopback into the encoder.
+         * stereo_buf[2*i] == stereo_buf[2*i+1] (L=R), take left channel.
+         * K_NO_WAIT: drop if encoder hasn't consumed the previous frame yet. */
+        int16_t mono_mix[PCM_SAMPLES_PER_FRAME];
+        for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+            mono_mix[i] = stereo_buf[2 * i];
+        }
+        if (k_msgq_put(&uplink_mix_q, mono_mix, K_NO_WAIT) != 0) {
+            static int mix_overrun_cnt = 0;
+            if ((mix_overrun_cnt++ % 100) == 0) {
+                printk("uplink_mix_q full - encoder lagging (cnt=%d)\n",
+                       mix_overrun_cnt);
+            }
+        }
+
         if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
             static int overrun_cnt = 0;
             if ((overrun_cnt++ % 100) == 0) {
