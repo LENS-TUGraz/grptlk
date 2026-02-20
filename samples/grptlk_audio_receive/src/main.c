@@ -105,6 +105,10 @@ static K_SEM_DEFINE(sem_per_big_info, 0, 1);
 static K_SEM_DEFINE(sem_big_sync, 0, BIS_ISO_CHAN_COUNT);
 static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
 
+/* Counts how many BIS channels reached the connected state in the current
+ * BIG sync attempt. Written by iso_connected (BT RX thread), read by main. */
+static atomic_t big_chan_connected;
+
 static bool iso_datapaths_setup = false;
 
 /* Encoded Audio FIFO (RX) */
@@ -496,12 +500,22 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 static void iso_connected(struct bt_iso_chan *chan) {
     printk("ISO Channel %p connected\n", chan);
+    atomic_inc(&big_chan_connected);
     k_sem_give(&sem_big_sync);
 }
 
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason) {
     printk("ISO Channel %p disconnected with reason 0x%02x\n", chan, reason);
-    if (reason != BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
+    if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB ||
+        reason == BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
+        /* Channel never reached the connected state:
+         *   0x3e — BIG sync timed out / PA sync was lost during establishment
+         *   0x44 — explicit bt_iso_big_terminate() called by the host
+         * Unblock the connect-wait loop immediately instead of stalling for
+         * the full TIMEOUT_SYNC_CREATE period. */
+        k_sem_give(&sem_big_sync);
+    } else {
+        /* Channel was fully connected and is now lost (broadcaster out of range). */
         k_sem_give(&sem_big_sync_lost);
     }
 }
@@ -952,6 +966,7 @@ int main(void)
 
 	big_sync_create:
 		printk("Create BIG Sync...\n");
+		atomic_set(&big_chan_connected, 0);
 		err = bt_iso_big_sync(sync, &big_sync_param, &big);
 		if (err)
 		{
@@ -970,18 +985,28 @@ int main(void)
 			}
 			printk("BIG sync chan %u successful.\n", chan);
 		}
-		if (err)
+		if (err || (int)atomic_get(&big_chan_connected) < BIS_ISO_CHAN_COUNT)
 		{
-			printk("failed (err %d)\n", err);
+			/* Either timed out waiting, or all sem_takes succeeded but some
+			 * channels failed with 0x3e (PA sync lost during BIG sync). */
+			printk("BIG sync failed (err %d, connected %d/%d)\n",
+			       err, (int)atomic_get(&big_chan_connected), BIS_ISO_CHAN_COUNT);
 
 			printk("BIG Sync Terminate...");
 			err = bt_iso_big_terminate(big);
 			if (err)
 			{
-				printk("failed (err %d)\n", err);
-				return 0;
+				if (err == -EINVAL) {
+					/* Controller already cleaned up the BIG (e.g., because
+					 * PA sync was lost before BIG sync could establish). */
+					printk("already cleaned up by controller.\n");
+				} else {
+					printk("failed (err %d)\n", err);
+					return 0;
+				}
+			} else {
+				printk("done.\n");
 			}
-			printk("done.\n");
 
 			goto per_sync_lost_check;
 		}
@@ -1032,8 +1057,25 @@ int main(void)
 		err = k_sem_take(&sem_per_sync_lost, K_NO_WAIT);
 		if (err)
 		{
-			/* Periodic Sync active, go back to creating BIG Sync */
-			goto big_sync_create;
+			/* PA sync still active. Wait for a fresh BIGInfo advertisement
+			 * before attempting BIG sync. This confirms the broadcaster's BIG
+			 * is actually being advertised, avoiding a wasted sync attempt
+			 * (and the associated stall) when the broadcaster is still offline.
+			 * The BIGInfo arrives within ~1 PA interval when the broadcaster
+			 * is present; 5 s gives ample margin. */
+			printk("Waiting for fresh BIGInfo...\n");
+			k_sem_reset(&sem_per_big_info);
+			err = k_sem_take(&sem_per_big_info, K_SECONDS(5));
+			if (err == 0)
+			{
+				/* Broadcaster is active, try BIG sync */
+				goto big_sync_create;
+			}
+
+			/* No BIGInfo in 5 s — broadcaster's BIG is not available.
+			 * Wait for PA sync to terminate naturally, then restart scan. */
+			printk("No BIGInfo, waiting for PA sync to terminate...\n");
+			(void)k_sem_take(&sem_per_sync_lost, K_FOREVER);
 		}
 		printk("Periodic sync lost.\n");
 	} while (true);
