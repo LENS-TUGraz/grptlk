@@ -260,11 +260,12 @@ void volume_control_thread(void *p1, void *p2, void *p3)
 #define POT_MAX_MV 3300		/* clamp top of range */
 #define MAX_VOL_Q15 13668	/* cap at ~50% */
 
-	static bool muted = true;
+	static bool    muted    = true;
+	static uint8_t last_reg = 0xFF; /* sentinel: any value > 40 forces write on first iteration */
 
 	int err;
 	int16_t sample;
-	struct adc_sequence seq = {0}; 
+	struct adc_sequence seq = {0};
 
 	/* Initialize sequence from DT spec, then point it to our buffer */
 	adc_sequence_init_dt(&pot, &seq);
@@ -290,15 +291,7 @@ void volume_control_thread(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		/* --- NEW: enable pin high iff pot > 0 mV --- */
-		if (mv > 0)
-		{
-			gpio_pin_set_dt(&p1_09_en, 1); /* enable/high */
-		}
-		else
-		{
-			gpio_pin_set_dt(&p1_09_en, 0); /* disable/low */
-		}
+		gpio_pin_set_dt(&p1_09_en, (mv > 0) ? 1 : 0);
 
 		/* Hysteretic mute */
 		if (mv <= POT_MUTE_ON_MV)
@@ -307,6 +300,7 @@ void volume_control_thread(void *p1, void *p2, void *p3)
 			{
 				max9867_set_mute(true);
 				muted = true;
+				last_reg = 0xFF; /* force re-write after unmute */
 			}
 			k_sleep(K_MSEC(100));
 			continue;
@@ -324,12 +318,15 @@ void volume_control_thread(void *p1, void *p2, void *p3)
 		int32_t mv_rel = (mv - POT_MUTE_OFF_MV);
 		uint16_t vol_q15 = (uint16_t)((mv_rel * (int32_t)MAX_VOL_Q15 + span / 2) / span);
 
-		(void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
-
-		// int vol_pct = (int)((vol_q15 * 100 + MAX_VOL_Q15 / 2) / MAX_VOL_Q15);
-		// printk("pot=%ld mV  vol_q15=%u  vol=%d%%  muted=%d  en=%d\n",
-		// 	   (long)mv, vol_q15, vol_pct, (int)muted,
-		// 	   gpio_pin_get_dt(&p1_09_en));
+		/* Only write to MAX9867 when the hardware register byte would change.
+		 * The driver maps vol_q15 to a 5-bit register (41 steps). ADC noise
+		 * causes vol_q15 to jitter by a few units each reading, but the
+		 * register value only changes when the pot moves by ~177 mV. */
+		uint8_t new_reg = (uint8_t)(40 - ((int32_t)vol_q15 * 41 / 0x7FFF));
+		if (new_reg != last_reg) {
+			(void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
+			last_reg = new_reg;
+		}
 
 		k_sleep(K_MSEC(100));
 	}

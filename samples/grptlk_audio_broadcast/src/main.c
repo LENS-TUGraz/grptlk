@@ -63,6 +63,15 @@ K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
 /* Queue for passing decoded uplink audio to I2S TX (speaker) */
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
 
+/* Uplink Decoder: encoded frames queued from iso_recv, decoded in a thread */
+struct uplink_frame {
+    uint16_t len;
+    uint8_t  data[CONFIG_BT_ISO_TX_MTU];
+};
+K_MSGQ_DEFINE(uplink_rx_q, sizeof(struct uplink_frame), 8, 4);
+K_THREAD_STACK_DEFINE(uplink_dec_stack, 4096);
+static struct k_thread uplink_dec_thread_data;
+
 /* RX Thread */
 K_THREAD_STACK_DEFINE(rx_stack, 4096);
 static struct k_thread rx_thread_data;
@@ -71,9 +80,10 @@ static struct k_thread rx_thread_data;
 K_THREAD_STACK_DEFINE(tx_stack, 2048);
 static struct k_thread tx_thread_data;
 
-/* Encoder Thread Configuration */
+/* Encoder / Decoder Thread Configuration */
 #define ENCODER_STACK_SIZE 4096
-#define ENCODER_PRIORITY 5
+#define ENCODER_PRIORITY   5
+#define DECODER_PRIORITY   5
 
 /* ISO / BAP Configuration */
 #define NUM_PRIME_PACKETS 2
@@ -101,7 +111,6 @@ static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
 /* Encoder Thread Objects */
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 static struct k_thread encoder_thread_data;
-static uint8_t audio_ctr = 0;
 
 /* Encoded Audio FIFO */
 /* Size of 2 ensures double buffering: one being sent, one being prepared.
@@ -123,7 +132,6 @@ static struct bt_iso_chan
     bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 
 static uint16_t seq_num;
-static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
 
 static struct bt_iso_big_create_param big_create_param = {
     .num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
@@ -285,6 +293,57 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*                           Uplink Decoder Thread                            */
+/* -------------------------------------------------------------------------- */
+
+static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
+{
+    struct uplink_frame frame;
+    int16_t recv_pcm_data[PCM_SAMPLES_PER_FRAME];
+    int ret;
+
+    printk("Uplink decoder thread started\n");
+
+    while (1) {
+        /* 12 ms timeout (> 10 ms ISO interval): if no packet arrives, run PLC
+         * to keep the output pipeline ticking even during sync loss. */
+        ret = k_msgq_get(&uplink_rx_q, &frame, K_MSEC(12));
+
+        if (ret == 0 && frame.len > 0) {
+            ret = lc3_decode(lc3_decoder, frame.data, frame.len,
+                             LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+            if (ret != 0) {
+                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+            }
+        } else {
+            /* Timeout (no packet) or ghost packet (len == 0) → PLC */
+            static int plc_cnt = 0;
+            if ((plc_cnt++ % 100) == 0) {
+                printk("Uplink PLC (%s)\n", (ret != 0) ? "timeout" : "ghost");
+            }
+            ret = lc3_decode(lc3_decoder, NULL, preset_active.qos.sdu,
+                             LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+            if (ret != 0) {
+                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+            }
+        }
+
+        /* Upmix mono → stereo (L=R) and push to I2S TX queue */
+        int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2];
+        for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+            stereo_buf[2 * i]     = recv_pcm_data[i]; /* Left  */
+            stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
+        }
+        if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
+            static int overrun_cnt = 0;
+            if ((overrun_cnt++ % 100) == 0) {
+                printk("Uplink TX queue full - dropping frame (cnt=%d)\n", overrun_cnt);
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               Volume Control                               */
 /* -------------------------------------------------------------------------- */
 
@@ -298,7 +357,8 @@ void volume_control_thread(void *p1, void *p2, void *p3)
 #define POT_MAX_MV      3300
 #define MAX_VOL_Q15     13668
 
-    static bool muted = true;
+    static bool    muted    = true;
+    static uint8_t last_reg = 0xFF; /* sentinel: any value > 40 forces write on first iteration */
 
     int err;
     int16_t sample;
@@ -324,16 +384,13 @@ void volume_control_thread(void *p1, void *p2, void *p3)
             continue;
         }
 
-        if (mv > 0) {
-            gpio_pin_set_dt(&p1_09_en, 1);
-        } else {
-            gpio_pin_set_dt(&p1_09_en, 0);
-        }
+        gpio_pin_set_dt(&p1_09_en, (mv > 0) ? 1 : 0);
 
         if (mv <= POT_MUTE_ON_MV) {
             if (!muted) {
                 max9867_set_mute(true);
                 muted = true;
+                last_reg = 0xFF; /* force re-write after unmute */
             }
             k_sleep(K_MSEC(100));
             continue;
@@ -345,11 +402,19 @@ void volume_control_thread(void *p1, void *p2, void *p3)
         if (mv > POT_MAX_MV) {
             mv = POT_MAX_MV;
         }
-        int32_t span = POT_MAX_MV - POT_MUTE_OFF_MV;
-        int32_t mv_rel = (mv - POT_MUTE_OFF_MV);
+        int32_t span    = POT_MAX_MV - POT_MUTE_OFF_MV;
+        int32_t mv_rel  = (mv - POT_MUTE_OFF_MV);
         uint16_t vol_q15 = (uint16_t)((mv_rel * (int32_t)MAX_VOL_Q15 + span / 2) / span);
 
-        (void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
+        /* Only write to MAX9867 when the hardware register byte would change.
+         * The driver maps vol_q15 to a 5-bit register (41 steps). ADC noise
+         * causes vol_q15 to jitter by a few units each reading, but the
+         * register value only changes when the pot moves by ~177 mV. */
+        uint8_t new_reg = (uint8_t)(40 - ((int32_t)vol_q15 * 41 / 0x7FFF));
+        if (new_reg != last_reg) {
+            (void)max9867_set_volume((int16_t)vol_q15, (int16_t)MAX_VOL_Q15);
+            last_reg = new_reg;
+        }
 
         k_sleep(K_MSEC(100));
     }
@@ -377,30 +442,26 @@ static void iso_sent(struct bt_iso_chan *chan) {
     int err;
     struct net_buf *buf;
 
-    buf = net_buf_alloc(&bis_tx_pool, K_FOREVER);
+    buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
     if (!buf) {
-      printk("Data buffer allocate timeout\n");
+      printk("iso_sent: net_buf pool exhausted\n");
       return;
     }
 
     net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 
-    int ret;
     uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
 
     /* Fetch already encoded frame from queue (non-blocking) */
-    ret = k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT);
-    if (ret == 0) {
-      net_buf_add_mem(buf, enc_data, sizeof(enc_data));
-    } else {
-      /* Underrun: Send silence or dummy data */
+    if (k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT) != 0) {
+      /* Underrun: encoder hasn't produced a frame yet — send silence */
       static int tx_underrun_cnt = 0;
       if ((tx_underrun_cnt++ % 100) == 0) {
-          printk("Broadcaster TX Underrun (Queue Empty) - sending silence (cnt=%d)\n", tx_underrun_cnt);
+          printk("TX underrun - sending silence (cnt=%d)\n", tx_underrun_cnt);
       }
-      memset(iso_data, 0, sizeof(iso_data));
-      net_buf_add_mem(buf, iso_data, sizeof(iso_data));
+      memset(enc_data, 0, sizeof(enc_data));
     }
+    net_buf_add_mem(buf, enc_data, sizeof(enc_data));
 
     err = bt_iso_chan_send(chan, buf, seq_num);
     if (err < 0) {
@@ -415,35 +476,18 @@ static void iso_sent(struct bt_iso_chan *chan) {
 
 static void iso_recv(struct bt_iso_chan *chan,
                      const struct bt_iso_recv_info *info, struct net_buf *buf) {
-  int16_t recv_pcm_data[PCM_SAMPLES_PER_FRAME];
-  int err;
+  struct uplink_frame frame;
 
-  if (buf->len == 0 || !(info->flags & BT_ISO_FLAGS_VALID)) {
-    /* PLC */
-    err = lc3_decode(lc3_decoder, NULL, preset_active.qos.sdu, LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+  if (buf && buf->len == CONFIG_BT_ISO_TX_MTU && (info->flags & BT_ISO_FLAGS_VALID)) {
+      frame.len = buf->len;
+      memcpy(frame.data, buf->data, buf->len);
   } else {
-    err = lc3_decode(lc3_decoder, buf->data, buf->len, LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
+      /* Lost or invalid packet: push a ghost frame to trigger PLC in decoder */
+      frame.len = 0;
   }
 
-  if (err == 0) {
-      /* Upmix decoded mono to stereo and push to I2S TX (speaker) */
-      int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2];
-      for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-          stereo_buf[2 * i]     = recv_pcm_data[i]; /* Left  */
-          stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
-      }
-      if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-          static int overrun_cnt = 0;
-          if ((overrun_cnt++ % 100) == 0) {
-              printk("Uplink TX queue full - dropping frame (cnt=%d)\n", overrun_cnt);
-          }
-      }
-  } else {
-      static int decode_err_cnt = 0;
-      if ((decode_err_cnt++ % 100) == 0) {
-          printk("Uplink RX Decode Error: %d (cnt=%d)\n", err, decode_err_cnt);
-      }
-  }
+  /* K_NO_WAIT: must not block in BT RX callback context */
+  k_msgq_put(&uplink_rx_q, &frame, K_NO_WAIT);
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -648,9 +692,6 @@ int main(void) {
   err = max9867_init();
   if (err) {
       printk("MAX9867 init failed: %d\n", err);
-      /* Proceed anyway? Or return error? For robustness let's return error but maybe continue if just verifying logic without hardware? */
-      /* Real HW: Return error. BSIM: Might fail if I2C simulated? Assuming BSIM handles it via mocks or real I2C model. */
-      /* If using custom driver in BSIM, it might need I2C model. */
       return err;
   }
 
@@ -753,6 +794,13 @@ int main(void) {
                   K_THREAD_STACK_SIZEOF(encoder_stack), encoder_thread_func,
                   NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
   k_thread_name_set(&encoder_thread_data, "lc3_encoder");
+
+  /* Start uplink decoder thread (decodes incoming mic audio from receiver) */
+  k_thread_create(&uplink_dec_thread_data, uplink_dec_stack,
+                  K_THREAD_STACK_SIZEOF(uplink_dec_stack),
+                  uplink_decoder_thread_func, NULL, NULL, NULL,
+                  DECODER_PRIORITY, 0, K_NO_WAIT);
+  k_thread_name_set(&uplink_dec_thread_data, "uplink_dec");
 
   /* --- Bluetooth Setup --- */
   err = bt_enable(NULL);
