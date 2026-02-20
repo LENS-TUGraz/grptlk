@@ -68,7 +68,12 @@ struct uplink_frame {
     uint16_t len;
     uint8_t  data[CONFIG_BT_ISO_TX_MTU];
 };
-K_MSGQ_DEFINE(uplink_rx_q, sizeof(struct uplink_frame), 8, 4);
+/* One message queue per RX BIS */
+#define NUM_RX_BIS (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
+struct k_msgq uplink_rx_q[NUM_RX_BIS];
+char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][8 * sizeof(struct uplink_frame)];
+K_SEM_DEFINE(uplink_rx_sem, 0, 100);
+
 K_THREAD_STACK_DEFINE(uplink_dec_stack, 4096);
 static struct k_thread uplink_dec_thread_data;
 
@@ -104,8 +109,8 @@ static const struct bt_data ad[] = {
 /* LC3 Codec Objects */
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
-static lc3_decoder_t lc3_decoder;
-static lc3_decoder_mem_16k_t lc3_decoder_mem;
+static lc3_decoder_t lc3_decoders[NUM_RX_BIS];
+static lc3_decoder_mem_16k_t lc3_decoder_mems[NUM_RX_BIS];
 static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
 
 /* Encoder Thread Objects */
@@ -298,46 +303,64 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3) {
 
 static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-    struct uplink_frame frame;
-    int16_t recv_pcm_data[PCM_SAMPLES_PER_FRAME];
-    int ret;
-
-    printk("Uplink decoder thread started\n");
+    printk("Uplink decoder thread started (mixing %d BISes)\\n", NUM_RX_BIS);
 
     while (1) {
-        /* 12 ms timeout (> 10 ms ISO interval): if no packet arrives, run PLC
+        /* Pace by waiting for at least one packet from iso_recv. 
+         * 12 ms timeout (> 10 ms ISO interval): if no packet arrives, run PLC
          * to keep the output pipeline ticking even during sync loss. */
-        ret = k_msgq_get(&uplink_rx_q, &frame, K_MSEC(12));
+        k_sem_take(&uplink_rx_sem, K_MSEC(12));
+        k_sem_reset(&uplink_rx_sem);
 
-        if (ret == 0 && frame.len > 0) {
-            ret = lc3_decode(lc3_decoder, frame.data, frame.len,
-                             LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
-            if (ret != 0) {
-                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+        int32_t mixed_pcm[PCM_SAMPLES_PER_FRAME] = {0};
+
+        /* Process all RX BISes */
+        for (int i = 0; i < NUM_RX_BIS; i++) {
+            struct uplink_frame frame;
+            int16_t stream_pcm[PCM_SAMPLES_PER_FRAME];
+            int ret;
+
+            ret = k_msgq_get(&uplink_rx_q[i], &frame, K_NO_WAIT);
+
+            if (ret == 0 && frame.len > 0) {
+                ret = lc3_decode(lc3_decoders[i], frame.data, frame.len,
+                                 LC3_PCM_FORMAT_S16, stream_pcm, 1);
+                if (ret != 0) {
+                    memset(stream_pcm, 0, sizeof(stream_pcm));
+                }
+            } else {
+                /* Timeout (no packet) or ghost packet (len == 0) → PLC */
+                ret = lc3_decode(lc3_decoders[i], NULL, preset_active.qos.sdu,
+                                 LC3_PCM_FORMAT_S16, stream_pcm, 1);
+                if (ret != 0) {
+                    memset(stream_pcm, 0, sizeof(stream_pcm));
+                }
             }
-        } else {
-            /* Timeout (no packet) or ghost packet (len == 0) → PLC */
-            static int plc_cnt = 0;
-            if ((plc_cnt++ % 100) == 0) {
-                printk("Uplink PLC (%s)\n", (ret != 0) ? "timeout" : "ghost");
-            }
-            ret = lc3_decode(lc3_decoder, NULL, preset_active.qos.sdu,
-                             LC3_PCM_FORMAT_S16, recv_pcm_data, 1);
-            if (ret != 0) {
-                memset(recv_pcm_data, 0, sizeof(recv_pcm_data));
+
+            /* Mix into 32-bit accumulator to avoid overflow during summation */
+            for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
+                mixed_pcm[s] += stream_pcm[s];
             }
         }
 
-        /* Upmix mono → stereo (L=R) and push to I2S TX queue */
+        /* Upmix mixed results (mono) → stereo (L=R) with anti-clipping protection, 
+         * then push to I2S TX queue */
         int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * 2];
         for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-            stereo_buf[2 * i]     = recv_pcm_data[i]; /* Left  */
-            stereo_buf[2 * i + 1] = recv_pcm_data[i]; /* Right */
+            int32_t sample = mixed_pcm[i];
+            if (sample > 32767) {
+                sample = 32767;
+            } else if (sample < -32768) {
+                sample = -32768;
+            }
+            stereo_buf[2 * i]     = (int16_t)sample; /* Left  */
+            stereo_buf[2 * i + 1] = (int16_t)sample; /* Right */
         }
+        
         if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
             static int overrun_cnt = 0;
             if ((overrun_cnt++ % 100) == 0) {
-                printk("Uplink TX queue full - dropping frame (cnt=%d)\n", overrun_cnt);
+                printk("Uplink TX queue full - dropping frame (cnt=%d)\\n", overrun_cnt);
             }
         }
     }
@@ -486,8 +509,21 @@ static void iso_recv(struct bt_iso_chan *chan,
       frame.len = 0;
   }
 
-  /* K_NO_WAIT: must not block in BT RX callback context */
-  k_msgq_put(&uplink_rx_q, &frame, K_NO_WAIT);
+  /* Find which BIS this is */
+  int bis_idx = -1;
+  for (int i = 0; i < NUM_RX_BIS; i++) {
+      if (chan == bis[i]) {
+          bis_idx = i;
+          break;
+      }
+  }
+
+  if (bis_idx >= 0 && bis_idx < NUM_RX_BIS) {
+      /* K_NO_WAIT: must not block in BT RX callback context */
+      if (k_msgq_put(&uplink_rx_q[bis_idx], &frame, K_NO_WAIT) == 0) {
+          k_sem_give(&uplink_rx_sem);
+      }
+  }
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -764,8 +800,14 @@ int main(void) {
                   rx_thread_func, NULL, NULL, NULL, 5, 0, K_NO_WAIT);
   k_thread_name_set(&rx_thread_data, "i2s_rx");
 
+  /* Dynamically initialize message queues for uplinks */
+  for (int i = 0; i < NUM_RX_BIS; i++) {
+      k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], 
+                  sizeof(struct uplink_frame), 8);
+  }
+
   /* --- LC3 Setup --- */
-  printk("Initializing lc3 encoder\n");
+  printk("Initializing lc3 encoder\\n");
   memset(send_pcm_data, 0, sizeof(send_pcm_data));
 
   /* Using parameters derived from the active BAP preset
@@ -777,16 +819,18 @@ int main(void) {
       lc3_setup_encoder(preset_active.qos.interval, 16000, 0, &lc3_encoder_mem);
 
   if (lc3_encoder == NULL) {
-    printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+    printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\\n");
     return -EIO;
   }
   
-  lc3_decoder = 
-      lc3_setup_decoder(preset_active.qos.interval, 16000, 0, &lc3_decoder_mem);
+  for (int i = 0; i < NUM_RX_BIS; i++) {
+      lc3_decoders[i] = 
+          lc3_setup_decoder(preset_active.qos.interval, 16000, 0, &lc3_decoder_mems[i]);
 
-  if (lc3_decoder == NULL) {
-    printk("ERROR: Failed to setup LC3 decoder\n");
-    return -EIO;
+      if (lc3_decoders[i] == NULL) {
+        printk("ERROR: Failed to setup LC3 decoder %d\\n", i);
+        return -EIO;
+      }
   }
 
   /* Start encoding thread */
