@@ -145,6 +145,7 @@ NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool,
 
 static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 static struct bt_iso_chan *bis[BIS_ISO_CHAN_COUNT];
+static struct bt_iso_chan *sync_bis[UPLINK_BIS];
 
 static uint16_t seq_num;
 
@@ -161,9 +162,12 @@ static struct bt_iso_chan_qos bis_iso_qos = {
 };
 
 static struct bt_iso_big_sync_param big_sync_param = {
-	.bis_channels = bis,
-	.num_bis = BIS_ISO_CHAN_COUNT,
-	.bis_bitfield = BIT_MASK(BIS_ISO_CHAN_COUNT),
+	/* Keep BIS indices contiguous for controller sync scheduler:
+	 * sync BIS1..BIS(UPLINK_BIS), but use data paths only on BIS1 and UPLINK_BIS.
+	 */
+	.bis_channels = sync_bis,
+	.num_bis = ARRAY_SIZE(sync_bis),
+	.bis_bitfield = BIT_MASK(UPLINK_BIS),
 	.mse = BT_ISO_SYNC_MSE_ANY,
 	.sync_timeout = 100, /* 10 ms units */
 };
@@ -685,6 +689,31 @@ static void reset_semaphores(void)
 	k_sem_reset(&sem_big_sync_lost);
 }
 
+static bool bis_channels_idle(void)
+{
+	for (uint8_t i = 0U; i < BIS_ISO_CHAN_COUNT; i++) {
+		if (bis[i]->iso != NULL) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void wait_bis_channels_idle(k_timeout_t timeout)
+{
+	int64_t deadline_ms = k_uptime_get() + k_ticks_to_ms_floor64(timeout.ticks);
+
+	while (!bis_channels_idle()) {
+		if (k_uptime_get() >= deadline_ms) {
+			break;
+		}
+
+		/* Prefer consuming disconnect notifications if available. */
+		(void)k_sem_take(&sem_big_sync_lost, K_MSEC(100));
+	}
+}
+
 /* -------------------------------------------------------------------------- */
 /*                               Setup Helpers                                */
 /* -------------------------------------------------------------------------- */
@@ -696,35 +725,78 @@ static void bis_channels_init(void)
 		bis_iso_chan[i].qos = &bis_iso_qos;
 		bis[i] = &bis_iso_chan[i];
 	}
+
+	for (uint8_t i = 0U; i < ARRAY_SIZE(sync_bis); i++) {
+		sync_bis[i] = bis[i];
+	}
+}
+
+static int bis_channel_index(const struct bt_iso_chan *chan)
+{
+	for (uint8_t i = 0U; i < BIS_ISO_CHAN_COUNT; i++) {
+		if (bis[i] == chan) {
+			return i;
+		}
+	}
+
+	return -1;
 }
 
 static int setup_iso_datapaths(void)
 {
 	int err;
 
-	for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++) {
+	for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
+		struct bt_iso_chan *chan = sync_bis[i];
+		int chan_idx = bis_channel_index(chan);
 		const struct bt_iso_chan_path hci_path = {
 			.pid = BT_ISO_DATA_PATH_HCI,
 			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 		};
 		uint8_t dir;
 
-		printk("Setting data path chan %u...\n", chan);
+		if (chan_idx < 0) {
+			printk("Unknown BIS channel pointer %p\n", chan);
+			return -EINVAL;
+		}
+
+		/* Only configure channels actually used by this app:
+		 * - BIS1 (downlink audio)
+		 * - UPLINK_BIS (uplink mic)
+		 */
+		if ((chan != bis[0]) && (chan != bis[UPLINK_BIS - 1])) {
+			printk("Skipping data path chan %d (unused)\n", chan_idx);
+			continue;
+		}
+
+		printk("Setting data path chan %d...\n", chan_idx);
 
 		/* Receiver role in group-talk:
-		 * - BIS1 (chan 0): downlink CTLR->HOST
-		 * - BIS2..BIS5: uplink HOST->CTLR
+		 * - BIS1: downlink CTLR->HOST
+		 * - UPLINK_BIS: uplink HOST->CTLR
 		 */
-		dir = (chan == 0U) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
-				   : BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+		dir = (chan == bis[0]) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
+				       : BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 
-		err = bt_iso_setup_data_path(bis[chan], dir, &hci_path);
+		err = bt_iso_setup_data_path(chan, dir, &hci_path);
+		if (err == -EACCES) {
+			/* Controller reports "command disallowed" when a stale path is
+			 * still configured on a reused BIS handle. Remove both possible
+			 * directions and retry once.
+			 */
+			printk("Data path chan %d busy, removing stale path and retrying...\n",
+			       chan_idx);
+			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_CTLR_TO_HOST);
+			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_HOST_TO_CTLR);
+			err = bt_iso_setup_data_path(chan, dir, &hci_path);
+		}
+
 		if (err) {
-			printk("Failed to setup ISO data path for chan %u: %d\n", chan, err);
+			printk("Failed to setup ISO data path for chan %d: %d\n", chan_idx, err);
 			return err;
 		}
 
-		printk("Setting data path complete chan %u.\n", chan);
+		printk("Setting data path complete chan %d.\n", chan_idx);
 	}
 
 	seq_num = 0U;
@@ -783,7 +855,8 @@ int main(void)
 	int err;
 
 	printk("Starting GRPTLK Receiver Audio DK\n");
-	printk("Config: downlink=BIS1, uplink=BIS%u\n", UPLINK_BIS);
+	printk("Config: downlink=BIS1, uplink=BIS%u, synced BIS bitfield=0x%02x\n",
+	       UPLINK_BIS, (unsigned int)big_sync_param.bis_bitfield);
 
 	bis_channels_init();
 
@@ -882,50 +955,75 @@ int main(void)
 		}
 
 big_sync_create:
+		if (!bis_channels_idle()) {
+			printk("Waiting for previous BIG channel cleanup...\n");
+			wait_bis_channels_idle(K_SECONDS(2));
+		}
+
+		if (!bis_channels_idle()) {
+			printk("Previous BIG channels still allocated, waiting for new BIGInfo...\n");
+			goto per_sync_lost_check;
+		}
+
 		printk("Create BIG Sync...\n");
 		atomic_set(&big_chan_connected, 0);
 		err = bt_iso_big_sync(sync, &big_sync_param, &big);
 		if (err) {
 			printk("bt_iso_big_sync failed: %d\n", err);
+			if (err == -EALREADY) {
+				wait_bis_channels_idle(K_SECONDS(2));
+				goto per_sync_lost_check;
+			}
 			return err;
 		}
 
-		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++) {
-			printk("Waiting for BIG sync chan %u...\n", chan);
+		for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
+			int chan_idx = bis_channel_index(sync_bis[i]);
+
+			printk("Waiting for BIG sync chan %d...\n", chan_idx);
 			err = k_sem_take(&sem_big_sync, TIMEOUT_SYNC_CREATE);
 			if (err) {
 				break;
 			}
-			printk("BIG sync chan %u successful.\n", chan);
+			printk("BIG sync chan %d successful.\n", chan_idx);
 		}
 
-		if (err || (int)atomic_get(&big_chan_connected) < BIS_ISO_CHAN_COUNT) {
-			printk("BIG sync failed (err %d, connected %d/%d)\n",
-			       err, (int)atomic_get(&big_chan_connected), BIS_ISO_CHAN_COUNT);
+		if (err || (int)atomic_get(&big_chan_connected) < (int)big_sync_param.num_bis) {
+			printk("BIG sync failed (err %d, connected %d/%u)\n",
+			       err, (int)atomic_get(&big_chan_connected), big_sync_param.num_bis);
 
 			err = bt_iso_big_terminate(big);
-			if ((err != 0) && (err != -EINVAL)) {
+			if ((err != 0) && (err != -EINVAL) && (err != -EIO)) {
 				printk("bt_iso_big_terminate failed: %d\n", err);
 				return err;
 			}
+			wait_bis_channels_idle(K_SECONDS(2));
 			goto per_sync_lost_check;
 		}
 
 		printk("BIG sync established.\n");
 		err = setup_iso_datapaths();
 		if (err) {
-			(void)bt_iso_big_terminate(big);
+			int term_err = bt_iso_big_terminate(big);
+
+			if ((term_err != 0) && (term_err != -EINVAL) && (term_err != -EIO)) {
+				printk("bt_iso_big_terminate failed: %d\n", term_err);
+				return term_err;
+			}
+			wait_bis_channels_idle(K_SECONDS(2));
 			goto per_sync_lost_check;
 		}
 
-		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++) {
-			printk("Waiting for BIG sync lost chan %u...\n", chan);
+		for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
+			int chan_idx = bis_channel_index(sync_bis[i]);
+
+			printk("Waiting for BIG sync lost chan %d...\n", chan_idx);
 			err = k_sem_take(&sem_big_sync_lost, K_FOREVER);
 			if (err) {
 				printk("sem_big_sync_lost failed: %d\n", err);
 				return err;
 			}
-			printk("BIG sync lost chan %u.\n", chan);
+			printk("BIG sync lost chan %d.\n", chan_idx);
 		}
 		printk("BIG sync lost.\n");
 
