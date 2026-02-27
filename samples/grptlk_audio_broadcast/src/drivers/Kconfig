@@ -1,0 +1,3 @@
+module = MAX9867
+module-str = max9867
+source "subsys/logging/Kconfig.template.log_config"
