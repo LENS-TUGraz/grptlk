@@ -1,0 +1,21 @@
+#ifndef GRPTLK_AUDIO_H_
+#define GRPTLK_AUDIO_H_
+
+#include <stdint.h>
+#include <zephyr/kernel.h>
+
+#define AUDIO_SAMPLE_RATE_HZ 16000
+#define AUDIO_FRAME_DURATION_MS 10
+#define AUDIO_CHANNELS 2
+#define AUDIO_BITS_PER_SAMPLE 16
+#define AUDIO_SAMPLES_PER_FRAME \
+	((AUDIO_SAMPLE_RATE_HZ * AUDIO_FRAME_DURATION_MS) / 1000)
+#define AUDIO_BLOCK_BYTES \
+	(AUDIO_SAMPLES_PER_FRAME * AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8))
+
+typedef void (*audio_rx_cb_t)(const int16_t *mono_frame);
+
+int audio_init(struct k_msgq *playback_q, audio_rx_cb_t rx_cb);
+int audio_start(void);
+
+#endif /* GRPTLK_AUDIO_H_ */
