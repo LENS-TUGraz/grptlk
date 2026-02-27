@@ -1,0 +1,9 @@
+/* Use ACLK/HFCLKAUDIO for stable 16 kHz I2S master clocking on nRF5340 Audio DK. */
+
+&clock {
+	hfclkaudio-frequency = <12288000>;
+};
+
+&i2s0 {
+	clock-source = "ACLK";
+};

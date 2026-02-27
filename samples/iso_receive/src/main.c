@@ -192,7 +192,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	// printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
+	printk("TX: seq_num: %d - payload: %x\n", seq_num, iso_data[0]);
 
 	iso_send_count++;
 	seq_num++;
