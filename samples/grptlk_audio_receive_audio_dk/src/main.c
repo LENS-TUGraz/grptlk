@@ -45,7 +45,6 @@ static struct bt_bap_lc3_preset preset_active =
 #define BIS_ISO_CHAN_COUNT          5
 #define NUM_PRIME_PACKETS           2
 #define MIC_PEAK_DETECT_THRESHOLD   64
-#define UPLINK_TX_VU_BAR_WIDTH      24
 
 /* THIS IS THE BIS ON WHICH THE RECEIVER SENDS UPLINK AUDIO */
 #define UPLINK_BIS                  3
@@ -137,9 +136,6 @@ static bool iso_datapaths_setup;
 
 /* Set once at least one uplink SDU was accepted for transmission. */
 static atomic_t uplink_tx_active;
-/* Latest mic peak used by LC3 uplink encoder. */
-static atomic_t uplink_pcm_peak;
-static uint32_t uplink_tx_sent_cnt;
 
 NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool,
 			  BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
@@ -480,21 +476,6 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		/* Track mic activity for TX-side VU output in iso_sent path. */
-		{
-			uint32_t peak = 0U;
-
-			for (size_t i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-				const uint32_t a = (uint32_t)abs_s16(mono_pcm[i]);
-
-				if (a > peak) {
-					peak = a;
-				}
-			}
-
-			atomic_set(&uplink_pcm_peak, (atomic_val_t)peak);
-		}
-
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1,
 				 octets_per_frame, encoded_buf);
 		if (ret < 0) {
@@ -557,36 +538,6 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 	}
 
 	atomic_set(&uplink_tx_active, 1);
-	uplink_tx_sent_cnt++;
-	if ((uplink_tx_sent_cnt % 10U) == 0U) {
-		static uint32_t held_peak;
-		uint32_t peak = (uint32_t)atomic_get(&uplink_pcm_peak);
-		uint32_t level;
-		char bar[UPLINK_TX_VU_BAR_WIDTH + 1];
-
-		if (peak > held_peak) {
-			held_peak = peak;
-		} else {
-			held_peak = (held_peak * 7U) / 8U;
-		}
-
-		level = (held_peak * UPLINK_TX_VU_BAR_WIDTH) / 32767U;
-		if (level > UPLINK_TX_VU_BAR_WIDTH) {
-			level = UPLINK_TX_VU_BAR_WIDTH;
-		}
-
-		for (size_t i = 0; i < UPLINK_TX_VU_BAR_WIDTH; i++) {
-			bar[i] = (i < level) ? '#' : '.';
-		}
-		bar[UPLINK_TX_VU_BAR_WIDTH] = '\0';
-
-		printk("UL TX BIS%u VU [%s] peak=%5u\n", UPLINK_BIS, bar, held_peak);
-	}
-
-	if ((uplink_tx_sent_cnt % 200U) == 0U) {
-		printk("UL TX BIS%u stats: sent=%u seq=%u\n",
-		       UPLINK_BIS, uplink_tx_sent_cnt, seq_num);
-	}
 	seq_num++;
 	return 0;
 }

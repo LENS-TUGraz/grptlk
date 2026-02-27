@@ -48,7 +48,6 @@ static struct bt_bap_lc3_preset preset_active =
 #define SAMPLE_RATE_HZ AUDIO_I2S_SAMPLE_RATE_HZ
 #define FRAMES_PER_BLOCK AUDIO_I2S_SAMPLES_PER_BLOCK
 #define MIC_PEAK_DETECT_THRESHOLD 64
-#define UPLINK_DEC_VU_BAR_WIDTH 24
 
 /* I2S RX Buffers (double-buffered as in nrf5340_audio) */
 static uint32_t i2s_rx_buf_a[AUDIO_I2S_WORDS_PER_BLOCK];
@@ -247,55 +246,6 @@ static int selected_mic_channel = -1; /* -1=auto, 0=left, 1=right */
 static inline int32_t abs_s16(int16_t s)
 {
     return (s < 0) ? -(int32_t)s : (int32_t)s;
-}
-
-static void uplink_decoded_vu_meter_update(const int32_t *mixed_pcm)
-{
-    static uint32_t frame_cnt;
-    static uint32_t held_peak;
-    uint32_t peak = 0U;
-    uint32_t level;
-    char bar[UPLINK_DEC_VU_BAR_WIDTH + 1];
-
-    for (size_t i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-        int32_t s = mixed_pcm[i];
-        uint32_t a;
-
-        if (s > 32767) {
-            s = 32767;
-        } else if (s < -32768) {
-            s = -32768;
-        }
-
-        a = (uint32_t)abs_s16((int16_t)s);
-        if (a > peak) {
-            peak = a;
-        }
-    }
-
-    /* Fast attack, gentle decay. */
-    if (peak > held_peak) {
-        held_peak = peak;
-    } else {
-        held_peak = (held_peak * 7U) / 8U;
-    }
-
-    /* Decoder cadence is 10 ms; print every 20 ms. */
-    if ((frame_cnt++ & 0x1U) != 0U) {
-        return;
-    }
-
-    level = (held_peak * UPLINK_DEC_VU_BAR_WIDTH) / 32767U;
-    if (level > UPLINK_DEC_VU_BAR_WIDTH) {
-        level = UPLINK_DEC_VU_BAR_WIDTH;
-    }
-
-    for (size_t i = 0; i < UPLINK_DEC_VU_BAR_WIDTH; i++) {
-        bar[i] = (i < level) ? '#' : '.';
-    }
-    bar[UPLINK_DEC_VU_BAR_WIDTH] = '\0';
-
-    printk("UL RX VU [%s] peak=%5u\n", bar, held_peak);
 }
 
 static inline uint8_t mic_channel_pick(int32_t left_peak, int32_t right_peak)
@@ -536,8 +486,6 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
         mixed_pcm[s] += stream_pcm[s];
       }
     }
-
-    uplink_decoded_vu_meter_update(mixed_pcm);
 
     /* Mono mix to stereo words for I2S TX (L=R). */
     for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
