@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
-project(grptlk_audio_receive)
+project(grptlk_audio_receive_hwn001)
 
 target_sources(app PRIVATE src/main.c src/drivers/max9867.c)
 target_include_directories(app PRIVATE src/drivers)
