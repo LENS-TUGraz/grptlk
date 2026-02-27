@@ -1,4 +1,4 @@
-#include "audio_io.h"
+#include "audio.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -16,16 +16,16 @@
 #error "No cirrus,cs47l63 node available. Use nrf5340_audio_dk/nrf5340/cpuapp."
 #endif
 
-BUILD_ASSERT(AUDIO_IO_SAMPLE_RATE_HZ == AUDIO_I2S_SAMPLE_RATE_HZ,
-	     "audio_io and audio_i2s sample rate must match");
-BUILD_ASSERT(AUDIO_IO_SAMPLES_PER_FRAME == AUDIO_I2S_SAMPLES_PER_BLOCK,
-	     "audio_io and audio_i2s frame size must match");
-BUILD_ASSERT(AUDIO_IO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
-	     "audio_io and audio_i2s block size must match");
+BUILD_ASSERT(AUDIO_SAMPLE_RATE_HZ == AUDIO_I2S_SAMPLE_RATE_HZ,
+	     "audio and audio_i2s sample rate must match");
+BUILD_ASSERT(AUDIO_SAMPLES_PER_FRAME == AUDIO_I2S_SAMPLES_PER_BLOCK,
+	     "audio and audio_i2s frame size must match");
+BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
+	     "audio and audio_i2s block size must match");
 
 #define MIC_PEAK_DETECT_THRESHOLD 64
 
-static audio_io_rx_cb_t rx_cb;
+static audio_rx_cb_t rx_cb;
 static struct k_msgq *playback_q;
 static bool is_initialized;
 static bool is_started;
@@ -172,7 +172,7 @@ static void extract_selected_channel_to_mono(const uint32_t *rx_words, int16_t *
 
 static void i2s_process_rx_block(const uint32_t *rx_words)
 {
-	int16_t mono_frame[AUDIO_IO_SAMPLES_PER_FRAME];
+	int16_t mono_frame[AUDIO_SAMPLES_PER_FRAME];
 	int32_t left_peak;
 	int32_t right_peak;
 	uint8_t ch;
@@ -235,7 +235,7 @@ static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf
 	}
 }
 
-int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
+int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 {
 	int err;
 
@@ -260,7 +260,7 @@ int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
 	return 0;
 }
 
-int audio_io_start(void)
+int audio_start(void)
 {
 	int err;
 

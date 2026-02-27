@@ -1,7 +1,8 @@
 #include <errno.h>
 #include <zephyr/kernel.h>
 #include "lc3.h"
-#include "audio_io/audio_io.h"
+#include "io/audio.h"
+#include "io/led.h"
 #include <stdint.h>
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
@@ -26,10 +27,10 @@ static struct bt_bap_lc3_preset preset_active =
                                        BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
 /* Derived Audio Parameters */
-#define PCM_SAMPLES_PER_FRAME AUDIO_IO_SAMPLES_PER_FRAME
-#define SAMPLE_RATE_HZ AUDIO_IO_SAMPLE_RATE_HZ
-#define FRAMES_PER_BLOCK AUDIO_IO_SAMPLES_PER_FRAME
-#define BLOCK_BYTES AUDIO_IO_BLOCK_BYTES
+#define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
+#define SAMPLE_RATE_HZ AUDIO_SAMPLE_RATE_HZ
+#define FRAMES_PER_BLOCK AUDIO_SAMPLES_PER_FRAME
+#define BLOCK_BYTES AUDIO_BLOCK_BYTES
 
 /* PCM Queue (Mono frames for Encoder) */
 K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
@@ -524,8 +525,15 @@ int main(void) {
   struct bt_le_ext_adv *adv;
   struct bt_iso_big *big;
   int err;
+  int led_err;
 
   printk("Starting GRPTLK Broadcaster\n");
+  led_err = led_init();
+  if (led_err) {
+    printk("led_init failed: %d\n", led_err);
+  } else {
+    (void)led_set_broadcast_running(false);
+  }
 
   for (int i = 0; i < NUM_RX_BIS; i++) {
       k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i],
@@ -533,15 +541,15 @@ int main(void) {
   }
 
   /* --- Audio Setup --- */
-  err = audio_io_init(&tx_msgq, audio_rx_mono_frame);
+  err = audio_init(&tx_msgq, audio_rx_mono_frame);
   if (err) {
-      printk("audio_io_init failed: %d\n", err);
+      printk("audio_init failed: %d\n", err);
       return err;
   }
 
-  err = audio_io_start();
+  err = audio_start();
   if (err) {
-      printk("audio_io_start failed: %d\n", err);
+      printk("audio_start failed: %d\n", err);
       return err;
   }
 
@@ -625,5 +633,10 @@ int main(void) {
   }
 
   prime_and_start_iso_transmission();
+  led_err = led_set_broadcast_running(true);
+  if (led_err) {
+    printk("led_set_broadcast_running failed: %d\n", led_err);
+  }
+
   return 0;
 }

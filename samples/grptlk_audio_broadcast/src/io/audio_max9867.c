@@ -1,4 +1,4 @@
-#include "audio_io.h"
+#include "audio.h"
 
 #include <errno.h>
 #include <string.h>
@@ -12,9 +12,9 @@
 
 #include "drivers/max9867.h"
 
-#define CHANNELS AUDIO_IO_CHANNELS
-#define FRAMES_PER_BLOCK AUDIO_IO_SAMPLES_PER_FRAME
-#define BLOCK_BYTES AUDIO_IO_BLOCK_BYTES
+#define CHANNELS AUDIO_CHANNELS
+#define FRAMES_PER_BLOCK AUDIO_SAMPLES_PER_FRAME
+#define BLOCK_BYTES AUDIO_BLOCK_BYTES
 
 #define RX_BLOCK_COUNT 16
 #define TX_BLOCK_COUNT 8
@@ -25,9 +25,9 @@ BUILD_ASSERT(BLOCK_BYTES == 640, "max9867 backend expects 10 ms stereo 16-bit bl
 	DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels) && \
 	DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channel_names) && \
 	DT_NODE_HAS_PROP(DT_PATH(zephyr_user), enable_gpios)
-#define AUDIO_IO_HAS_VOLUME_CTRL 1
+#define AUDIO_HAS_VOLUME_CTRL 1
 #else
-#define AUDIO_IO_HAS_VOLUME_CTRL 0
+#define AUDIO_HAS_VOLUME_CTRL 0
 #endif
 
 static const struct device *i2s_dev;
@@ -35,7 +35,7 @@ K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
 K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
 
 static struct k_msgq *playback_q;
-static audio_io_rx_cb_t rx_cb;
+static audio_rx_cb_t rx_cb;
 static bool initialized;
 static bool started;
 
@@ -43,12 +43,12 @@ K_THREAD_STACK_DEFINE(rx_stack, 4096);
 static struct k_thread rx_thread_data;
 K_THREAD_STACK_DEFINE(tx_stack, 2048);
 static struct k_thread tx_thread_data;
-#if AUDIO_IO_HAS_VOLUME_CTRL
+#if AUDIO_HAS_VOLUME_CTRL
 K_THREAD_STACK_DEFINE(vol_stack, 1024);
 static struct k_thread vol_thread_data;
 #endif
 
-#if AUDIO_IO_HAS_VOLUME_CTRL
+#if AUDIO_HAS_VOLUME_CTRL
 static const struct adc_dt_spec pot =
 	ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), potentiometer);
 static const struct gpio_dt_spec p1_09_en =
@@ -74,7 +74,7 @@ static void tx_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	printk("audio_io tx thread running\n");
+	printk("audio tx thread running\n");
 
 	while (1) {
 		uint32_t free_slabs = k_mem_slab_num_free_get(&tx_slab);
@@ -135,7 +135,7 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	printk("audio_io rx thread running\n");
+	printk("audio rx thread running\n");
 
 	while (1) {
 		size_t got = sizeof(stereo_buf);
@@ -152,7 +152,7 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 	}
 }
 
-#if AUDIO_IO_HAS_VOLUME_CTRL
+#if AUDIO_HAS_VOLUME_CTRL
 static void volume_thread_fn(void *p1, void *p2, void *p3)
 {
 #define POT_MUTE_ON_MV  100
@@ -223,7 +223,7 @@ static void volume_thread_fn(void *p1, void *p2, void *p3)
 }
 #endif
 
-int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
+int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 {
 	int err;
 
@@ -238,7 +238,7 @@ int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
 	playback_q = tx_q;
 	rx_cb = mono_rx_cb;
 
-#if AUDIO_IO_HAS_VOLUME_CTRL
+#if AUDIO_HAS_VOLUME_CTRL
 	if (!adc_is_ready_dt(&pot)) {
 		printk("adc device not ready\n");
 		return -EIO;
@@ -272,7 +272,7 @@ int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
 		.channels = CHANNELS,
 		.format = I2S_FMT_DATA_FORMAT_I2S,
 		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
-		.frame_clk_freq = AUDIO_IO_SAMPLE_RATE_HZ,
+		.frame_clk_freq = AUDIO_SAMPLE_RATE_HZ,
 		.mem_slab = &rx_slab,
 		.block_size = BLOCK_BYTES,
 		.timeout = 2000,
@@ -289,7 +289,7 @@ int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
 		.channels = CHANNELS,
 		.format = I2S_FMT_DATA_FORMAT_I2S,
 		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
-		.frame_clk_freq = AUDIO_IO_SAMPLE_RATE_HZ,
+		.frame_clk_freq = AUDIO_SAMPLE_RATE_HZ,
 		.mem_slab = &tx_slab,
 		.block_size = BLOCK_BYTES,
 		.timeout = 1000,
@@ -316,7 +316,7 @@ int audio_io_init(struct k_msgq *tx_q, audio_io_rx_cb_t mono_rx_cb)
 	return 0;
 }
 
-int audio_io_start(void)
+int audio_start(void)
 {
 	int err;
 
@@ -330,7 +330,7 @@ int audio_io_start(void)
 
 	k_thread_create(&tx_thread_data, tx_stack, K_THREAD_STACK_SIZEOF(tx_stack),
 			tx_thread_fn, NULL, NULL, NULL, 6, 0, K_NO_WAIT);
-	k_thread_name_set(&tx_thread_data, "audio_io_tx");
+	k_thread_name_set(&tx_thread_data, "audio_tx");
 
 	err = i2s_trigger(i2s_dev, I2S_DIR_BOTH, I2S_TRIGGER_START);
 	if (err) {
@@ -340,12 +340,12 @@ int audio_io_start(void)
 
 	k_thread_create(&rx_thread_data, rx_stack, K_THREAD_STACK_SIZEOF(rx_stack),
 			rx_thread_fn, NULL, NULL, NULL, 5, 0, K_NO_WAIT);
-	k_thread_name_set(&rx_thread_data, "audio_io_rx");
+	k_thread_name_set(&rx_thread_data, "audio_rx");
 
-#if AUDIO_IO_HAS_VOLUME_CTRL
+#if AUDIO_HAS_VOLUME_CTRL
 	k_thread_create(&vol_thread_data, vol_stack, K_THREAD_STACK_SIZEOF(vol_stack),
 			volume_thread_fn, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
-	k_thread_name_set(&vol_thread_data, "audio_io_vol");
+	k_thread_name_set(&vol_thread_data, "audio_vol");
 #endif
 
 	started = true;

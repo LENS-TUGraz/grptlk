@@ -6,6 +6,10 @@
     status = "disabled";
 };
 
+&gpio2 {
+    status = "okay";
+};
+
 / {
     chosen {
         zephyr,bt-hci = &bt_hci_controller;
