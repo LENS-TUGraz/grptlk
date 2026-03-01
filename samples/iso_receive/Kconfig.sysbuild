@@ -3,6 +3,15 @@
 
 source "share/sysbuild/Kconfig"
 
+config GRPTLK_MAX_ISO_CHAN_COUNT
+	int "Max ISO channels (app + netcore)"
+	range 2 31
+	default 5
+	help
+	  Single sysbuild knob used to keep ISO channel limits aligned between
+	  application core and hci_ipc netcore image.
+	  Change this symbol for nRF53 builds to adjust max receivable streams.
+
 config NET_CORE_BOARD
 	string
 	default "nrf5340dk/nrf5340/cpunet" if "$(BOARD)" = "nrf5340dk"
