@@ -5,6 +5,16 @@ menuconfig GRPTLK
 
 if GRPTLK
 
+config GRPTLK_ISO_CHAN_COUNT
+	int "Number of BIS channels to create"
+	range 2 31
+	default 5
+	help
+	  Number of BIS channels the ISO broadcast sample creates in the BIG.
+	  BIS1 is downlink (TX). BIS2..BISn are uplink RX slots from receivers.
+	  For nRF53 sysbuild builds, this value is driven by
+	  SB_CONFIG_GRPTLK_ISO_CHAN_COUNT from Kconfig.sysbuild.
+
 choice GRPTLK_ROLE
     bool "GRPTLK Role"
     default GRPTLK_BCST
@@ -16,6 +26,66 @@ config GRPTLK_RECV
     bool "GRPTLK Receiver Role"
 
 endchoice
+
+config BT_ISO_MAX_CHAN
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST
+
+config BT_ISO_TX_BUF_COUNT
+	default 8 if GRPTLK_BCST
+
+config BT_ISO_RX_BUF_COUNT
+	default 8 if GRPTLK_BCST
+
+config BT_BUF_EVT_RX_COUNT
+	default 16 if GRPTLK_BCST
+
+# Single-core controller tuning follows the GRPTLK channel count.
+config BT_CTLR_ADV_DATA_LEN_MAX
+	default 191 if GRPTLK_BCST && BT_CTLR_ADV_EXT
+
+config BT_CTLR_SCAN_DATA_LEN_MAX
+	default 255 if GRPTLK_BCST && BT_CTLR_ADV_EXT
+
+# Broadcaster TX SDU is BT_ISO_TX_MTU (40). PDU = SDU + controller header.
+# 48 = 40 (SDU) + 8 (controller overhead).
+config BT_CTLR_ADV_ISO_PDU_LEN_MAX
+	default 48 if GRPTLK_BCST && BT_CTLR_ADV_ISO
+
+# Broadcaster RX (uplink) SDUs are the same size as TX SDUs.
+config BT_CTLR_SYNC_ISO_PDU_LEN_MAX
+	default 48 if GRPTLK_BCST && BT_CTLR_SYNC_ISO && !BT_HCI_RAW
+
+config BT_CTLR_ADV_ISO_STREAM_MAX
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && BT_CTLR_ADV_ISO
+
+config BT_CTLR_ADV_ISO_STREAM_COUNT
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && BT_CTLR_ADV_ISO
+
+# Broadcaster receives on MAX-1 uplink BISes (BIS2..BISn).
+# Use MAX here for simplicity; one extra slot costs negligible memory.
+config BT_CTLR_SYNC_ISO_STREAM_MAX
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && BT_CTLR_SYNC_ISO
+
+config BT_CTLR_SYNC_ISO_STREAM_COUNT
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && BT_CTLR_SYNC_ISO
+
+config BT_CTLR_ISOAL_SOURCES
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && (BT_CTLR_ADV_ISO || BT_CTLR_CONN_ISO)
+
+config BT_CTLR_ISOAL_SINKS
+	default GRPTLK_ISO_CHAN_COUNT if GRPTLK_BCST && (BT_CTLR_SYNC_ISO || BT_CTLR_CONN_ISO)
+
+config BT_CTLR_ISO_TX_BUFFERS
+	default BT_ISO_TX_BUF_COUNT if GRPTLK_BCST && (BT_CTLR_ADV_ISO || BT_CTLR_CONN_ISO)
+
+config BT_CTLR_ISO_RX_BUFFERS
+	default 8 if GRPTLK_BCST && (BT_CTLR_SYNC_ISO || BT_CTLR_CONN_ISO)
+
+config BT_CTLR_ISO_TX_BUFFER_SIZE
+	default 48 if GRPTLK_BCST && (BT_CTLR_ADV_ISO || BT_CTLR_CONN_ISO)
+
+config BT_CTLR_ISO_TX_SDU_LEN_MAX
+	default 40 if GRPTLK_BCST && (BT_CTLR_ADV_ISO || BT_CTLR_CONN_ISO)
 
 endif # GRPTLK
 

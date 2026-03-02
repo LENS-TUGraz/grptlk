@@ -24,7 +24,7 @@ config GRPTLK_ISO_STATS_ENABLED
 config GRPTLK_UPLINK_BIS
 	int "Uplink BIS index"
 	range 2 31
-	default 3
+	default 2
 	help
 	  BIS index used for uplink TX in receiver role.
 	  BIS1 is reserved for downlink RX.

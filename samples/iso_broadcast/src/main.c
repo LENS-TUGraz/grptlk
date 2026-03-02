@@ -10,11 +10,14 @@
 #define BIG_SDU_INTERVAL_US (10000)
 #define BUF_ALLOC_TIMEOUT_US (BIG_SDU_INTERVAL_US * 2U)
 
-#define BIS_ISO_CHAN_COUNT 5
-#define NUM_PRIME_PACKETS 2
-#define ISO_STATS_ENABLED 1
+/* BIS count follows the sysbuild knob (default 2). */
+#define BIS_ISO_CHAN_COUNT           CONFIG_GRPTLK_ISO_CHAN_COUNT
+#define NUM_PRIME_PACKETS           2
+#define ISO_STATS_ENABLED           1
 #define ISO_STATS_PRINT_INTERVAL_MS 1000U
-#define MAX_UPLINK_REPORTERS (BIS_ISO_CHAN_COUNT * 4U)
+/* Reporters not heard from within this period are evicted from the table. */
+#define UPLINK_REPORTER_STALE_MS    5000U
+#define MAX_UPLINK_REPORTERS        (BIS_ISO_CHAN_COUNT * 4U)
 
 LOG_MODULE_REGISTER(grptlk_iso_broadcast);
 
@@ -25,7 +28,7 @@ NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
 static K_SEM_DEFINE(sem_big_cmplt, 0, BIS_ISO_CHAN_COUNT);
 static K_SEM_DEFINE(sem_big_term, 0, BIS_ISO_CHAN_COUNT);
 
-static struct bt_iso_chan *bis[];
+static struct bt_iso_chan *bis[BIS_ISO_CHAN_COUNT];
 
 struct iso_tx_stats
 {
@@ -256,7 +259,41 @@ static void log_uplink_chan_stats(int chan_idx)
 static void log_uplink_reporter_stats(void)
 {
 	uint32_t now = k_uptime_get_32();
+	int active_count = 0;
 
+	/* First pass: evict stale reporters and emit eviction lines. */
+	for (int i = 0; i < MAX_UPLINK_REPORTERS; i++)
+	{
+		char dev_id_hex[(GRPTLK_DEVICE_ID_LEN * 2U) + 1U];
+		uint32_t age_ms;
+
+		if (!uplink_reporters[i].used)
+		{
+			continue;
+		}
+
+		age_ms = now - uplink_reporters[i].last_seen_ms;
+		if (age_ms > UPLINK_REPORTER_STALE_MS)
+		{
+			format_dev_id_hex(&uplink_reporters[i], dev_id_hex, sizeof(dev_id_hex));
+			printk(GRPTLK_LOG_DATA_PREFIX "dev=%s status=stale age_ms=%u\n",
+			       dev_id_hex[0] ? dev_id_hex : "unknown", age_ms);
+			uplink_reporters[i].used = false;
+			continue;
+		}
+
+		active_count++;
+	}
+
+	/*
+	 * Dashboard heartbeat: always emitted so the UI knows the broadcaster
+	 * is alive even when no receivers are present.
+	 * Format: GRPTLK_DATA ts=<uptime_ms> active=<n> bis_count=<n>
+	 */
+	printk(GRPTLK_LOG_DATA_PREFIX "ts=%u active=%d bis_count=%d\n",
+	       now, active_count, BIS_ISO_CHAN_COUNT);
+
+	/* Second pass: emit one structured line per active device. */
 	for (int i = 0; i < MAX_UPLINK_REPORTERS; i++)
 	{
 		char dev_id_hex[(GRPTLK_DEVICE_ID_LEN * 2U) + 1U];
@@ -270,15 +307,32 @@ static void log_uplink_reporter_stats(void)
 		format_dev_id_hex(&uplink_reporters[i], dev_id_hex, sizeof(dev_id_hex));
 		age_ms = now - uplink_reporters[i].last_seen_ms;
 
-		LOG_INF("UL DEV[%d]: id=%s bis_rx=%u bis_id=%u age=%ums seq=%u int=%ums dl_rx=%u valid=%u lost=%u err=%u bad=%u gap=%u dup=%u ul_tx_ok=%u alloc=%u send=%u",
-		       i, dev_id_hex[0] ? dev_id_hex : "unknown",
-		       uplink_reporters[i].transport_bis, uplink_reporters[i].uplink_bis,
-		       age_ms, uplink_reporters[i].seq_num, uplink_reporters[i].interval_ms,
-		       uplink_reporters[i].dl_rx_total, uplink_reporters[i].dl_rx_valid,
-		       uplink_reporters[i].dl_rx_lost, uplink_reporters[i].dl_rx_error,
-		       uplink_reporters[i].dl_rx_bad_len, uplink_reporters[i].dl_rx_gap_packets,
-		       uplink_reporters[i].dl_rx_old_or_dup, uplink_reporters[i].ul_tx_ok,
-		       uplink_reporters[i].ul_tx_alloc_fail, uplink_reporters[i].ul_tx_send_fail);
+		/*
+		 * Per-device structured line.
+		 * Format: GRPTLK_DATA dev=<hex_id> bis_rx=<n> uplink_bis=<n>
+		 *   age_ms=<n> seq=<n> dl_rx=<n> dl_valid=<n> dl_lost=<n>
+		 *   dl_err=<n> dl_bad=<n> dl_gap=<n> dl_dup=<n>
+		 *   ul_ok=<n> ul_alloc=<n> ul_send=<n>
+		 */
+		printk(GRPTLK_LOG_DATA_PREFIX
+		       "dev=%s bis_rx=%u uplink_bis=%u age_ms=%u seq=%u "
+		       "dl_rx=%u dl_valid=%u dl_lost=%u dl_err=%u dl_bad=%u "
+		       "dl_gap=%u dl_dup=%u ul_ok=%u ul_alloc=%u ul_send=%u\n",
+		       dev_id_hex[0] ? dev_id_hex : "unknown",
+		       uplink_reporters[i].transport_bis,
+		       uplink_reporters[i].uplink_bis,
+		       age_ms,
+		       uplink_reporters[i].seq_num,
+		       uplink_reporters[i].dl_rx_total,
+		       uplink_reporters[i].dl_rx_valid,
+		       uplink_reporters[i].dl_rx_lost,
+		       uplink_reporters[i].dl_rx_error,
+		       uplink_reporters[i].dl_rx_bad_len,
+		       uplink_reporters[i].dl_rx_gap_packets,
+		       uplink_reporters[i].dl_rx_old_or_dup,
+		       uplink_reporters[i].ul_tx_ok,
+		       uplink_reporters[i].ul_tx_alloc_fail,
+		       uplink_reporters[i].ul_tx_send_fail);
 	}
 }
 
@@ -485,36 +539,17 @@ static struct bt_iso_chan_qos bis_iso_qos = {
 	.rx = &iso_rx_qos,
 };
 
-static struct bt_iso_chan bis_iso_chan[] = {
-	{
-		.ops = &iso_ops,
-		.qos = &bis_iso_qos,
-	},
-	{
-		.ops = &iso_ops,
-		.qos = &bis_iso_qos,
-	},
-	{
-		.ops = &iso_ops,
-		.qos = &bis_iso_qos,
-	},
-	{
-		.ops = &iso_ops,
-		.qos = &bis_iso_qos,
-	},
-	{
-		.ops = &iso_ops,
-		.qos = &bis_iso_qos,
-	},
-};
+static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 
-static struct bt_iso_chan *bis[] = {
-	&bis_iso_chan[0],
-	&bis_iso_chan[1],
-	&bis_iso_chan[2],
-	&bis_iso_chan[3],
-	&bis_iso_chan[4],
-};
+static void iso_init_channels(void)
+{
+	for (int i = 0; i < BIS_ISO_CHAN_COUNT; i++)
+	{
+		bis_iso_chan[i].ops = &iso_ops;
+		bis_iso_chan[i].qos = &bis_iso_qos;
+		bis[i] = &bis_iso_chan[i];
+	}
+}
 
 static struct bt_iso_big_create_param big_create_param = {
 	.num_bis = BIS_ISO_CHAN_COUNT,
@@ -535,6 +570,7 @@ int main(void)
 	struct bt_iso_big *big;
 	int err;
 
+	iso_init_channels();
 	LOG_INF("Starting GRPTLK Broadcaster");
 	iso_log_startup_hint();
 	iso_start_stats_thread();

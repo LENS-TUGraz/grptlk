@@ -3,6 +3,15 @@
 
 source "share/sysbuild/Kconfig"
 
+config GRPTLK_ISO_CHAN_COUNT
+	int "Number of BIS channels to create"
+	range 2 31
+	default 4
+	help
+	  Number of BIS channels the ISO broadcast sample creates in the BIG.
+	  BIS1 is downlink (TX). BIS2..BISn are uplink RX slots from receivers.
+	  Change this symbol for nRF53 builds to adjust the BIG size.
+
 config NET_CORE_BOARD
 	string
 	default "nrf5340dk/nrf5340/cpunet" if "$(BOARD)" = "nrf5340dk"

@@ -10,6 +10,12 @@
 #define GRPTLK_DEVICE_ID_LEN 8U
 #define GRPTLK_UPLINK_STATS_V1_SIZE 40U
 
+/* Prefix for all structured log lines emitted by the broadcaster.
+ * Dashboard parsers should match lines starting with this string.
+ * Format: GRPTLK_DATA key=val key=val ...\n
+ */
+#define GRPTLK_LOG_DATA_PREFIX "GRPTLK_DATA "
+
 struct __packed grptlk_uplink_stats_v1
 {
 	uint8_t magic[2];

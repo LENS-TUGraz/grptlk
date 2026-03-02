@@ -48,6 +48,8 @@ static bt_addr_le_t per_addr;
 static uint8_t per_sid;
 static uint32_t per_interval_us;
 static uint16_t iso_uplink_sdu_len = CONFIG_BT_ISO_TX_MTU;
+/* Actual number of BISes in the discovered BIG, clamped to BIS_ISO_CHAN_COUNT */
+static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
 
 static K_SEM_DEFINE(sem_per_adv, 0, 1);
 static K_SEM_DEFINE(sem_per_sync, 0, 1);
@@ -125,6 +127,11 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync,
 	}
 
 	iso_uplink_sdu_len = preferred_len;
+
+	/* Clamp to our configured capacity */
+	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+	LOG_INF("BIG has %u BIS(es), syncing to %u (capacity %u)",
+		   biginfo->num_bis, big_actual_num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
 
 	k_sem_give(&sem_per_big_info);
 }
@@ -410,6 +417,7 @@ static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 
 static struct bt_iso_big_sync_param big_sync_param = {
 	.bis_channels = bis,
+	/* num_bis and bis_bitfield are set at runtime from biginfo->num_bis */
 	.num_bis = BIS_ISO_CHAN_COUNT,
 	.bis_bitfield = (BIT_MASK(BIS_ISO_CHAN_COUNT)),
 	.mse = BT_ISO_SYNC_MSE_ANY,
@@ -561,7 +569,11 @@ int main(void)
 		       iso_tx_qos.sdu);
 
 	big_sync_create:
-		LOG_INF("Create BIG Sync...");
+		/* Use the actual BIG size discovered via biginfo, clamped to our capacity */
+		big_sync_param.num_bis = big_actual_num_bis;
+		big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
+		LOG_INF("Create BIG Sync (num_bis=%u, bitfield=0x%x)...",
+			   big_sync_param.num_bis, big_sync_param.bis_bitfield);
 		err = bt_iso_big_sync(sync, &big_sync_param, &big);
 		if (err)
 		{
@@ -570,7 +582,7 @@ int main(void)
 		}
 		LOG_INF("success.");
 
-		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
+		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
 		{
 			LOG_INF("Waiting for BIG sync chan %u...", chan);
 			err = k_sem_take(&sem_big_sync, TIMEOUT_SYNC_CREATE);
@@ -597,7 +609,7 @@ int main(void)
 		}
 		LOG_INF("BIG sync established.");
 
-		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
+		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
 		{
 			LOG_INF("Setting data path chan %u...", chan);
 
@@ -624,7 +636,7 @@ int main(void)
 
 		iso_datapaths_setup = true;
 
-		for (uint8_t chan = 0U; chan < BIS_ISO_CHAN_COUNT; chan++)
+		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
 		{
 			LOG_INF("Waiting for BIG sync lost chan %u...", chan);
 			err = k_sem_take(&sem_big_sync_lost, K_FOREVER);
