@@ -399,8 +399,8 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 	}
 	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
 
-	active_uplink_bis = idx + 2U; /* BIS2 = idx 0, BIS3 = idx 1, etc. */
-	return bis[1U + idx];
+	active_uplink_bis = idx + 1U;
+	return bis[active_uplink_bis];
 #else
 	return bis[UPLINK_BIS - 1];
 #endif
