@@ -22,12 +22,33 @@ config GRPTLK_ISO_STATS_ENABLED
 	  Enable periodic ISO statistics logging for uplink and downlink traffic.
 
 config GRPTLK_UPLINK_BIS
-	int "Uplink BIS index"
+	int "Uplink BIS index (static mode)"
 	range 2 31
 	default 2
 	help
-	  BIS index used for uplink TX in receiver role.
-	  BIS1 is reserved for downlink RX.
+	  BIS index used for uplink TX in static mode (GRPTLK_UPLINK_MODE_STATIC).
+	  BIS1 is reserved for downlink RX. Has no effect in random mode.
+
+choice GRPTLK_UPLINK_MODE
+	bool "Uplink BIS selection mode"
+	depends on GRPTLK_RECV
+	default GRPTLK_UPLINK_MODE_RANDOM
+
+config GRPTLK_UPLINK_MODE_STATIC
+	bool "Static"
+	help
+	  Always transmit uplink on the fixed BIS index configured by
+	  GRPTLK_UPLINK_BIS. Useful for deterministic testing.
+
+config GRPTLK_UPLINK_MODE_RANDOM
+	bool "Random"
+	help
+	  Randomly select one of the available uplink BISes (BIS2..BISn)
+	  for each ISO send event using sys_rand32_get(). The selection
+	  happens at each downlink SDU receive, spreading uplink load
+	  across all available uplink channels.
+
+endchoice # GRPTLK_UPLINK_MODE
 
 choice GRPTLK_ROLE
     bool "GRPTLK Role"

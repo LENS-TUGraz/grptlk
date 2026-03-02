@@ -5,6 +5,7 @@
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/random/random.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 #include <string.h>
@@ -30,6 +31,7 @@
 
 LOG_MODULE_REGISTER(grptlk_iso_receive);
 
+#if defined(CONFIG_GRPTLK_UPLINK_MODE_STATIC)
 #if (UPLINK_BIS <= 1)
 #error "UPLINK_BIS must be in BIS2..BISn (BIS1 is downlink)"
 #endif
@@ -37,6 +39,7 @@ LOG_MODULE_REGISTER(grptlk_iso_receive);
 #if (UPLINK_BIS > BIS_ISO_CHAN_COUNT)
 #error "UPLINK_BIS must be <= CONFIG_GRPTLK_MAX_ISO_CHAN_COUNT"
 #endif
+#endif /* CONFIG_GRPTLK_UPLINK_MODE_STATIC */
 
 #if (CONFIG_BT_ISO_TX_MTU < CONFIG_BT_ISO_RX_MTU)
 #error "CONFIG_BT_ISO_TX_MTU must be >= CONFIG_BT_ISO_RX_MTU"
@@ -50,6 +53,8 @@ static uint32_t per_interval_us;
 static uint16_t iso_uplink_sdu_len = CONFIG_BT_ISO_TX_MTU;
 /* Actual number of BISes in the discovered BIG, clamped to BIS_ISO_CHAN_COUNT */
 static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
+/* BIS index (1-based) actually used for uplink TX; updated by iso_select_uplink_chan() */
+static uint8_t active_uplink_bis = UPLINK_BIS;
 
 static K_SEM_DEFINE(sem_per_adv, 0, 1);
 static K_SEM_DEFINE(sem_per_sync, 0, 1);
@@ -229,7 +234,7 @@ static void init_report_cache(void)
 	report_cache.magic[1] = GRPTLK_UPLINK_MAGIC_1;
 	report_cache.version = GRPTLK_UPLINK_VERSION;
 	report_cache.type = GRPTLK_UPLINK_TYPE_STATS_V1;
-	report_cache.uplink_bis = UPLINK_BIS;
+	report_cache.uplink_bis = active_uplink_bis;
 	report_cache.dev_id_len = grptlk_device_id_len;
 	memcpy(report_cache.dev_id, grptlk_device_id, sizeof(report_cache.dev_id));
 	report_last_ms = k_uptime_get_32();
@@ -263,7 +268,7 @@ static void iso_prepare_uplink_payload(size_t sdu_len)
 #if ISO_STATS_ENABLED
 	refresh_report_cache();
 	report_cache.seq_num = sys_cpu_to_le16(seq_num);
-	report_cache.uplink_bis = UPLINK_BIS;
+	report_cache.uplink_bis = active_uplink_bis;
 	report_cache.dev_id_len = grptlk_device_id_len;
 	memcpy(report_cache.dev_id, grptlk_device_id, sizeof(report_cache.dev_id));
 	memcpy(iso_data, &report_cache, MIN(sdu_len, sizeof(report_cache)));
@@ -306,6 +311,8 @@ static int iso_send_uplink(struct bt_iso_chan *chan, size_t sdu_len)
 	seq_num++;
 	return 0;
 }
+
+static struct bt_iso_chan *iso_select_uplink_chan(void);
 
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 					 struct net_buf *buf)
@@ -372,8 +379,31 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 
 	if (iso_datapaths_setup)
 	{
-		(void)iso_send_uplink(bis[UPLINK_BIS - 1], uplink_len);
+		struct bt_iso_chan *ul_chan = iso_select_uplink_chan();
+
+		if (ul_chan != NULL)
+		{
+			(void)iso_send_uplink(ul_chan, uplink_len);
+		}
 	}
+}
+
+static struct bt_iso_chan *iso_select_uplink_chan(void)
+{
+#if defined(CONFIG_GRPTLK_UPLINK_MODE_RANDOM)
+	/* Randomly pick from the available uplink BISes (BIS2..BISn). */
+	uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
+
+	if (num_uplink == 0U) {
+		return NULL;
+	}
+	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
+
+	active_uplink_bis = idx + 2U; /* BIS2 = idx 0, BIS3 = idx 1, etc. */
+	return bis[1U + idx];
+#else
+	return bis[UPLINK_BIS - 1];
+#endif
 }
 
 static void iso_connected(struct bt_iso_chan *chan)
