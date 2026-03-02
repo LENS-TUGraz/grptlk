@@ -72,9 +72,7 @@ struct uplink_reporter_state
 	uint16_t ul_tx_alloc_fail;
 	uint16_t ul_tx_send_fail;
 	uint32_t last_seen_ms;
-	/* Per-device uplink loss tracking from payload seq_num.
-	 * Valid regardless of BIS selection mode (static or random).
-	 */
+	/* Uplink loss tracking from payload seq_num. */
 	uint16_t prev_seq_num;
 	bool seq_initialized;
 	uint32_t ul_lost_payload;
@@ -135,6 +133,7 @@ static uint32_t stats_delta_u32(uint32_t now, uint32_t *prev)
 	*prev = now;
 	return delta;
 }
+
 
 static uint8_t clamp_dev_id_len(uint8_t len)
 {
@@ -203,9 +202,6 @@ static bool parse_uplink_report(int chan_idx, struct net_buf *buf)
 
 	uint16_t rx_seq = sys_le16_to_cpu(frame.seq_num);
 
-	/* Per-device loss: compare received seq against the one we expected next.
-	 * Use uint16 wraparound arithmetic so it handles the 65535→0 rollover.
-	 * Skip on first packet from this device or when the slot was just reused. */
 	if (reporter->used && reporter->seq_initialized) {
 		uint16_t expected = reporter->prev_seq_num + 1U;
 		uint16_t delta = (uint16_t)(rx_seq - expected);
@@ -214,7 +210,6 @@ static bool parse_uplink_report(int chan_idx, struct net_buf *buf)
 			reporter->ul_lost_payload += delta;
 		}
 	} else {
-		/* First packet: reset loss counter for this device slot. */
 		reporter->ul_lost_payload = 0U;
 		reporter->seq_initialized = false;
 	}
@@ -249,13 +244,10 @@ static void format_dev_id_hex(const struct uplink_reporter_state *reporter,
 {
 	size_t written;
 
-	if ((out_len == 0U) || (reporter->dev_id_len == 0U))
-	{
-		if (out_len > 0U)
-		{
+	if ((out_len == 0U) || (reporter->dev_id_len == 0U)) {
+		if (out_len > 0U) {
 			out[0] = '\0';
 		}
-
 		return;
 	}
 
@@ -288,7 +280,7 @@ static void log_uplink_reporter_stats(void)
 	uint32_t now = k_uptime_get_32();
 	int active_count = 0;
 
-	/* First pass: evict stale reporters and emit eviction lines. */
+	/* First pass: evict stale reporters. */
 	for (int i = 0; i < MAX_UPLINK_REPORTERS; i++)
 	{
 		char dev_id_hex[(GRPTLK_DEVICE_ID_LEN * 2U) + 1U];
@@ -312,15 +304,10 @@ static void log_uplink_reporter_stats(void)
 		active_count++;
 	}
 
-	/*
-	 * Dashboard heartbeat: always emitted so the UI knows the broadcaster
-	 * is alive even when no receivers are present.
-	 * Format: GRPTLK_DATA ts=<uptime_ms> active=<n> bis_count=<n>
-	 */
 	printk(GRPTLK_LOG_DATA_PREFIX "ts=%u active=%d bis_count=%d\n",
 	       now, active_count, BIS_ISO_CHAN_COUNT);
 
-	/* Second pass: emit one structured line per active device. */
+	/* Second pass: emit one structured line per active slot. */
 	for (int i = 0; i < MAX_UPLINK_REPORTERS; i++)
 	{
 		char dev_id_hex[(GRPTLK_DEVICE_ID_LEN * 2U) + 1U];
@@ -334,13 +321,6 @@ static void log_uplink_reporter_stats(void)
 		format_dev_id_hex(&uplink_reporters[i], dev_id_hex, sizeof(dev_id_hex));
 		age_ms = now - uplink_reporters[i].last_seen_ms;
 
-		/*
-		 * Per-device structured line.
-		 * Format: GRPTLK_DATA dev=<hex_id> bis_rx=<n> uplink_bis=<n>
-		 *   age_ms=<n> seq=<n> dl_rx=<n> dl_valid=<n> dl_lost=<n>
-		 *   dl_err=<n> dl_bad=<n> dl_gap=<n> dl_dup=<n>
-		 *   ul_ok=<n> ul_alloc=<n> ul_send=<n>
-		 */
 		printk(GRPTLK_LOG_DATA_PREFIX
 		       "dev=%s bis_rx=%u uplink_bis=%u age_ms=%u seq=%u "
 		       "dl_rx=%u dl_valid=%u dl_lost=%u dl_err=%u dl_bad=%u "

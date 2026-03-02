@@ -22,9 +22,9 @@ struct __packed grptlk_uplink_stats_v1
 	uint8_t version;
 	uint8_t type;
 	uint8_t uplink_bis;
-	uint8_t dev_id_len;
+	uint8_t dev_id_len;      /* number of valid bytes in dev_id[] */
 	uint8_t reserved[2];
-	uint8_t dev_id[GRPTLK_DEVICE_ID_LEN];
+	uint8_t dev_id[GRPTLK_DEVICE_ID_LEN]; /* BT BD_ADDR (6 bytes used) */
 	uint16_t seq_num;
 	uint16_t interval_ms;
 	uint16_t dl_rx_total;

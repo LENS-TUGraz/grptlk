@@ -2,7 +2,7 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
-#include <zephyr/drivers/hwinfo.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
@@ -213,18 +213,23 @@ static struct iso_rx_stats *iso_rx_stats_for_chan(int chan_idx)
 }
 
 #if ISO_STATS_ENABLED
+/* Populate device ID from BT identity address.
+ * Called after bt_enable() so the address is available.
+ * The BT random address is unique per device in both BSim and real hardware. */
 static void init_device_id(void)
 {
-	ssize_t len = hwinfo_get_device_id(grptlk_device_id, sizeof(grptlk_device_id));
+	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+	size_t count = ARRAY_SIZE(addrs);
 
-	if (len <= 0)
-	{
+	bt_id_get(addrs, &count);
+	if (count > 0U) {
+		/* BD_ADDR is 6 bytes, fits within GRPTLK_DEVICE_ID_LEN=8. */
+		grptlk_device_id_len = sizeof(addrs[0].a.val);
+		memcpy(grptlk_device_id, addrs[0].a.val, grptlk_device_id_len);
+	} else {
 		grptlk_device_id_len = 0U;
 		memset(grptlk_device_id, 0, sizeof(grptlk_device_id));
-		return;
 	}
-
-	grptlk_device_id_len = (uint8_t)MIN((size_t)len, sizeof(grptlk_device_id));
 }
 
 static void init_report_cache(void)
@@ -484,10 +489,6 @@ int main(void)
 
 	LOG_INF("Starting GRPTLK Receiver");
 	iso_init_channels();
-#if ISO_STATS_ENABLED
-	init_device_id();
-	init_report_cache();
-#endif
 
 	/* Initialize the Bluetooth Subsystem */
 	err = bt_enable(NULL);
@@ -496,6 +497,12 @@ int main(void)
 		LOG_ERR("Bluetooth init failed (err %d)", err);
 		return 0;
 	}
+
+#if ISO_STATS_ENABLED
+	/* init_device_id() must come after bt_enable() so bt_id_get() works. */
+	init_device_id();
+	init_report_cache();
+#endif
 
 	LOG_INF("Scan callbacks register...");
 	bt_le_scan_cb_register(&scan_callbacks);
