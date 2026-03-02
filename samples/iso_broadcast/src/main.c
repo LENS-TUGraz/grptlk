@@ -72,6 +72,12 @@ struct uplink_reporter_state
 	uint16_t ul_tx_alloc_fail;
 	uint16_t ul_tx_send_fail;
 	uint32_t last_seen_ms;
+	/* Per-device uplink loss tracking from payload seq_num.
+	 * Valid regardless of BIS selection mode (static or random).
+	 */
+	uint16_t prev_seq_num;
+	bool seq_initialized;
+	uint32_t ul_lost_payload;
 };
 
 static uint16_t seq_num;
@@ -194,12 +200,33 @@ static bool parse_uplink_report(int chan_idx, struct net_buf *buf)
 	}
 
 	reporter = &uplink_reporters[slot];
+
+	uint16_t rx_seq = sys_le16_to_cpu(frame.seq_num);
+
+	/* Per-device loss: compare received seq against the one we expected next.
+	 * Use uint16 wraparound arithmetic so it handles the 65535→0 rollover.
+	 * Skip on first packet from this device or when the slot was just reused. */
+	if (reporter->used && reporter->seq_initialized) {
+		uint16_t expected = reporter->prev_seq_num + 1U;
+		uint16_t delta = (uint16_t)(rx_seq - expected);
+
+		if ((delta > 0U) && (delta < 0x8000U)) {
+			reporter->ul_lost_payload += delta;
+		}
+	} else {
+		/* First packet: reset loss counter for this device slot. */
+		reporter->ul_lost_payload = 0U;
+		reporter->seq_initialized = false;
+	}
+
 	reporter->used = true;
+	reporter->prev_seq_num = rx_seq;
+	reporter->seq_initialized = true;
 	reporter->transport_bis = (uint8_t)(chan_idx + 1);
 	reporter->uplink_bis = frame.uplink_bis;
 	reporter->dev_id_len = dev_id_len;
 	memcpy(reporter->dev_id, frame.dev_id, sizeof(reporter->dev_id));
-	reporter->seq_num = sys_le16_to_cpu(frame.seq_num);
+	reporter->seq_num = rx_seq;
 	reporter->interval_ms = sys_le16_to_cpu(frame.interval_ms);
 	reporter->dl_rx_total = sys_le16_to_cpu(frame.dl_rx_total);
 	reporter->dl_rx_valid = sys_le16_to_cpu(frame.dl_rx_valid);
@@ -317,7 +344,7 @@ static void log_uplink_reporter_stats(void)
 		printk(GRPTLK_LOG_DATA_PREFIX
 		       "dev=%s bis_rx=%u uplink_bis=%u age_ms=%u seq=%u "
 		       "dl_rx=%u dl_valid=%u dl_lost=%u dl_err=%u dl_bad=%u "
-		       "dl_gap=%u dl_dup=%u ul_ok=%u ul_alloc=%u ul_send=%u\n",
+		       "dl_gap=%u dl_dup=%u ul_ok=%u ul_alloc=%u ul_send=%u ul_lost=%u\n",
 		       dev_id_hex[0] ? dev_id_hex : "unknown",
 		       uplink_reporters[i].transport_bis,
 		       uplink_reporters[i].uplink_bis,
@@ -332,7 +359,8 @@ static void log_uplink_reporter_stats(void)
 		       uplink_reporters[i].dl_rx_old_or_dup,
 		       uplink_reporters[i].ul_tx_ok,
 		       uplink_reporters[i].ul_tx_alloc_fail,
-		       uplink_reporters[i].ul_tx_send_fail);
+		       uplink_reporters[i].ul_tx_send_fail,
+		       uplink_reporters[i].ul_lost_payload);
 	}
 }
 
