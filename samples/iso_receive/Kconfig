@@ -21,6 +21,12 @@ config GRPTLK_ISO_STATS_ENABLED
 	help
 	  Enable periodic ISO statistics logging for uplink and downlink traffic.
 
+config GRPTLK_ISO_SDU_INTERVAL_US
+	int "ISO SDU Interval (us)"
+	default 10000
+	help
+	  The SDU interval in microseconds for the ISO stream interval.
+
 config GRPTLK_UPLINK_BIS
 	int "Uplink BIS index (static mode)"
 	range 2 31

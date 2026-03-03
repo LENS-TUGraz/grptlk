@@ -15,6 +15,20 @@ config GRPTLK_ISO_CHAN_COUNT
 	  For nRF53 sysbuild builds, this value is driven by
 	  SB_CONFIG_GRPTLK_ISO_CHAN_COUNT from Kconfig.sysbuild.
 
+config GRPTLK_ISO_SDU_INTERVAL_US
+	int "BIG SDU interval in microseconds"
+	default 10000
+	help
+	  The SDU interval in microseconds for the Broadcast Isochronous Group (BIG).
+
+config GRPTLK_ISO_STATS
+	bool "Enable ISO TX/RX statistics tracking"
+	default y
+	help
+	  Enable tracking and printing of ISO broadcast channel statistics.
+	  Includes DL TX success rates and UL RX packet counts/errors
+	  received from ISO reporters.
+
 choice GRPTLK_ROLE
     bool "GRPTLK Role"
     default GRPTLK_BCST

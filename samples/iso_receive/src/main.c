@@ -3,31 +3,36 @@
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
 
+#include "rx_stats.h"
+#include <grptlk_uplink_stats.h>
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
-#include <string.h>
-#include <grptlk_uplink_stats.h>
-
-/* ------------------------------------------------------------------------------- */
-/* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE BROADCASTER  */
-/* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is downlink/rx) */
+/* -------------------------------------------------------------------------------
+ */
+/* THIS IS THE BIS ON WHICH THE GRPTLK RECEIVER TRANSMITS BACK TO THE
+ * BROADCASTER  */
+/* E.g., in a BIG with 5 BISes, this parameter can be [2..5] (BIS1 is
+ * downlink/rx) */
 #define UPLINK_BIS CONFIG_GRPTLK_UPLINK_BIS
-/* ------------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------------
+ */
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 
-#define BT_LE_SCAN_CUSTOM BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE,    \
-										   BT_LE_SCAN_OPT_NONE,       \
-										   BT_GAP_SCAN_FAST_INTERVAL, \
-										   BT_GAP_SCAN_FAST_WINDOW)
+#define BT_LE_SCAN_CUSTOM                                                      \
+  BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE,                \
+                   BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_WINDOW)
 
 #define PA_RETRY_COUNT 6
 
 #define BIS_ISO_CHAN_COUNT CONFIG_GRPTLK_MAX_ISO_CHAN_COUNT
 #define ISO_STATS_ENABLED CONFIG_GRPTLK_ISO_STATS_ENABLED
+
+#define NUM_PRIME_PACKETS 2
 
 LOG_MODULE_REGISTER(grptlk_iso_receive);
 
@@ -51,9 +56,11 @@ static bt_addr_le_t per_addr;
 static uint8_t per_sid;
 static uint32_t per_interval_us;
 static uint16_t iso_uplink_sdu_len = CONFIG_BT_ISO_TX_MTU;
-/* Actual number of BISes in the discovered BIG, clamped to BIS_ISO_CHAN_COUNT */
+/* Actual number of BISes in the discovered BIG, clamped to BIS_ISO_CHAN_COUNT
+ */
 static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
-/* BIS index (1-based) actually used for uplink TX; updated by iso_select_uplink_chan() */
+/* BIS index (1-based) actually used for uplink TX; updated by
+ * iso_select_uplink_chan() */
 static uint8_t active_uplink_bis = UPLINK_BIS;
 
 static K_SEM_DEFINE(sem_per_adv, 0, 1);
@@ -66,634 +73,459 @@ static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
 static bool iso_datapaths_setup = false;
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
-					  struct net_buf_simple *buf)
-{
-	ARG_UNUSED(buf);
+                      struct net_buf_simple *buf) {
+  ARG_UNUSED(buf);
 
-	if (!per_adv_found && info->interval)
-	{
-		per_adv_found = true;
+  if (!per_adv_found && info->interval) {
+    per_adv_found = true;
 
-		per_sid = info->sid;
-		per_interval_us = BT_CONN_INTERVAL_TO_US(info->interval);
-		bt_addr_le_copy(&per_addr, info->addr);
+    per_sid = info->sid;
+    per_interval_us = BT_CONN_INTERVAL_TO_US(info->interval);
+    bt_addr_le_copy(&per_addr, info->addr);
 
-		k_sem_give(&sem_per_adv);
-	}
+    k_sem_give(&sem_per_adv);
+  }
 }
 
 static struct bt_le_scan_cb scan_callbacks = {
-	.recv = scan_recv,
+    .recv = scan_recv,
 };
 
 static void sync_cb(struct bt_le_per_adv_sync *sync,
-					struct bt_le_per_adv_sync_synced_info *info)
-{
-	ARG_UNUSED(sync);
-	ARG_UNUSED(info);
+                    struct bt_le_per_adv_sync_synced_info *info) {
+  ARG_UNUSED(sync);
+  ARG_UNUSED(info);
 
-	k_sem_give(&sem_per_sync);
+  k_sem_give(&sem_per_sync);
 }
 
 static void term_cb(struct bt_le_per_adv_sync *sync,
-					const struct bt_le_per_adv_sync_term_info *info)
-{
-	char le_addr[BT_ADDR_LE_STR_LEN];
+                    const struct bt_le_per_adv_sync_term_info *info) {
+  char le_addr[BT_ADDR_LE_STR_LEN];
 
-	bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
+  bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
 
-	LOG_INF("PER_ADV_SYNC[%u]: [DEVICE]: %s sync terminated",
-		   bt_le_per_adv_sync_get_index(sync), le_addr);
+  LOG_INF("PER_ADV_SYNC[%u]: [DEVICE]: %s sync terminated",
+          bt_le_per_adv_sync_get_index(sync), le_addr);
 
-	per_adv_lost = true;
-	k_sem_give(&sem_per_sync_lost);
+  per_adv_lost = true;
+  k_sem_give(&sem_per_sync_lost);
 }
 
 static void biginfo_cb(struct bt_le_per_adv_sync *sync,
-					   const struct bt_iso_biginfo *biginfo)
-{
-	ARG_UNUSED(sync);
+                       const struct bt_iso_biginfo *biginfo) {
+  ARG_UNUSED(sync);
 
-	uint16_t preferred_len = biginfo->max_sdu;
+  uint16_t preferred_len = biginfo->max_sdu;
 
-	if (preferred_len == 0U)
-	{
-		preferred_len = biginfo->max_pdu;
-	}
-	if (preferred_len == 0U)
-	{
-		preferred_len = CONFIG_BT_ISO_TX_MTU;
-	}
-	if (preferred_len > CONFIG_BT_ISO_TX_MTU)
-	{
-		LOG_WRN("BIG info SDU %u exceeds TX MTU %u, clamping uplink size",
-		       preferred_len, CONFIG_BT_ISO_TX_MTU);
-		preferred_len = CONFIG_BT_ISO_TX_MTU;
-	}
+  if (preferred_len == 0U) {
+    preferred_len = biginfo->max_pdu;
+  }
+  if (preferred_len == 0U) {
+    preferred_len = CONFIG_BT_ISO_TX_MTU;
+  }
+  if (preferred_len > CONFIG_BT_ISO_TX_MTU) {
+    LOG_WRN("BIG info SDU %u exceeds TX MTU %u, clamping uplink size",
+            preferred_len, CONFIG_BT_ISO_TX_MTU);
+    preferred_len = CONFIG_BT_ISO_TX_MTU;
+  }
 
-	iso_uplink_sdu_len = preferred_len;
+  iso_uplink_sdu_len = preferred_len;
 
-	/* Clamp to our configured capacity */
-	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
-	LOG_INF("BIG has %u BIS(es), syncing to %u (capacity %u)",
-		   biginfo->num_bis, big_actual_num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+  /* Clamp to our configured capacity */
+  big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+  LOG_INF("BIG has %u BIS(es), syncing to %u (capacity %u)", biginfo->num_bis,
+          big_actual_num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
 
-	k_sem_give(&sem_per_big_info);
+  k_sem_give(&sem_per_big_info);
 }
 
 static struct bt_le_per_adv_sync_cb sync_callbacks = {
-	.synced = sync_cb,
-	.term = term_cb,
-	.biginfo = biginfo_cb,
+    .synced = sync_cb,
+    .term = term_cb,
+    .biginfo = biginfo_cb,
 };
 
 NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT,
-						  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
-						  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
-
-struct iso_tx_stats
-{
-	uint32_t ok;
-	uint32_t alloc_fail;
-	uint32_t send_fail;
-};
-
-struct iso_rx_stats
-{
-	uint32_t total;
-	uint32_t valid_flag;
-	uint32_t lost_flag;
-	uint32_t error_flag;
-	uint32_t bad_len;
-	uint32_t seq_gap_events;
-	uint32_t seq_gap_packets;
-	uint32_t old_or_dup;
-};
+                          BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
+                          CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
 static uint16_t seq_num;
-static struct iso_tx_stats iso_uplink_tx_stats;
-static struct iso_rx_stats iso_downlink_rx_stats;
-static uint16_t iso_recv_expected_seq[BIS_ISO_CHAN_COUNT];
-static bool iso_recv_seq_initialized[BIS_ISO_CHAN_COUNT];
 static uint8_t iso_data[CONFIG_BT_ISO_TX_MTU] = {0};
-
-#if ISO_STATS_ENABLED
-BUILD_ASSERT(sizeof(struct grptlk_uplink_stats_v1) == GRPTLK_UPLINK_STATS_V1_SIZE,
-	     "Stats payload format must stay 40 bytes");
-
-static uint8_t grptlk_device_id[GRPTLK_DEVICE_ID_LEN];
-static uint8_t grptlk_device_id_len;
-static uint32_t report_last_ms;
-static struct grptlk_uplink_stats_v1 report_cache;
-#endif
 
 static struct bt_iso_chan *bis[BIS_ISO_CHAN_COUNT];
 
-static int iso_chan_index(struct bt_iso_chan *chan)
-{
-	for (int i = 0; i < BIS_ISO_CHAN_COUNT; i++)
-	{
-		if (chan == bis[i])
-		{
-			return i;
-		}
-	}
+static int iso_chan_index(struct bt_iso_chan *chan) {
+  for (int i = 0; i < BIS_ISO_CHAN_COUNT; i++) {
+    if (chan == bis[i]) {
+      return i;
+    }
+  }
 
-	return -1;
-}
-
-static struct iso_rx_stats *iso_rx_stats_for_chan(int chan_idx)
-{
-	if (chan_idx == 0)
-	{
-		return &iso_downlink_rx_stats;
-	}
-
-	return NULL;
-}
-
-#if ISO_STATS_ENABLED
-/* Populate device ID from BT identity address.
- * Called after bt_enable() so the address is available.
- * The BT random address is unique per device in both BSim and real hardware. */
-static void init_device_id(void)
-{
-	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
-	size_t count = ARRAY_SIZE(addrs);
-
-	bt_id_get(addrs, &count);
-	if (count > 0U) {
-		/* BD_ADDR is 6 bytes, fits within GRPTLK_DEVICE_ID_LEN=8. */
-		grptlk_device_id_len = sizeof(addrs[0].a.val);
-		memcpy(grptlk_device_id, addrs[0].a.val, grptlk_device_id_len);
-	} else {
-		grptlk_device_id_len = 0U;
-		memset(grptlk_device_id, 0, sizeof(grptlk_device_id));
-	}
-}
-
-static void init_report_cache(void)
-{
-	memset(&report_cache, 0, sizeof(report_cache));
-	report_cache.magic[0] = GRPTLK_UPLINK_MAGIC_0;
-	report_cache.magic[1] = GRPTLK_UPLINK_MAGIC_1;
-	report_cache.version = GRPTLK_UPLINK_VERSION;
-	report_cache.type = GRPTLK_UPLINK_TYPE_STATS_V1;
-	report_cache.uplink_bis = active_uplink_bis;
-	report_cache.dev_id_len = grptlk_device_id_len;
-	memcpy(report_cache.dev_id, grptlk_device_id, sizeof(report_cache.dev_id));
-	report_last_ms = k_uptime_get_32();
-}
-
-static void refresh_report_cache(void)
-{
-	uint32_t now = k_uptime_get_32();
-	uint32_t elapsed_ms = now - report_last_ms;
-
-	/* Live snapshot: publish current cumulative counters in every uplink packet. */
-	report_cache.interval_ms = sys_cpu_to_le16((uint16_t)MIN(elapsed_ms, UINT16_MAX));
-	report_cache.dl_rx_total = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.total);
-	report_cache.dl_rx_valid = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.valid_flag);
-	report_cache.dl_rx_lost = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.lost_flag);
-	report_cache.dl_rx_error = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.error_flag);
-	report_cache.dl_rx_bad_len = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.bad_len);
-	report_cache.dl_rx_gap_packets = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.seq_gap_packets);
-	report_cache.dl_rx_old_or_dup = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.old_or_dup);
-	report_cache.ul_tx_ok = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.ok);
-	report_cache.ul_tx_alloc_fail = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.alloc_fail);
-	report_cache.ul_tx_send_fail = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.send_fail);
-	report_last_ms = now;
-}
-#endif
-
-
-static void iso_prepare_uplink_payload(size_t sdu_len)
-{
-	memset(iso_data, 0, sdu_len);
-#if ISO_STATS_ENABLED
-	refresh_report_cache();
-	report_cache.seq_num = sys_cpu_to_le16(seq_num);
-	report_cache.uplink_bis = active_uplink_bis;
-	report_cache.dev_id_len = grptlk_device_id_len;
-	memcpy(report_cache.dev_id, grptlk_device_id, sizeof(report_cache.dev_id));
-	memcpy(iso_data, &report_cache, MIN(sdu_len, sizeof(report_cache)));
-#else
-	memset(iso_data, (uint8_t)seq_num, sdu_len);
-#endif
-}
-
-static int iso_send_uplink(struct bt_iso_chan *chan, size_t sdu_len)
-{
-	int err;
-	struct net_buf *buf;
-
-	if ((sdu_len == 0U) || (sdu_len > sizeof(iso_data)))
-	{
-		iso_uplink_tx_stats.send_fail++;
-		return -EINVAL;
-	}
-
-	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
-	if (!buf)
-	{
-		iso_uplink_tx_stats.alloc_fail++;
-		return -ENOMEM;
-	}
-
-	iso_prepare_uplink_payload(sdu_len);
-
-	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	net_buf_add_mem(buf, iso_data, sdu_len);
-	err = bt_iso_chan_send(chan, buf, seq_num);
-	if (err < 0)
-	{
-		iso_uplink_tx_stats.send_fail++;
-		net_buf_unref(buf);
-		return err;
-	}
-
-	iso_uplink_tx_stats.ok++;
-	seq_num++;
-	return 0;
+  return -1;
 }
 
 static struct bt_iso_chan *iso_select_uplink_chan(void);
 
-static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
-					 struct net_buf *buf)
-{
-	int chan_idx;
-	struct iso_rx_stats *rx_stats;
-	size_t uplink_len = iso_uplink_sdu_len;
+#define TX_THREAD_STACK_SIZE 1024
+#define TX_THREAD_PRIORITY 5
 
-	chan_idx = iso_chan_index(chan);
-	if (chan_idx < 0)
-	{
-		return;
-	}
-	if (chan_idx != 0)
-	{
-		return;
-	}
+static struct k_thread tx_thread_data;
+K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
+static K_SEM_DEFINE(tx_sem, 0, 1);
 
-	rx_stats = iso_rx_stats_for_chan(chan_idx);
-	if (iso_recv_seq_initialized[chan_idx])
-	{
-		uint16_t delta =
-			(uint16_t)(info->seq_num - iso_recv_expected_seq[chan_idx]);
+static void tx_thread(void *arg1, void *arg2, void *arg3) {
+  int err;
+  struct net_buf *buf;
+  struct bt_iso_chan *ul_chan;
+  size_t uplink_len;
 
-		if ((delta > 0U) && (delta < 0x8000U))
-		{
-			rx_stats->seq_gap_events++;
-			rx_stats->seq_gap_packets += delta;
-		}
-		else if (delta >= 0x8000U)
-		{
-			rx_stats->old_or_dup++;
-		}
-	}
+  while (true) {
+    k_sem_take(&tx_sem, K_FOREVER);
 
-	iso_recv_expected_seq[chan_idx] = (uint16_t)(info->seq_num + 1U);
-	iso_recv_seq_initialized[chan_idx] = true;
-	rx_stats->total++;
+    ul_chan = iso_select_uplink_chan();
+    if (ul_chan == NULL) {
+      continue;
+    }
 
-	if ((info->flags & BT_ISO_FLAGS_VALID) != 0U)
-	{
-		rx_stats->valid_flag++;
-	}
-	if ((info->flags & BT_ISO_FLAGS_LOST) != 0U)
-	{
-		rx_stats->lost_flag++;
-	}
-	if ((info->flags & BT_ISO_FLAGS_ERROR) != 0U)
-	{
-		rx_stats->error_flag++;
-	}
+    uplink_len = iso_uplink_sdu_len;
+    if ((uplink_len == 0U) || (uplink_len > sizeof(iso_data))) {
+      rx_stats_tx_send_fail();
+      continue;
+    }
 
-	/* Accept any SDU length up to configured RX MTU */
-	if ((buf == NULL) || (buf->len == 0U) || (buf->len > CONFIG_BT_ISO_RX_MTU))
-	{
-		rx_stats->bad_len++;
-	}
-	else if (buf->len > 0U)
-	{
-		/* Keep uplink payload size aligned with received BIS payload size */
-		iso_uplink_sdu_len = (uint16_t)buf->len;
-		uplink_len = buf->len;
-	}
+    buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
+    if (!buf) {
+      rx_stats_tx_alloc_fail();
+      continue;
+    }
 
-	if (iso_datapaths_setup)
-	{
-		struct bt_iso_chan *ul_chan = iso_select_uplink_chan();
+    rx_stats_prepare_uplink_payload(iso_data, uplink_len, seq_num,
+                                    active_uplink_bis);
 
-		if (ul_chan != NULL)
-		{
-			(void)iso_send_uplink(ul_chan, uplink_len);
-		}
-	}
+    net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+    net_buf_add_mem(buf, iso_data, uplink_len);
+
+    err = bt_iso_chan_send(ul_chan, buf, seq_num);
+    if (err < 0) {
+      rx_stats_tx_send_fail();
+      net_buf_unref(buf);
+      continue;
+    }
+
+    rx_stats_tx_ok();
+    seq_num++;
+  }
 }
 
-static struct bt_iso_chan *iso_select_uplink_chan(void)
-{
+static void iso_sent(struct bt_iso_chan *chan) {
+  if (chan == bis[active_uplink_bis]) {
+    k_sem_give(&tx_sem);
+  }
+}
+
+static struct bt_iso_chan *iso_select_uplink_chan(void);
+
+static void iso_recv(struct bt_iso_chan *chan,
+                     const struct bt_iso_recv_info *info, struct net_buf *buf) {
+  int chan_idx;
+  size_t uplink_len = iso_uplink_sdu_len;
+
+  chan_idx = iso_chan_index(chan);
+  if (chan_idx < 0) {
+    return;
+  }
+  if (chan_idx != 0) {
+    return;
+  }
+
+  rx_stats_rx_downlink(info, buf);
+
+  /* Accept any SDU length up to configured RX MTU */
+  if (buf && buf->len > 0U && buf->len <= CONFIG_BT_ISO_RX_MTU) {
+    /* Keep uplink payload size aligned with received BIS payload size */
+    iso_uplink_sdu_len = (uint16_t)buf->len;
+  }
+}
+
+static struct bt_iso_chan *iso_select_uplink_chan(void) {
 #if defined(CONFIG_GRPTLK_UPLINK_MODE_RANDOM)
-	/* Randomly pick from the available uplink BISes (BIS2..BISn). */
-	uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
+  /* Randomly pick from the available uplink BISes (BIS2..BISn). */
+  uint8_t num_uplink =
+      (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
 
-	if (num_uplink == 0U) {
-		return NULL;
-	}
-	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
+  if (num_uplink == 0U) {
+    return NULL;
+  }
+  uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
 
-	active_uplink_bis = idx + 1U;
-	return bis[active_uplink_bis];
+  active_uplink_bis = idx + 1U;
+  return bis[active_uplink_bis];
 #else
-	return bis[UPLINK_BIS - 1];
+  return bis[UPLINK_BIS - 1];
 #endif
 }
 
-static void iso_connected(struct bt_iso_chan *chan)
-{
-	LOG_INF("ISO Channel %p connected", chan);
-	memset(iso_recv_seq_initialized, 0, sizeof(iso_recv_seq_initialized));
-	k_sem_give(&sem_big_sync);
+static void iso_connected(struct bt_iso_chan *chan) {
+  LOG_INF("ISO Channel %p connected", chan);
+  seq_num = 0U;
+  rx_stats_reset_seq();
+  k_sem_give(&sem_big_sync);
 }
 
-static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
-{
-	LOG_INF("ISO Channel %p disconnected with reason 0x%02x",
-		   chan, reason);
+static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason) {
+  LOG_INF("ISO Channel %p disconnected with reason 0x%02x", chan, reason);
 
-	if (reason != BT_HCI_ERR_OP_CANCELLED_BY_HOST)
-	{
-		iso_datapaths_setup = false;
-		k_sem_give(&sem_big_sync_lost);
-	}
+  if (reason != BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
+    iso_datapaths_setup = false;
+    k_sem_give(&sem_big_sync_lost);
+  }
 }
 
 static struct bt_iso_chan_ops iso_ops = {
-	.recv = iso_recv,
-	.connected = iso_connected,
-	.disconnected = iso_disconnected,
+    .recv = iso_recv,
+    .sent = iso_sent,
+    .connected = iso_connected,
+    .disconnected = iso_disconnected,
 };
 
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
-	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 1,
-	.phy = BT_GAP_LE_PHY_2M,
+    .sdu = CONFIG_BT_ISO_TX_MTU,
+    .rtn = 1,
+    .phy = BT_GAP_LE_PHY_2M,
 };
 
 static struct bt_iso_chan_qos bis_iso_qos = {
-	.tx = &iso_tx_qos,
-	.rx = &iso_rx_qos,
+    .tx = &iso_tx_qos,
+    .rx = &iso_rx_qos,
 };
 
 static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 
 static struct bt_iso_big_sync_param big_sync_param = {
-	.bis_channels = bis,
-	/* num_bis and bis_bitfield are set at runtime from biginfo->num_bis */
-	.num_bis = BIS_ISO_CHAN_COUNT,
-	.bis_bitfield = (BIT_MASK(BIS_ISO_CHAN_COUNT)),
-	.mse = BT_ISO_SYNC_MSE_ANY,
-	.sync_timeout = 100, /* in 10 ms units */
+    .bis_channels = bis,
+    /* num_bis and bis_bitfield are set at runtime from biginfo->num_bis */
+    .num_bis = BIS_ISO_CHAN_COUNT,
+    .bis_bitfield = (BIT_MASK(BIS_ISO_CHAN_COUNT)),
+    .mse = BT_ISO_SYNC_MSE_ANY,
+    .sync_timeout = 100, /* in 10 ms units */
 };
 
-static void iso_init_channels(void)
-{
-	for (int i = 0; i < BIS_ISO_CHAN_COUNT; i++)
-	{
-		bis_iso_chan[i].ops = &iso_ops;
-		bis_iso_chan[i].qos = &bis_iso_qos;
-		bis[i] = &bis_iso_chan[i];
-	}
+static void iso_init_channels(void) {
+  for (int i = 0; i < BIS_ISO_CHAN_COUNT; i++) {
+    bis_iso_chan[i].ops = &iso_ops;
+    bis_iso_chan[i].qos = &bis_iso_qos;
+    bis[i] = &bis_iso_chan[i];
+  }
 }
 
-static void reset_semaphores(void)
-{
-	k_sem_reset(&sem_per_adv);
-	k_sem_reset(&sem_per_sync);
-	k_sem_reset(&sem_per_sync_lost);
-	k_sem_reset(&sem_per_big_info);
-	k_sem_reset(&sem_big_sync);
-	k_sem_reset(&sem_big_sync_lost);
+static void reset_semaphores(void) {
+  k_sem_reset(&sem_per_adv);
+  k_sem_reset(&sem_per_sync);
+  k_sem_reset(&sem_per_sync_lost);
+  k_sem_reset(&sem_per_big_info);
+  k_sem_reset(&sem_big_sync);
+  k_sem_reset(&sem_big_sync_lost);
 }
 
-int main(void)
-{
-	struct bt_le_per_adv_sync_param sync_create_param;
-	struct bt_le_per_adv_sync *sync;
-	struct bt_iso_big *big;
-	uint32_t sem_timeout_us;
-	int err;
+int main(void) {
+  struct bt_le_per_adv_sync_param sync_create_param;
+  struct bt_le_per_adv_sync *sync;
+  struct bt_iso_big *big;
+  uint32_t sem_timeout_us;
+  int err;
 
-	LOG_INF("Starting GRPTLK Receiver");
-	iso_init_channels();
+  LOG_INF("Starting GRPTLK Receiver");
+  iso_init_channels();
 
-	/* Initialize the Bluetooth Subsystem */
-	err = bt_enable(NULL);
-	if (err)
-	{
-		LOG_ERR("Bluetooth init failed (err %d)", err);
-		return 0;
-	}
+  /* Initialize the Bluetooth Subsystem */
+  err = bt_enable(NULL);
+  if (err) {
+    LOG_ERR("Bluetooth init failed (err %d)", err);
+    return 0;
+  }
 
-#if ISO_STATS_ENABLED
-	/* init_device_id() must come after bt_enable() so bt_id_get() works. */
-	init_device_id();
-	init_report_cache();
-#endif
+  rx_stats_init_device_id();
+  rx_stats_init_report_cache(active_uplink_bis);
 
-	LOG_INF("Scan callbacks register...");
-	bt_le_scan_cb_register(&scan_callbacks);
-	LOG_INF("success.");
+  k_thread_create(&tx_thread_data, tx_thread_stack,
+                  K_THREAD_STACK_SIZEOF(tx_thread_stack), tx_thread, NULL, NULL,
+                  NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
 
-	LOG_INF("Periodic Advertising callbacks register...");
-	bt_le_per_adv_sync_cb_register(&sync_callbacks);
-	LOG_INF("Success.");
+  LOG_INF("Scan callbacks register...");
+  bt_le_scan_cb_register(&scan_callbacks);
+  LOG_INF("success.");
 
-	do
-	{
-		reset_semaphores();
-		per_adv_lost = false;
+  LOG_INF("Periodic Advertising callbacks register...");
+  bt_le_per_adv_sync_cb_register(&sync_callbacks);
+  LOG_INF("Success.");
 
-		LOG_INF("Start scanning...");
-		err = bt_le_scan_start(BT_LE_SCAN_CUSTOM, NULL);
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
-			return 0;
-		}
-		LOG_INF("success.");
+  do {
+    reset_semaphores();
+    per_adv_lost = false;
 
-		LOG_INF("Waiting for periodic advertising...");
-		per_adv_found = false;
-		err = k_sem_take(&sem_per_adv, K_FOREVER);
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
-			return 0;
-		}
-		LOG_INF("Found periodic advertising.");
+    LOG_INF("Start scanning...");
+    err = bt_le_scan_start(BT_LE_SCAN_CUSTOM, NULL);
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
+      return 0;
+    }
+    LOG_INF("success.");
 
-		LOG_INF("Stop scanning...");
-		err = bt_le_scan_stop();
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
-			return 0;
-		}
-		LOG_INF("success.");
+    LOG_INF("Waiting for periodic advertising...");
+    per_adv_found = false;
+    err = k_sem_take(&sem_per_adv, K_FOREVER);
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
+      return 0;
+    }
+    LOG_INF("Found periodic advertising.");
 
-		LOG_INF("Creating Periodic Advertising Sync...");
-		bt_addr_le_copy(&sync_create_param.addr, &per_addr);
-		sync_create_param.options = 0;
-		sync_create_param.sid = per_sid;
-		sync_create_param.skip = 0;
-		/* Multiple PA interval with retry count and convert to unit of 10 ms */
-		sync_create_param.timeout = (per_interval_us * PA_RETRY_COUNT) /
-									(10 * USEC_PER_MSEC);
-		sem_timeout_us = per_interval_us * PA_RETRY_COUNT;
-		err = bt_le_per_adv_sync_create(&sync_create_param, &sync);
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
-			return 0;
-		}
-		LOG_INF("success.");
+    LOG_INF("Stop scanning...");
+    err = bt_le_scan_stop();
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
+      return 0;
+    }
+    LOG_INF("success.");
 
-		LOG_INF("Waiting for periodic sync...");
-		err = k_sem_take(&sem_per_sync, K_USEC(sem_timeout_us));
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
+    LOG_INF("Creating Periodic Advertising Sync...");
+    bt_addr_le_copy(&sync_create_param.addr, &per_addr);
+    sync_create_param.options = 0;
+    sync_create_param.sid = per_sid;
+    sync_create_param.skip = 0;
+    /* Multiple PA interval with retry count and convert to unit of 10 ms */
+    sync_create_param.timeout =
+        (per_interval_us * PA_RETRY_COUNT) / (10 * USEC_PER_MSEC);
+    sem_timeout_us = per_interval_us * PA_RETRY_COUNT;
+    err = bt_le_per_adv_sync_create(&sync_create_param, &sync);
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
+      return 0;
+    }
+    LOG_INF("success.");
 
-			LOG_INF("Deleting Periodic Advertising Sync...");
-			err = bt_le_per_adv_sync_delete(sync);
-			if (err)
-			{
-				LOG_ERR("failed (err %d)", err);
-				return 0;
-			}
-			continue;
-		}
-		LOG_INF("Periodic sync established.");
+    LOG_INF("Waiting for periodic sync...");
+    err = k_sem_take(&sem_per_sync, K_USEC(sem_timeout_us));
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
 
-		LOG_INF("Waiting for BIG info...");
-		err = k_sem_take(&sem_per_big_info, K_USEC(sem_timeout_us));
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
+      LOG_INF("Deleting Periodic Advertising Sync...");
+      err = bt_le_per_adv_sync_delete(sync);
+      if (err) {
+        LOG_ERR("failed (err %d)", err);
+        return 0;
+      }
+      continue;
+    }
+    LOG_INF("Periodic sync established.");
 
-			if (per_adv_lost)
-			{
-				continue;
-			}
+    LOG_INF("Waiting for BIG info...");
+    err = k_sem_take(&sem_per_big_info, K_USEC(sem_timeout_us));
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
 
-			LOG_INF("Deleting Periodic Advertising Sync...");
-			err = bt_le_per_adv_sync_delete(sync);
-			if (err)
-			{
-				LOG_ERR("failed (err %d)", err);
-				return 0;
-			}
-			continue;
-		}
-		LOG_INF("Periodic sync established.");
+      if (per_adv_lost) {
+        continue;
+      }
 
-		iso_tx_qos.sdu = iso_uplink_sdu_len;
-		LOG_INF("Uplink SDU length configured to %u bytes.",
-		       iso_tx_qos.sdu);
+      LOG_INF("Deleting Periodic Advertising Sync...");
+      err = bt_le_per_adv_sync_delete(sync);
+      if (err) {
+        LOG_ERR("failed (err %d)", err);
+        return 0;
+      }
+      continue;
+    }
+    LOG_INF("Periodic sync established.");
 
-	big_sync_create:
-		/* Use the actual BIG size discovered via biginfo, clamped to our capacity */
-		big_sync_param.num_bis = big_actual_num_bis;
-		big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
-		LOG_INF("Create BIG Sync (num_bis=%u, bitfield=0x%x)...",
-			   big_sync_param.num_bis, big_sync_param.bis_bitfield);
-		err = bt_iso_big_sync(sync, &big_sync_param, &big);
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
-			return 0;
-		}
-		LOG_INF("success.");
+    iso_tx_qos.sdu = iso_uplink_sdu_len;
+    LOG_INF("Uplink SDU length configured to %u bytes.", iso_tx_qos.sdu);
 
-		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
-		{
-			LOG_INF("Waiting for BIG sync chan %u...", chan);
-			err = k_sem_take(&sem_big_sync, TIMEOUT_SYNC_CREATE);
-			if (err)
-			{
-				break;
-			}
-			LOG_INF("BIG sync chan %u successful.", chan);
-		}
-		if (err)
-		{
-			LOG_ERR("failed (err %d)", err);
+  big_sync_create:
+    /* Use the actual BIG size discovered via biginfo, clamped to our capacity
+     */
+    big_sync_param.num_bis = big_actual_num_bis;
+    big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
+    LOG_INF("Create BIG Sync (num_bis=%u, bitfield=0x%x)...",
+            big_sync_param.num_bis, big_sync_param.bis_bitfield);
+    err = bt_iso_big_sync(sync, &big_sync_param, &big);
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
+      return 0;
+    }
+    LOG_INF("success.");
 
-			LOG_INF("BIG Sync Terminate...");
-			err = bt_iso_big_terminate(big);
-			if (err)
-			{
-				LOG_ERR("failed (err %d)", err);
-				return 0;
-			}
-			LOG_INF("done.");
+    for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++) {
+      LOG_INF("Waiting for BIG sync chan %u...", chan);
+      err = k_sem_take(&sem_big_sync, TIMEOUT_SYNC_CREATE);
+      if (err) {
+        break;
+      }
+      LOG_INF("BIG sync chan %u successful.", chan);
+    }
+    if (err) {
+      LOG_ERR("failed (err %d)", err);
 
-			goto per_sync_lost_check;
-		}
-		LOG_INF("BIG sync established.");
+      LOG_INF("BIG Sync Terminate...");
+      err = bt_iso_big_terminate(big);
+      if (err) {
+        LOG_ERR("failed (err %d)", err);
+        return 0;
+      }
+      LOG_INF("done.");
 
-		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
-		{
-			LOG_INF("Setting data path chan %u...", chan);
+      goto per_sync_lost_check;
+    }
+    LOG_INF("BIG sync established.");
 
-			const struct bt_iso_chan_path hci_path = {
-				.pid = BT_ISO_DATA_PATH_HCI,
-				.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
-			};
+    for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++) {
+      LOG_INF("Setting data path chan %u...", chan);
 
-			uint8_t dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+      const struct bt_iso_chan_path hci_path = {
+          .pid = BT_ISO_DATA_PATH_HCI,
+          .format = BT_HCI_CODING_FORMAT_TRANSPARENT,
+      };
 
-			if (chan == 0)
-			{
-				dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
-			}
+      uint8_t dir = BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 
-			err = bt_iso_setup_data_path(bis[chan], dir, &hci_path);
-			if (err != 0)
-			{
-				LOG_ERR("Failed to setup ISO RX data path: %d", err);
-			}
+      if (chan == 0) {
+        dir = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+      }
 
-			LOG_INF("Setting data path complete chan %u.", chan);
-		}
+      err = bt_iso_setup_data_path(bis[chan], dir, &hci_path);
+      if (err != 0) {
+        LOG_ERR("Failed to setup ISO RX data path: %d", err);
+      }
 
-		iso_datapaths_setup = true;
+      LOG_INF("Setting data path complete chan %u.", chan);
+    }
 
-		for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++)
-		{
-			LOG_INF("Waiting for BIG sync lost chan %u...", chan);
-			err = k_sem_take(&sem_big_sync_lost, K_FOREVER);
-			if (err)
-			{
-				LOG_ERR("failed (err %d)", err);
-				return 0;
-			}
-			LOG_INF("BIG sync lost chan %u.", chan);
-		}
-		LOG_INF("BIG sync lost.");
+    iso_datapaths_setup = true;
 
-	per_sync_lost_check:
-		LOG_INF("Check for periodic sync lost...");
-		err = k_sem_take(&sem_per_sync_lost, K_NO_WAIT);
-		if (err)
-		{
-			/* Periodic Sync active, go back to creating BIG Sync */
-			goto big_sync_create;
-		}
-		LOG_INF("Periodic sync lost.");
-	} while (true);
+    /* Give exactly 1 token to start the engine.
+     * We only want ONE packet to be sent per interval. */
+    k_sem_give(&tx_sem);
+
+    for (uint8_t chan = 0U; chan < big_actual_num_bis; chan++) {
+      LOG_INF("Waiting for BIG sync lost chan %u...", chan);
+      err = k_sem_take(&sem_big_sync_lost, K_FOREVER);
+      if (err) {
+        LOG_ERR("failed (err %d)", err);
+        return 0;
+      }
+      LOG_INF("BIG sync lost chan %u.", chan);
+    }
+    LOG_INF("BIG sync lost.");
+
+  per_sync_lost_check:
+    LOG_INF("Check for periodic sync lost...");
+    err = k_sem_take(&sem_per_sync_lost, K_NO_WAIT);
+    if (err) {
+      /* Periodic Sync active, go back to creating BIG Sync */
+      goto big_sync_create;
+    }
+    LOG_INF("Periodic sync lost.");
+  } while (true);
 }
