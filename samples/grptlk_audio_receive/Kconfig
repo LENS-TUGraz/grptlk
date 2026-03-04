@@ -51,6 +51,24 @@ config HW_CODEC_CIRRUS_LOGIC
 
 endif # GRPTLK_AUDIO_BACKEND_CS47L63
 
+config GRPTLK_UPLINK_BIS
+	int "Static uplink BIS index (1-based, BIS1 is downlink)"
+	default 2
+	range 2 5
+	help
+	  BIS index on which this receiver transmits uplink audio back to the
+	  broadcaster. BIS1 is always the downlink, so valid values are 2..5.
+	  Only used when GRPTLK_UPLINK_RANDOM is disabled.
+
+config GRPTLK_UPLINK_RANDOM
+	bool "Randomly select uplink BIS each interval"
+	default n
+	help
+	  When enabled the receiver picks a random uplink BIS (BIS2..BISn) on
+	  every transmission interval instead of always using GRPTLK_UPLINK_BIS.
+	  The broadcaster must use a single shared LC3 decoder for all uplink
+	  BISes to handle the stream correctly.
+
 rsource "src/drivers/Kconfig"
 
 endif # GRPTLK

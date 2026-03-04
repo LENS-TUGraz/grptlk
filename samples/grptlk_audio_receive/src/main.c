@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/random/random.h>
 
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
@@ -39,11 +40,8 @@ static struct bt_bap_lc3_preset preset_active =
 #define BIS_ISO_CHAN_COUNT          5
 #define NUM_PRIME_PACKETS           2
 
-/* THIS IS THE BIS ON WHICH THE RECEIVER SENDS UPLINK AUDIO */
-#define UPLINK_BIS                  3
-
-#if (UPLINK_BIS < 2) || (UPLINK_BIS > BIS_ISO_CHAN_COUNT)
-#error "UPLINK_BIS must be in [2..BIS_ISO_CHAN_COUNT] because BIS1 is downlink"
+#if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > BIS_ISO_CHAN_COUNT)
+#error "CONFIG_GRPTLK_UPLINK_BIS must be in [2..BIS_ISO_CHAN_COUNT]"
 #endif
 
 #ifndef CONFIG_BT_ISO_TX_MTU
@@ -78,7 +76,7 @@ struct lc3_frame {
 /* Downlink encoded frames from BIS1 */
 K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 8, 4);
 
-/* Uplink encoded frames for UPLINK_BIS */
+/* Uplink encoded frames (mic -> LC3 -> ISO TX) */
 K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 8, 4);
 
 static lc3_decoder_t lc3_decoder;
@@ -103,6 +101,11 @@ static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 /* -------------------------------------------------------------------------- */
 /*                               BT/ISO Objects                               */
 /* -------------------------------------------------------------------------- */
+
+/* Actual number of BISes in the discovered BIG, updated from biginfo_cb. */
+static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
+/* BIS index (1-based) currently used for uplink TX. */
+static uint8_t active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS;
 
 static bool per_adv_found;
 static bool per_adv_lost;
@@ -137,7 +140,6 @@ NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool,
 
 static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 static struct bt_iso_chan *bis[BIS_ISO_CHAN_COUNT];
-static struct bt_iso_chan *sync_bis[UPLINK_BIS];
 
 static uint16_t seq_num;
 
@@ -154,12 +156,10 @@ static struct bt_iso_chan_qos bis_iso_qos = {
 };
 
 static struct bt_iso_big_sync_param big_sync_param = {
-	/* Keep BIS indices contiguous for controller sync scheduler:
-	 * sync BIS1..BIS(UPLINK_BIS), but use data paths only on BIS1 and UPLINK_BIS.
-	 */
-	.bis_channels = sync_bis,
-	.num_bis = ARRAY_SIZE(sync_bis),
-	.bis_bitfield = BIT_MASK(UPLINK_BIS),
+	/* Sync all BISes so any uplink BIS can be selected at runtime. */
+	.bis_channels = bis,
+	.num_bis = BIS_ISO_CHAN_COUNT,
+	.bis_bitfield = BIT_MASK(BIS_ISO_CHAN_COUNT),
 	.mse = BT_ISO_SYNC_MSE_ANY,
 	.sync_timeout = 100, /* 10 ms units */
 };
@@ -198,18 +198,19 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		/* Keep cadence near 10 ms; timeout drives PLC when packet is missing. */
 		ret = k_msgq_get(&lc3_rx_q, &frame, K_MSEC(12));
 
-		if (ret == 0 && frame.len > 0U) {
-			ret = lc3_decode(lc3_decoder, frame.data, frame.len,
-					 LC3_PCM_FORMAT_S16, mono_pcm, 1);
-		} else {
-			ret = lc3_decode(lc3_decoder, NULL, octets_per_frame,
-					 LC3_PCM_FORMAT_S16, mono_pcm, 1);
-		}
+		bool got_frame = (ret == 0 && frame.len > 0U);
 
-		if (ret < 0) {
+		/* Always advance the LC3 decoder state. On a missing/invalid frame
+		 * run PLC (NULL data) to keep state in sync, then output silence.
+		 * Skipping the decoder entirely causes phase discontinuities that
+		 * produce crackling bursts on the next valid frame. */
+		const uint8_t *lc3_data = got_frame ? frame.data : NULL;
+		int lc3_len = got_frame ? (int)frame.len : 0;
+		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
+				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
+		if (!got_frame || ret < 0) {
 			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
 
@@ -272,6 +273,25 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 /*                               ISO TX Thread                                */
 /* -------------------------------------------------------------------------- */
 
+static struct bt_iso_chan *iso_select_uplink_chan(void)
+{
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
+	uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
+
+	if (num_uplink == 0U) {
+		return NULL;
+	}
+
+	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
+
+	active_uplink_bis = idx + 1U;
+	return bis[active_uplink_bis];
+#else
+	active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+	return bis[active_uplink_bis];
+#endif
+}
+
 static int uplink_send_next(struct bt_iso_chan *chan);
 
 static void tx_thread(void *arg1, void *arg2, void *arg3)
@@ -281,8 +301,13 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg3);
 
 	while (true) {
+		struct bt_iso_chan *ul_chan;
+
 		k_sem_take(&tx_sem, K_FOREVER);
-		(void)uplink_send_next(bis[UPLINK_BIS - 1]);
+		ul_chan = iso_select_uplink_chan();
+		if (ul_chan != NULL) {
+			(void)uplink_send_next(ul_chan);
+		}
 	}
 }
 
@@ -333,12 +358,10 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	/* Only transmit uplink on selected BIS. */
-	if (chan != bis[UPLINK_BIS - 1]) {
-		return;
+	/* Give semaphore for any uplink BIS (bis[1..N]); bis[0] is downlink-only. */
+	if (chan != bis[0]) {
+		k_sem_give(&tx_sem);
 	}
-
-	k_sem_give(&tx_sem);
 }
 
 static void iso_recv(struct bt_iso_chan *chan,
@@ -385,7 +408,7 @@ static void iso_connected(struct bt_iso_chan *chan)
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 {
 	printk("ISO Channel %p disconnected with reason 0x%02x\n", chan, reason);
-	if (chan == bis[UPLINK_BIS - 1]) {
+	if (chan == bis[active_uplink_bis]) {
 		atomic_set(&uplink_tx_active, 0);
 	}
 
@@ -454,7 +477,8 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync,
 		       const struct bt_iso_biginfo *biginfo)
 {
 	ARG_UNUSED(sync);
-	ARG_UNUSED(biginfo);
+	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+	printk("BIG has %u BIS(es), syncing to %u\n", biginfo->num_bis, big_actual_num_bis);
 	k_sem_give(&sem_per_big_info);
 }
 
@@ -510,21 +534,6 @@ static void bis_channels_init(void)
 		bis_iso_chan[i].qos = &bis_iso_qos;
 		bis[i] = &bis_iso_chan[i];
 	}
-
-	for (uint8_t i = 0U; i < ARRAY_SIZE(sync_bis); i++) {
-		sync_bis[i] = bis[i];
-	}
-}
-
-static int bis_channel_index(const struct bt_iso_chan *chan)
-{
-	for (uint8_t i = 0U; i < BIS_ISO_CHAN_COUNT; i++) {
-		if (bis[i] == chan) {
-			return i;
-		}
-	}
-
-	return -1;
 }
 
 static int setup_iso_datapaths(void)
@@ -532,36 +541,16 @@ static int setup_iso_datapaths(void)
 	int err;
 
 	for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
-		struct bt_iso_chan *chan = sync_bis[i];
-		int chan_idx = bis_channel_index(chan);
+		struct bt_iso_chan *chan = bis[i];
 		const struct bt_iso_chan_path hci_path = {
 			.pid = BT_ISO_DATA_PATH_HCI,
 			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 		};
-		uint8_t dir;
+		/* BIS1 (index 0): downlink CTLR->HOST; all others: uplink HOST->CTLR */
+		uint8_t dir = (i == 0U) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
+					: BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 
-		if (chan_idx < 0) {
-			printk("Unknown BIS channel pointer %p\n", chan);
-			return -EINVAL;
-		}
-
-		/* Only configure channels actually used by this app:
-		 * - BIS1 (downlink audio)
-		 * - UPLINK_BIS (uplink mic)
-		 */
-		if ((chan != bis[0]) && (chan != bis[UPLINK_BIS - 1])) {
-			printk("Skipping data path chan %d (unused)\n", chan_idx);
-			continue;
-		}
-
-		printk("Setting data path chan %d...\n", chan_idx);
-
-		/* Receiver role in group-talk:
-		 * - BIS1: downlink CTLR->HOST
-		 * - UPLINK_BIS: uplink HOST->CTLR
-		 */
-		dir = (chan == bis[0]) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
-				       : BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
+		printk("Setting data path chan %u...\n", i);
 
 		err = bt_iso_setup_data_path(chan, dir, &hci_path);
 		if (err == -EACCES) {
@@ -569,19 +558,18 @@ static int setup_iso_datapaths(void)
 			 * still configured on a reused BIS handle. Remove both possible
 			 * directions and retry once.
 			 */
-			printk("Data path chan %d busy, removing stale path and retrying...\n",
-			       chan_idx);
+			printk("Data path chan %u busy, removing stale path and retrying...\n", i);
 			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_CTLR_TO_HOST);
 			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_HOST_TO_CTLR);
 			err = bt_iso_setup_data_path(chan, dir, &hci_path);
 		}
 
 		if (err) {
-			printk("Failed to setup ISO data path for chan %d: %d\n", chan_idx, err);
+			printk("Failed to setup ISO data path for chan %u: %d\n", i, err);
 			return err;
 		}
 
-		printk("Setting data path complete chan %d.\n", chan_idx);
+		printk("Setting data path complete chan %u.\n", i);
 	}
 
 	seq_num = 0U;
@@ -646,8 +634,13 @@ int main(void)
 	int led_err;
 
 	printk("Starting GRPTLK Receiver\n");
-	printk("Config: downlink=BIS1, uplink=BIS%u, synced BIS bitfield=0x%02x\n",
-	       UPLINK_BIS, (unsigned int)big_sync_param.bis_bitfield);
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
+	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n",
+	       BIS_ISO_CHAN_COUNT);
+#else
+	printk("Config: downlink=BIS1, uplink=static BIS%u\n",
+	       CONFIG_GRPTLK_UPLINK_BIS);
+#endif
 
 	led_err = led_init();
 	if (led_err) {
@@ -759,7 +752,10 @@ big_sync_create:
 			goto per_sync_lost_check;
 		}
 
-		printk("Create BIG Sync...\n");
+		big_sync_param.num_bis = big_actual_num_bis;
+		big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
+		printk("Create BIG Sync (num_bis=%u, bitfield=0x%x)...\n",
+		       big_sync_param.num_bis, big_sync_param.bis_bitfield);
 		atomic_set(&big_chan_connected, 0);
 		err = bt_iso_big_sync(sync, &big_sync_param, &big);
 		if (err) {
@@ -771,20 +767,18 @@ big_sync_create:
 			return err;
 		}
 
-		for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
-			int chan_idx = bis_channel_index(sync_bis[i]);
-
-			printk("Waiting for BIG sync chan %d...\n", chan_idx);
+		for (uint8_t i = 0U; i < big_actual_num_bis; i++) {
+			printk("Waiting for BIG sync chan %u...\n", i);
 			err = k_sem_take(&sem_big_sync, TIMEOUT_SYNC_CREATE);
 			if (err) {
 				break;
 			}
-			printk("BIG sync chan %d successful.\n", chan_idx);
+			printk("BIG sync chan %u successful.\n", i);
 		}
 
-		if (err || (int)atomic_get(&big_chan_connected) < (int)big_sync_param.num_bis) {
+		if (err || (int)atomic_get(&big_chan_connected) < (int)big_actual_num_bis) {
 			printk("BIG sync failed (err %d, connected %d/%u)\n",
-			       err, (int)atomic_get(&big_chan_connected), big_sync_param.num_bis);
+			       err, (int)atomic_get(&big_chan_connected), big_actual_num_bis);
 
 			err = bt_iso_big_terminate(big);
 			if ((err != 0) && (err != -EINVAL) && (err != -EIO)) {
@@ -815,16 +809,14 @@ big_sync_create:
 			}
 		}
 
-		for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
-			int chan_idx = bis_channel_index(sync_bis[i]);
-
-			printk("Waiting for BIG sync lost chan %d...\n", chan_idx);
+		for (uint8_t i = 0U; i < big_actual_num_bis; i++) {
+			printk("Waiting for BIG sync lost chan %u...\n", i);
 			err = k_sem_take(&sem_big_sync_lost, K_FOREVER);
 			if (err) {
 				printk("sem_big_sync_lost failed: %d\n", err);
 				return err;
 			}
-			printk("BIG sync lost chan %d.\n", chan_idx);
+			printk("BIG sync lost chan %u.\n", i);
 		}
 		printk("BIG sync lost.\n");
 		if (led_err == 0) {

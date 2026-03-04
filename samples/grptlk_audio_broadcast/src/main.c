@@ -74,6 +74,9 @@ static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 static struct bt_iso_chan  bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 static uint16_t seq_num;
+/* Set to true when a real uplink frame is received on bis[i+1].
+ * Cleared on disconnect so PLC from a gone sender is not mixed in. */
+static bool bis_ever_rx[NUM_RX_BIS];
 
 static struct bt_iso_big_create_param big_create_param = {
     .num_bis      = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
@@ -168,43 +171,97 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
     static uint32_t dec_frame_cnt;
+    /* Per-BIS debug counters, reset on printk interval. */
+    static uint32_t dbg_rx_cnt[NUM_RX_BIS];
+    static uint32_t dbg_plc_cnt[NUM_RX_BIS];
+    static uint32_t dbg_dec_err[NUM_RX_BIS];
+    static int16_t  dbg_peak[NUM_RX_BIS];
 
     while (1) {
-        k_sem_take(&uplink_rx_sem, K_MSEC(12));
+        k_sem_take(&uplink_rx_sem, K_FOREVER);
+        /* Wait briefly for other BIS channels in the same ISO interval to
+         * enqueue their packets before we drain all queues in one pass.
+         * Without this, BIS2 and BIS3 packets (which arrive at different
+         * subevents within the same 10ms interval) cause two separate wakeups
+         * and two frames into tx_msgq — overflowing the queue. */
+        k_sleep(K_USEC(1500));
+        /* Drain any extra gives that accumulated while sleeping. */
+        while (k_sem_take(&uplink_rx_sem, K_NO_WAIT) == 0) {}
 
         uint32_t t0_total = k_cycle_get_32();
         uint32_t dec_us[NUM_RX_BIS];
         int32_t mixed_pcm[PCM_SAMPLES_PER_FRAME] = {0};
+        int active_streams = 0;
 
         for (int i = 0; i < NUM_RX_BIS; i++) {
             struct uplink_frame frame;
             int16_t stream_pcm[PCM_SAMPLES_PER_FRAME];
-            int ret = k_msgq_get(&uplink_rx_q[i], &frame, K_NO_WAIT);
 
             uint32_t t0 = k_cycle_get_32();
-            if (ret == 0 && frame.len > 0) {
-                ret = lc3_decode(lc3_decoders[i], frame.data, frame.len,
-                                 LC3_PCM_FORMAT_S16, stream_pcm, 1);
-                if (ret != 0) {
-                    memset(stream_pcm, 0, sizeof(stream_pcm));
-                }
+            bool got_frame = (k_msgq_get(&uplink_rx_q[i], &frame, K_NO_WAIT) == 0 &&
+                              frame.len > 0);
+
+            if (got_frame) {
+                dbg_rx_cnt[i]++;
+                bis_ever_rx[i] = true;
             } else {
-                lc3_decode(lc3_decoders[i], NULL, preset_active.qos.sdu,
-                           LC3_PCM_FORMAT_S16, stream_pcm, 1);
+                dbg_plc_cnt[i]++;
+            }
+
+            /* Always run the LC3 decoder to keep its internal state advancing.
+             * On a missing frame pass NULL (PLC mode) but discard the output —
+             * this prevents phase discontinuities that cause bursts of crackling
+             * every time a BT packet is dropped. */
+            const uint8_t *lc3_data = got_frame ? frame.data : NULL;
+            int lc3_len = got_frame ? (int)frame.len : 0;
+            int ret = lc3_decode(lc3_decoders[i], lc3_data, lc3_len,
+                                 LC3_PCM_FORMAT_S16, stream_pcm, 1);
+
+            if (ret < 0) {
+                /* ret==1 means PLC operated (normal), ret<0 means bad params. */
+                dbg_dec_err[i]++;
+            }
+
+            /* Mix real frames (ret==0) and PLC frames (ret==1) for active
+             * senders — PLC smooths over occasional dropped BT packets.
+             * Never mix PLC output from idle BISes (bis_ever_rx[i]==false):
+             * their decoder produces noise from an uninitialised state. */
+            if (ret >= 0 && bis_ever_rx[i]) {
+                int16_t peak = 0;
+                for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
+                    int16_t a = stream_pcm[s] < 0 ? -stream_pcm[s] : stream_pcm[s];
+                    if (a > peak) { peak = a; }
+                }
+                if (peak > dbg_peak[i]) { dbg_peak[i] = peak; }
+                active_streams++;
+                for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
+                    mixed_pcm[s] += stream_pcm[s];
+                }
             }
             dec_us[i] = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
+        }
 
+        /* Normalise by number of active streams to prevent clipping. */
+        if (active_streams > 1) {
             for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-                mixed_pcm[s] += stream_pcm[s];
+                mixed_pcm[s] /= active_streams;
             }
         }
 
         uint32_t total_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0_total);
         if ((dec_frame_cnt++ % 100U) == 0U) {
-            printk("[dec] frame=%u total=%u us  tx_q=%u\n",
-                   dec_frame_cnt, total_us, k_msgq_num_used_get(&tx_msgq));
+            printk("[dec] frame=%u total=%u us active=%d tx_q=%u\n",
+                   dec_frame_cnt, total_us, active_streams,
+                   k_msgq_num_used_get(&tx_msgq));
             for (int i = 0; i < NUM_RX_BIS; i++) {
-                printk("      bis%d=%u us\n", i + 1, dec_us[i]);
+                printk("  bis%d: rx=%u plc=%u err=%u peak=%d (%u us)\n",
+                       i + 2,
+                       dbg_rx_cnt[i], dbg_plc_cnt[i],
+                       dbg_dec_err[i], dbg_peak[i], dec_us[i]);
+                dbg_rx_cnt[i]  = 0;
+                dbg_plc_cnt[i] = 0;
+                dbg_dec_err[i] = 0;
+                dbg_peak[i]    = 0;
             }
         }
 
@@ -282,6 +339,13 @@ static void iso_connected(struct bt_iso_chan *chan)
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 {
     printk("ISO Channel %p disconnected with reason 0x%02x\n", chan, reason);
+    for (int i = 0; i < NUM_RX_BIS; i++) {
+        if (chan == bis[i + 1]) {
+            bis_ever_rx[i] = false;
+            k_msgq_purge(&uplink_rx_q[i]);
+            break;
+        }
+    }
 }
 
 static void iso_sent(struct bt_iso_chan *chan)
@@ -296,7 +360,7 @@ static void iso_recv(struct bt_iso_chan *chan,
 {
     struct uplink_frame frame;
 
-    if (buf && buf->len == CONFIG_BT_ISO_TX_MTU && (info->flags & BT_ISO_FLAGS_VALID)) {
+    if (buf && buf->len > 0 && buf->len <= CONFIG_BT_ISO_TX_MTU && (info->flags & BT_ISO_FLAGS_VALID)) {
         frame.len = buf->len;
         memcpy(frame.data, buf->data, buf->len);
     } else {
@@ -538,8 +602,8 @@ int main(void)
 
     for (int i = 0; i < NUM_RX_BIS; i++) {
         lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval,
-                                              SAMPLE_RATE_HZ, 0,
-                                              &lc3_decoder_mems[i]);
+                                             SAMPLE_RATE_HZ, 0,
+                                             &lc3_decoder_mems[i]);
         if (lc3_decoders[i] == NULL) {
             printk("Failed to setup LC3 decoder %d\n", i);
             return -EIO;
