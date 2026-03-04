@@ -5,11 +5,16 @@
 
 struct net_buf;
 struct bt_iso_recv_info;
+struct bt_iso_chan;
 
 #if IS_ENABLED(CONFIG_GRPTLK_ISO_STATS)
 
 void iso_log_startup_hint(void);
-void iso_start_stats_thread(void);
+/*
+ * Start the stats thread.  bis[] and count are stored so the thread can call
+ * bt_iso_chan_get_info() on each channel once per second.
+ */
+void iso_start_stats_thread(struct bt_iso_chan **bis, int count);
 void iso_stats_reset_seq(void);
 
 void iso_stats_tx_ok(void);
@@ -23,7 +28,11 @@ void iso_stats_rx(int chan_idx, const struct bt_iso_recv_info *info, struct net_
 #else
 
 static inline void iso_log_startup_hint(void) {}
-static inline void iso_start_stats_thread(void) {}
+static inline void iso_start_stats_thread(struct bt_iso_chan **bis, int count)
+{
+	(void)bis;
+	(void)count;
+}
 static inline void iso_stats_reset_seq(void) {}
 
 static inline void iso_stats_tx_ok(void) {}

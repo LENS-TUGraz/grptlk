@@ -137,6 +137,9 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync,
   LOG_INF("BIG has %u BIS(es), syncing to %u (capacity %u)", biginfo->num_bis,
           big_actual_num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
 
+  /* Record PHY for inclusion in uplink stats reports */
+  rx_stats_set_phy(biginfo->phy);
+
   k_sem_give(&sem_per_big_info);
 }
 
@@ -229,7 +232,6 @@ static struct bt_iso_chan *iso_select_uplink_chan(void);
 static void iso_recv(struct bt_iso_chan *chan,
                      const struct bt_iso_recv_info *info, struct net_buf *buf) {
   int chan_idx;
-  size_t uplink_len = iso_uplink_sdu_len;
 
   chan_idx = iso_chan_index(chan);
   if (chan_idx < 0) {
@@ -267,9 +269,18 @@ static struct bt_iso_chan *iso_select_uplink_chan(void) {
 }
 
 static void iso_connected(struct bt_iso_chan *chan) {
+  int chan_idx;
+
   LOG_INF("ISO Channel %p connected", chan);
   seq_num = 0U;
   rx_stats_reset_seq();
+
+  /* Snapshot channel parameters for BIS1 (downlink) only */
+  chan_idx = iso_chan_index(chan);
+  if (chan_idx == 0) {
+    rx_stats_update_chan_info(chan);
+  }
+
   k_sem_give(&sem_big_sync);
 }
 

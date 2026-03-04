@@ -3,6 +3,7 @@
 #if IS_ENABLED(CONFIG_GRPTLK_ISO_STATS_ENABLED)
 
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/iso.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
@@ -32,22 +33,25 @@ struct iso_rx_stats
 	uint32_t old_or_dup;
 };
 
+BUILD_ASSERT(sizeof(struct grptlk_uplink_stats_v1) == GRPTLK_UPLINK_STATS_V1_SIZE,
+	     "Stats v1 payload format must stay 40 bytes");
+BUILD_ASSERT(sizeof(struct grptlk_uplink_stats_v2) == GRPTLK_UPLINK_STATS_V2_SIZE,
+	     "Stats v2 payload format must stay 40 bytes");
+
 static struct iso_tx_stats iso_uplink_tx_stats;
 static struct iso_rx_stats iso_downlink_rx_stats;
 static uint16_t iso_recv_expected_seq[BIS_ISO_CHAN_COUNT];
 static bool iso_recv_seq_initialized[BIS_ISO_CHAN_COUNT];
 
-BUILD_ASSERT(sizeof(struct grptlk_uplink_stats_v1) == GRPTLK_UPLINK_STATS_V1_SIZE,
-	     "Stats payload format must stay 40 bytes");
+static uint8_t dl_phy;
+static struct bt_iso_info dl_chan_info;
+static bool dl_chan_info_valid;
 
 static uint8_t grptlk_device_id[GRPTLK_DEVICE_ID_LEN];
 static uint8_t grptlk_device_id_len;
 static uint32_t report_last_ms;
-static struct grptlk_uplink_stats_v1 report_cache;
+static struct grptlk_uplink_stats_v2 report_cache;
 
-/* Populate device ID from BT identity address.
- * Called after bt_enable() so the address is available.
- * The BT random address is unique per device in both BSim and real hardware. */
 void rx_stats_init_device_id(void)
 {
 	bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
@@ -55,7 +59,6 @@ void rx_stats_init_device_id(void)
 
 	bt_id_get(addrs, &count);
 	if (count > 0U) {
-		/* BD_ADDR is 6 bytes, fits within GRPTLK_DEVICE_ID_LEN=8. */
 		grptlk_device_id_len = sizeof(addrs[0].a.val);
 		memcpy(grptlk_device_id, addrs[0].a.val, grptlk_device_id_len);
 	} else {
@@ -69,12 +72,27 @@ void rx_stats_init_report_cache(uint8_t active_uplink_bis)
 	memset(&report_cache, 0, sizeof(report_cache));
 	report_cache.magic[0] = GRPTLK_UPLINK_MAGIC_0;
 	report_cache.magic[1] = GRPTLK_UPLINK_MAGIC_1;
-	report_cache.version = GRPTLK_UPLINK_VERSION;
-	report_cache.type = GRPTLK_UPLINK_TYPE_STATS_V1;
+	report_cache.version = GRPTLK_UPLINK_VERSION_2;
+	report_cache.type = GRPTLK_UPLINK_TYPE_STATS_V2;
 	report_cache.uplink_bis = active_uplink_bis;
 	report_cache.dev_id_len = grptlk_device_id_len;
 	memcpy(report_cache.dev_id, grptlk_device_id, sizeof(report_cache.dev_id));
 	report_last_ms = k_uptime_get_32();
+}
+
+void rx_stats_set_phy(uint8_t phy)
+{
+	dl_phy = phy;
+}
+
+void rx_stats_update_chan_info(struct bt_iso_chan *chan)
+{
+	int err = bt_iso_chan_get_info(chan, &dl_chan_info);
+
+	dl_chan_info_valid = (err == 0);
+	if (err != 0) {
+		LOG_WRN("bt_iso_chan_get_info failed: %d", err);
+	}
 }
 
 static void refresh_report_cache(void)
@@ -82,18 +100,24 @@ static void refresh_report_cache(void)
 	uint32_t now = k_uptime_get_32();
 	uint32_t elapsed_ms = now - report_last_ms;
 
-	/* Live snapshot: publish current cumulative counters in every uplink packet. */
 	report_cache.interval_ms = sys_cpu_to_le16((uint16_t)MIN(elapsed_ms, UINT16_MAX));
 	report_cache.dl_rx_total = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.total);
 	report_cache.dl_rx_valid = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.valid_flag);
 	report_cache.dl_rx_lost = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.lost_flag);
-	report_cache.dl_rx_error = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.error_flag);
-	report_cache.dl_rx_bad_len = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.bad_len);
 	report_cache.dl_rx_gap_packets = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.seq_gap_packets);
+	report_cache.dl_rx_gap_events = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.seq_gap_events);
 	report_cache.dl_rx_old_or_dup = sys_cpu_to_le16((uint16_t)iso_downlink_rx_stats.old_or_dup);
 	report_cache.ul_tx_ok = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.ok);
 	report_cache.ul_tx_alloc_fail = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.alloc_fail);
 	report_cache.ul_tx_send_fail = sys_cpu_to_le16((uint16_t)iso_uplink_tx_stats.send_fail);
+
+	report_cache.phy = dl_phy;
+	if (dl_chan_info_valid) {
+		report_cache.chan_info = GRPTLK_CHAN_INFO_PACK(dl_chan_info.sync_receiver.bn,
+							      dl_chan_info.sync_receiver.irc);
+		report_cache.chan_max_pdu = sys_cpu_to_le16(dl_chan_info.sync_receiver.max_pdu);
+	}
+
 	report_last_ms = now;
 }
 
@@ -120,7 +144,7 @@ void rx_stats_tx_send_fail(void)
 void rx_stats_rx_downlink(const struct bt_iso_recv_info *info, struct net_buf *buf)
 {
 	struct iso_rx_stats *rx_stats = &iso_downlink_rx_stats;
-	int chan_idx = 0; // Downlink is always index 0
+	int chan_idx = 0; /* Downlink is always index 0 */
 
 	if (iso_recv_seq_initialized[chan_idx])
 	{

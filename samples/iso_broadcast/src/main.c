@@ -163,7 +163,7 @@ int main(void) {
   iso_init_channels();
   LOG_INF("Starting GRPTLK Broadcaster");
   iso_log_startup_hint();
-  iso_start_stats_thread();
+  iso_start_stats_thread(bis, BIS_ISO_CHAN_COUNT);
 
   err = bt_enable(NULL);
   if (err) {

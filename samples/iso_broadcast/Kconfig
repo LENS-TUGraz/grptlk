@@ -65,7 +65,8 @@ config BT_CTLR_SCAN_DATA_LEN_MAX
 config BT_CTLR_ADV_ISO_PDU_LEN_MAX
 	default 48 if GRPTLK_BCST && BT_CTLR_ADV_ISO
 
-# Broadcaster RX (uplink) SDUs are the same size as TX SDUs.
+# Broadcaster RX (uplink) SDUs are grptlk_uplink_stats_v2 (40 bytes, same as downlink SDU).
+# PDU = SDU + controller overhead (8 bytes) => 48.
 config BT_CTLR_SYNC_ISO_PDU_LEN_MAX
 	default 48 if GRPTLK_BCST && BT_CTLR_SYNC_ISO && !BT_HCI_RAW
 

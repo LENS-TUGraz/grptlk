@@ -6,6 +6,7 @@
 
 struct net_buf;
 struct bt_iso_recv_info;
+struct bt_iso_chan;
 
 #if IS_ENABLED(CONFIG_GRPTLK_ISO_STATS_ENABLED)
 
@@ -20,6 +21,9 @@ void rx_stats_tx_send_fail(void);
 void rx_stats_rx_downlink(const struct bt_iso_recv_info *info, struct net_buf *buf);
 
 void rx_stats_prepare_uplink_payload(uint8_t *data, size_t sdu_len, uint16_t seq_num, uint8_t active_uplink_bis);
+
+void rx_stats_set_phy(uint8_t phy);
+void rx_stats_update_chan_info(struct bt_iso_chan *chan);
 
 #else
 
@@ -39,6 +43,9 @@ static inline void rx_stats_prepare_uplink_payload(uint8_t *data, size_t sdu_len
 		memset(data, (uint8_t)seq_num, sdu_len);
 	}
 }
+
+static inline void rx_stats_set_phy(uint8_t phy) { (void)phy; }
+static inline void rx_stats_update_chan_info(struct bt_iso_chan *chan) { (void)chan; }
 
 #endif /* IS_ENABLED(CONFIG_GRPTLK_ISO_STATS_ENABLED) */
 
