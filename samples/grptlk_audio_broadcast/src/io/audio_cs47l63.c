@@ -198,16 +198,25 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	}
 }
 
+/* Last successfully decoded frame, replayed on underrun to avoid silence
+ * clicks caused by the broadcaster ACLK / receiver BLE clock drift. */
+static uint32_t tx_last_frame[AUDIO_I2S_WORDS_PER_BLOCK];
+
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	static uint32_t silence_inject_cnt;
+	static uint32_t underrun_cnt;
 
-	if (playback_q == NULL ||
-	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) != 0) {
-		memset(tx_words, 0, AUDIO_I2S_BLOCK_BYTES);
-		if ((silence_inject_cnt++ % 200U) == 0U) {
-			printk("Uplink RX playback: injecting silence (cnt=%u)\n",
-			       silence_inject_cnt);
+	if (playback_q != NULL &&
+	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) == 0) {
+		/* Got a real frame — save it for potential replay. */
+		memcpy(tx_last_frame, tx_words, AUDIO_I2S_BLOCK_BYTES);
+	} else {
+		/* Queue empty: replay the last frame instead of silence to
+		 * avoid audible clicks from the ACLK/BLE clock drift. */
+		memcpy(tx_words, tx_last_frame, AUDIO_I2S_BLOCK_BYTES);
+		if ((underrun_cnt++ % 200U) == 0U) {
+			printk("Uplink RX playback: replaying last frame (cnt=%u)\n",
+			       underrun_cnt);
 		}
 	}
 }
@@ -291,6 +300,20 @@ int audio_start(void)
 
 	memset(i2s_tx_buf_a, 0, sizeof(i2s_tx_buf_a));
 	memset(i2s_tx_buf_b, 0, sizeof(i2s_tx_buf_b));
+
+	/* Pre-fill the playback queue with silence so tx_buffer_fill() always
+	 * finds a frame ready, even before the uplink decoder produces its first
+	 * real frame.  Without this the nrfx I2S ISR fires before the decoder
+	 * thread has run, finds tx_msgq empty, and injects a silence burst that
+	 * the codec reproduces as a click or crackle.  Two frames (20 ms) is
+	 * enough to absorb one full decoder wake-up cycle. */
+	if (playback_q != NULL) {
+		static const uint8_t silence[AUDIO_I2S_BLOCK_BYTES];
+
+		for (int i = 0; i < 2; i++) {
+			(void)k_msgq_put(playback_q, silence, K_NO_WAIT);
+		}
+	}
 
 	err = audio_i2s_start(i2s_rx_buf_a, i2s_tx_buf_a);
 	if (err) {
