@@ -89,6 +89,13 @@ static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 static struct k_thread encoder_thread_data;
 
+/* ISO TX Thread Objects */
+#define TX_THREAD_STACK_SIZE 1024
+#define TX_THREAD_PRIORITY   5
+
+K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
+static struct k_thread tx_thread_data;
+
 /* Encoded Audio FIFO */
 /* Size of 2 ensures double buffering: one being sent, one being prepared.
  * This minimizes latency (keeping buffer shallow) while preventing underruns.
@@ -103,6 +110,7 @@ NET_BUF_POOL_FIXED_DEFINE(
     NULL);
 
 static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
+static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
 static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 static struct bt_iso_chan
@@ -269,6 +277,43 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 }
 
 /* -------------------------------------------------------------------------- */
+/*                               ISO TX Thread                                */
+/* -------------------------------------------------------------------------- */
+
+static void tx_thread(void *arg1, void *arg2, void *arg3)
+{
+    int err;
+    struct net_buf *buf;
+    uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
+
+    while (true) {
+        k_sem_take(&tx_sem, K_FOREVER);
+
+        buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
+        if (!buf) {
+            printk("tx_thread: net_buf pool exhausted\n");
+            continue;
+        }
+
+        net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+
+        if (k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT) != 0) {
+            memset(enc_data, 0, sizeof(enc_data));
+        }
+        net_buf_add_mem(buf, enc_data, sizeof(enc_data));
+
+        err = bt_iso_chan_send(bis[0], buf, seq_num);
+        if (err < 0) {
+            printk("Unable to broadcast data: %d\n", err);
+            net_buf_unref(buf);
+            continue;
+        }
+
+        seq_num++;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               ISO Callbacks                                */
 /* -------------------------------------------------------------------------- */
 
@@ -284,38 +329,7 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason) {
 
 static void iso_sent(struct bt_iso_chan *chan) {
   if (chan == bis[0]) {
-    int err;
-    struct net_buf *buf;
-
-    buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
-    if (!buf) {
-      printk("iso_sent: net_buf pool exhausted\n");
-      return;
-    }
-
-    net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-
-    uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
-
-    /* Fetch already encoded frame from queue (non-blocking) */
-    if (k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT) != 0) {
-      /* Underrun: encoder hasn't produced a frame yet — send silence */
-      static int tx_underrun_cnt = 0;
-      if ((tx_underrun_cnt++ % 100) == 0) {
-          printk("TX underrun - sending silence (cnt=%d)\n", tx_underrun_cnt);
-      }
-      memset(enc_data, 0, sizeof(enc_data));
-    }
-    net_buf_add_mem(buf, enc_data, sizeof(enc_data));
-
-    err = bt_iso_chan_send(chan, buf, seq_num);
-    if (err < 0) {
-      printk("Unable to broadcast data on channel %p : %d\n", chan, err);
-      net_buf_unref(buf);
-      return;
-    }
-
-    seq_num++;
+    k_sem_give(&tx_sem);
   }
 }
 
@@ -513,7 +527,7 @@ static int setup_iso_datapaths(void) {
 
 static void prime_and_start_iso_transmission(void) {
   for (int i = 0; i < NUM_PRIME_PACKETS; i++) {
-    iso_sent(bis[0]);
+    k_sem_give(&tx_sem);
   }
 }
 
@@ -631,6 +645,12 @@ int main(void) {
   if (err) {
     return err;
   }
+
+  k_thread_create(&tx_thread_data, tx_thread_stack,
+                  K_THREAD_STACK_SIZEOF(tx_thread_stack),
+                  tx_thread, NULL, NULL, NULL,
+                  TX_THREAD_PRIORITY, 0, K_NO_WAIT);
+  k_thread_name_set(&tx_thread_data, "iso_tx");
 
   prime_and_start_iso_transmission();
   led_err = led_set_broadcast_running(true);
