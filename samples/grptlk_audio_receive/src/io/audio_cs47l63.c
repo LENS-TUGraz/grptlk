@@ -129,8 +129,11 @@ static inline uint8_t mic_channel_pick(int32_t left_peak, int32_t right_peak)
 
 static inline void i2s_word_unpack(uint32_t word, int16_t *left, int16_t *right)
 {
-	*left = (int16_t)(word & 0xFFFF);
-	*right = (int16_t)(word >> 16);
+	/* NRF_I2S_ALIGN_LEFT with NRF_I2S_SWIDTH_16BIT: the 16-bit sample
+	 * occupies the upper half of the 32-bit word (bits [31:16] = left
+	 * channel, bits [15:0] = right channel). */
+	*left  = (int16_t)(word >> 16);
+	*right = (int16_t)(word & 0xFFFF);
 }
 
 static void stereo_peak_analyze_words(const uint32_t *rx_words,

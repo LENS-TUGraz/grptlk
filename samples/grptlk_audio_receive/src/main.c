@@ -92,6 +92,14 @@ static struct k_thread decoder_thread_data;
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 static struct k_thread encoder_thread_data;
 
+/* ISO TX Thread Objects */
+#define TX_THREAD_STACK_SIZE        1024
+#define TX_THREAD_PRIORITY          5
+
+K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
+static struct k_thread tx_thread_data;
+static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
+
 /* -------------------------------------------------------------------------- */
 /*                               BT/ISO Objects                               */
 /* -------------------------------------------------------------------------- */
@@ -261,6 +269,24 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 }
 
 /* -------------------------------------------------------------------------- */
+/*                               ISO TX Thread                                */
+/* -------------------------------------------------------------------------- */
+
+static int uplink_send_next(struct bt_iso_chan *chan);
+
+static void tx_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (true) {
+		k_sem_take(&tx_sem, K_FOREVER);
+		(void)uplink_send_next(bis[UPLINK_BIS - 1]);
+	}
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               ISO Callbacks                                */
 /* -------------------------------------------------------------------------- */
 
@@ -312,7 +338,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 		return;
 	}
 
-	(void)uplink_send_next(chan);
+	k_sem_give(&tx_sem);
 }
 
 static void iso_recv(struct bt_iso_chan *chan,
@@ -345,7 +371,7 @@ static void iso_recv(struct bt_iso_chan *chan,
 	 * does not reliably trigger the iso_sent chain on the nRF5340. */
 	if (iso_datapaths_setup) {
 		iso_datapaths_setup = false;
-		(void)uplink_send_next(bis[UPLINK_BIS - 1]);
+		k_sem_give(&tx_sem);
 	}
 }
 
@@ -597,6 +623,11 @@ static int lc3_workers_start(void)
 			K_THREAD_STACK_SIZEOF(encoder_stack), encoder_thread_func,
 			NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
+
+	k_thread_create(&tx_thread_data, tx_thread_stack,
+			K_THREAD_STACK_SIZEOF(tx_thread_stack), tx_thread,
+			NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&tx_thread_data, "iso_tx");
 
 	return 0;
 }
