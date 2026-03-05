@@ -238,6 +238,35 @@ static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf
 	}
 }
 
+int audio_volume_adjust(int8_t step_db)
+{
+	uint32_t vol;
+	int ret;
+
+	ret = cs47l63_read_reg(&codec_driver, CS47L63_OUT1L_VOLUME_1, &vol);
+	if (ret != CS47L63_STATUS_OK) {
+		return -EIO;
+	}
+
+	int32_t new_vol = (int32_t)(vol & 0xFFU) + (int32_t)(step_db * 2);
+
+	if (new_vol < 0) {
+		new_vol = 0;
+	} else if (new_vol > MAX_VOLUME_REG_VAL) {
+		new_vol = MAX_VOLUME_REG_VAL;
+	}
+
+	ret = cs47l63_write_reg(&codec_driver, CS47L63_OUT1L_VOLUME_1,
+				(uint32_t)new_vol | VOLUME_UPDATE_BIT);
+	if (ret != CS47L63_STATUS_OK) {
+		return -EIO;
+	}
+
+	printk("[VOL] %+d dB -> reg=0x%02x (%d dB)\n",
+	       step_db, (uint8_t)new_vol, (int)(new_vol / 2) - MAX_VOLUME_DB);
+	return 0;
+}
+
 int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 {
 	int err;

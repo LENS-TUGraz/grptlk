@@ -19,6 +19,87 @@
 #include <zephyr/sys/byteorder.h>
 
 /* -------------------------------------------------------------------------- */
+/*                    Volume Buttons (sw0 = Vol Down, sw1 = Vol Up)           */
+/* -------------------------------------------------------------------------- */
+
+#define VOLUME_STEP_DB 3
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
+#define VOL_BTN_AVAILABLE 1
+static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static struct gpio_callback vol_dn_cb_data;
+static struct gpio_callback vol_up_cb_data;
+
+/* Deferred volume work: ISRs cannot call SPI directly. */
+static struct k_work vol_work;
+static atomic_t vol_pending_step = ATOMIC_INIT(0);
+
+static void vol_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    int step = (int)atomic_set(&vol_pending_step, 0);
+
+    if (step != 0) {
+        audio_volume_adjust((int8_t)step);
+    }
+}
+
+static void vol_dn_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
+    printk("[VOL] down pressed\n");
+    atomic_add(&vol_pending_step, -VOLUME_STEP_DB);
+    k_work_submit(&vol_work);
+}
+
+static void vol_up_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
+    printk("[VOL] up pressed\n");
+    atomic_add(&vol_pending_step, VOLUME_STEP_DB);
+    k_work_submit(&vol_work);
+}
+#else
+#define VOL_BTN_AVAILABLE 0
+#endif
+
+static int vol_buttons_init(void)
+{
+#if VOL_BTN_AVAILABLE
+    int err;
+
+    k_work_init(&vol_work, vol_work_handler);
+
+    if (!gpio_is_ready_dt(&vol_dn_btn) || !gpio_is_ready_dt(&vol_up_btn)) {
+        printk("Volume button GPIO not ready\n");
+        return -ENODEV;
+    }
+    err = gpio_pin_configure_dt(&vol_dn_btn, GPIO_INPUT);
+    if (err) { return err; }
+    err = gpio_pin_configure_dt(&vol_up_btn, GPIO_INPUT);
+    if (err) { return err; }
+
+    err = gpio_pin_interrupt_configure_dt(&vol_dn_btn, GPIO_INT_EDGE_TO_ACTIVE);
+    if (err) { return err; }
+    err = gpio_pin_interrupt_configure_dt(&vol_up_btn, GPIO_INT_EDGE_TO_ACTIVE);
+    if (err) { return err; }
+
+    gpio_init_callback(&vol_dn_cb_data, vol_dn_isr, BIT(vol_dn_btn.pin));
+    gpio_init_callback(&vol_up_cb_data, vol_up_isr, BIT(vol_up_btn.pin));
+    gpio_add_callback(vol_dn_btn.port, &vol_dn_cb_data);
+    gpio_add_callback(vol_up_btn.port, &vol_up_cb_data);
+
+    printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n",
+           VOLUME_STEP_DB);
+    return 0;
+#else
+    printk("Volume buttons: sw0/sw1 not available on this board\n");
+    return 0;
+#endif
+}
+
+/* -------------------------------------------------------------------------- */
 /*                           PTT Button (BTN3 = sw2)                          */
 /* -------------------------------------------------------------------------- */
 
@@ -756,6 +837,8 @@ int main(void)
         printk("audio_start failed: %d\n", err);
         return err;
     }
+
+    (void)vol_buttons_init();
 
     lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
                                      0, &lc3_encoder_mem);

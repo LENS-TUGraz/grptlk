@@ -18,4 +18,8 @@ typedef void (*audio_rx_cb_t)(const int16_t *mono_frame);
 int audio_init(struct k_msgq *playback_q, audio_rx_cb_t rx_cb);
 int audio_start(void);
 
+/* Adjust output volume by step_db dB (+3 = up, -3 = down).
+ * Clamped to [−64 dB, 0 dB]. Only available on CS47L63-equipped boards. */
+int audio_volume_adjust(int8_t step_db);
+
 #endif /* GRPTLK_AUDIO_H_ */
