@@ -10,6 +10,9 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
@@ -22,6 +25,80 @@
 #include "io/audio.h"
 #include "io/led.h"
 #include "lc3.h"
+
+#define NUM_PRIME_PACKETS 2
+/* Defined early so ptt_isr_press can call k_sem_give(&tx_sem). */
+K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
+
+/* -------------------------------------------------------------------------- */
+/*                           PTT Button (BTN3 = sw2)                          */
+/* -------------------------------------------------------------------------- */
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#define PTT_AVAILABLE 1
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static struct gpio_callback ptt_cb_data;
+
+static atomic_t ptt_active = ATOMIC_INIT(0);
+
+static void ptt_isr_press(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+	int val = gpio_pin_get_dt(&ptt_btn);
+
+	if (val > 0) {
+		/* Button pressed: start TX chain by priming the semaphore. */
+		atomic_set(&ptt_active, 1);
+		printk("[PTT] pressed\n");
+		k_sem_give(&tx_sem);
+	} else {
+		/* Button released: clear flag so iso_sent stops re-arming tx_sem. */
+		atomic_set(&ptt_active, 0);
+		printk("[PTT] released\n");
+	}
+}
+#else
+#define PTT_AVAILABLE 0
+static atomic_t ptt_active = ATOMIC_INIT(1); /* always transmit if no button */
+#endif
+
+static int ptt_init(void)
+{
+#if PTT_AVAILABLE
+	int err;
+
+	if (!gpio_is_ready_dt(&ptt_btn)) {
+		printk("PTT button GPIO not ready\n");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&ptt_btn, GPIO_INPUT);
+	if (err) {
+		printk("PTT button configure failed: %d\n", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&ptt_btn, GPIO_INT_EDGE_BOTH);
+	if (err) {
+		printk("PTT interrupt configure failed: %d\n", err);
+		return err;
+	}
+
+	gpio_init_callback(&ptt_cb_data, ptt_isr_press, BIT(ptt_btn.pin));
+	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
+
+	/* Read initial state */
+	int val = gpio_pin_get_dt(&ptt_btn);
+	atomic_set(&ptt_active, val > 0 ? 1 : 0);
+	printk("PTT init: button is %s\n", val > 0 ? "pressed" : "released");
+	return 0;
+#else
+	printk("PTT: no sw2 alias, always transmitting\n");
+	return 0;
+#endif
+}
 
 /* -------------------------------------------------------------------------- */
 /*                               Configuration                                */
@@ -38,7 +115,6 @@ static struct bt_bap_lc3_preset preset_active =
 #define TIMEOUT_SYNC_CREATE         K_SECONDS(10)
 #define PA_RETRY_COUNT              6
 #define BIS_ISO_CHAN_COUNT          5
-#define NUM_PRIME_PACKETS           2
 
 #if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > BIS_ISO_CHAN_COUNT)
 #error "CONFIG_GRPTLK_UPLINK_BIS must be in [2..BIS_ISO_CHAN_COUNT]"
@@ -96,7 +172,6 @@ static struct k_thread encoder_thread_data;
 
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 static struct k_thread tx_thread_data;
-static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
 /* -------------------------------------------------------------------------- */
 /*                               BT/ISO Objects                               */
@@ -188,7 +263,6 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	struct lc3_frame frame;
 	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
 	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * AUDIO_CHANNELS];
-	const int octets_per_frame = preset_active.qos.sdu;
 	static uint32_t tx_q_drop_cnt;
 
 	ARG_UNUSED(arg1);
@@ -203,14 +277,15 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		bool got_frame = (ret == 0 && frame.len > 0U);
 
 		/* Always advance the LC3 decoder state. On a missing/invalid frame
-		 * run PLC (NULL data) to keep state in sync, then output silence.
-		 * Skipping the decoder entirely causes phase discontinuities that
-		 * produce crackling bursts on the next valid frame. */
+		 * run PLC (NULL data) — liblc3 returns ret=1 and writes synthesised
+		 * concealment audio into mono_pcm. Use that output as-is; only zero
+		 * on a hard decoder error (ret < 0). Silencing PLC frames discards
+		 * the concealment audio and causes a click on every lost packet. */
 		const uint8_t *lc3_data = got_frame ? frame.data : NULL;
 		int lc3_len = got_frame ? (int)frame.len : 0;
 		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
 				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
-		if (!got_frame || ret < 0) {
+		if (ret < 0) {
 			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
 
@@ -358,8 +433,9 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	/* Give semaphore for any uplink BIS (bis[1..N]); bis[0] is downlink-only. */
-	if (chan != bis[0]) {
+	/* Re-arm TX only for uplink BISes and only while PTT is held.
+	 * When PTT is released the chain starves: no more packets are sent. */
+	if (chan != bis[0] && atomic_get(&ptt_active) != 0) {
 		k_sem_give(&tx_sem);
 	}
 }
@@ -394,7 +470,10 @@ static void iso_recv(struct bt_iso_chan *chan,
 	 * does not reliably trigger the iso_sent chain on the nRF5340. */
 	if (iso_datapaths_setup) {
 		iso_datapaths_setup = false;
-		k_sem_give(&tx_sem);
+		/* Only kickstart the uplink chain if PTT is already held at sync time. */
+		if (atomic_get(&ptt_active) != 0) {
+			k_sem_give(&tx_sem);
+		}
 	}
 }
 
@@ -648,6 +727,8 @@ int main(void)
 	} else {
 		(void)led_set_receiver_synced(false);
 	}
+
+	(void)ptt_init();
 
 	bis_channels_init();
 

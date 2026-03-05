@@ -8,12 +8,72 @@
 #include "io/audio.h"
 #include "io/led.h"
 #include <stdint.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
 #include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
+
+/* -------------------------------------------------------------------------- */
+/*                           PTT Button (BTN3 = sw2)                          */
+/* -------------------------------------------------------------------------- */
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#define PTT_AVAILABLE 1
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static struct gpio_callback ptt_cb_data;
+static atomic_t ptt_active = ATOMIC_INIT(0);
+
+static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+    int val = gpio_pin_get_dt(&ptt_btn);
+
+    atomic_set(&ptt_active, val > 0 ? 1 : 0);
+    printk("[PTT] %s\n", val > 0 ? "pressed" : "released");
+}
+#else
+#define PTT_AVAILABLE 0
+static atomic_t ptt_active = ATOMIC_INIT(1); /* always transmit if no button */
+#endif
+
+static int ptt_init(void)
+{
+#if PTT_AVAILABLE
+    int err;
+
+    if (!gpio_is_ready_dt(&ptt_btn)) {
+        printk("PTT button GPIO not ready\n");
+        return -ENODEV;
+    }
+    err = gpio_pin_configure_dt(&ptt_btn, GPIO_INPUT);
+    if (err) {
+        printk("PTT button configure failed: %d\n", err);
+        return err;
+    }
+    err = gpio_pin_interrupt_configure_dt(&ptt_btn, GPIO_INT_EDGE_BOTH);
+    if (err) {
+        printk("PTT interrupt configure failed: %d\n", err);
+        return err;
+    }
+    gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
+    gpio_add_callback(ptt_btn.port, &ptt_cb_data);
+
+    int val = gpio_pin_get_dt(&ptt_btn);
+    atomic_set(&ptt_active, val > 0 ? 1 : 0);
+    printk("PTT init: button is %s\n", val > 0 ? "pressed" : "released");
+    return 0;
+#else
+    printk("PTT: no sw2 alias, always transmitting mic\n");
+    return 0;
+#endif
+}
 
 /* BAP preset: 16 kHz, 10 ms frames, 40 octets/frame, reliability class 1. */
 static struct bt_bap_lc3_preset preset_active =
@@ -153,6 +213,11 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
         ret = k_msgq_get(&pcm_msgq, send_pcm_data, K_FOREVER);
         if (ret != 0) {
             continue;
+        }
+
+        /* PTT gate: broadcast silence when button is not held. */
+        if (atomic_get(&ptt_active) == 0) {
+            memset(send_pcm_data, 0, sizeof(send_pcm_data));
         }
 
         int16_t uplink_mono[PCM_SAMPLES_PER_FRAME];
@@ -672,6 +737,8 @@ int main(void)
     } else {
         (void)led_set_broadcast_running(false);
     }
+
+    (void)ptt_init();
 
     for (int i = 0; i < NUM_RX_BIS; i++) {
         k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i],
