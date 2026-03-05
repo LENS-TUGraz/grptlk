@@ -65,9 +65,10 @@ const uint32_t pdm_mic_enable_configure[][2] = {
 	/* Enable PDM mic as digital input */
 	{ CS47L63_INPUT1_CONTROL1, 0x50021 },
 
-	/* Un-mute and set gain to 0dB */
-	{ CS47L63_IN1L_CONTROL2, 0x800080 },
-	{ CS47L63_IN1R_CONTROL2, 0x800080 },
+	/* Un-mute and set gain to -16dB (0x60 = 0dB - 32 steps * 0.5dB/step)
+	 * Reduced from 0dB (0x80) to limit acoustic feedback from speaker. */
+	{ CS47L63_IN1L_CONTROL2, 0x800060 },
+	{ CS47L63_IN1R_CONTROL2, 0x800060 },
 
 	/* Volume Update */
 	{ CS47L63_INPUT_CONTROL3, 0x20000000 },
