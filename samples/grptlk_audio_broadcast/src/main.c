@@ -250,10 +250,10 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define NUM_PRIME_PACKETS 2
 
 /* Queues */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 3, 4);
-K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 3, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 5, 4);
+K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 5, 4);
 
 struct uplink_frame {
 	uint16_t len;
@@ -261,7 +261,7 @@ struct uplink_frame {
 	uint8_t _pad[2]; /* align struct size to 4-byte K_MSGQ boundary */
 };
 struct k_msgq uplink_rx_q[NUM_RX_BIS];
-char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][3 * sizeof(struct uplink_frame)];
+char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][5 * sizeof(struct uplink_frame)];
 
 /* Decoder wakeup: first arriving BIS packet each interval gives the semaphore
  * immediately (zero drift, locked to BT anchor). The watchdog timer fires only
@@ -909,7 +909,7 @@ int main(void)
 	(void)ptt_lock_init();
 
 	for (int i = 0; i < NUM_RX_BIS; i++) {
-		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 3);
+		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 5);
 	}
 
 	err = audio_init(&tx_msgq, audio_rx_mono_frame);

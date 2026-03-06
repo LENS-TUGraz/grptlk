@@ -289,21 +289,22 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define ENCODER_PRIORITY   5
 
 /* Mic PCM -> LC3 encoder */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
 
 /* LC3 decoded downlink -> audio backend playback queue */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 3, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 5, 4);
 
 struct lc3_frame {
 	uint16_t len;
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+	uint8_t _pad[2]; /* Pad to 44 bytes for K_MSGQ 4-byte boundary */
 };
 
 /* Downlink encoded frames from BIS1 */
-K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 3, 4);
+K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 5, 4);
 
 /* Uplink encoded frames (mic -> LC3 -> ISO TX) */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 3, 4);
+K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 5, 4);
 
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
