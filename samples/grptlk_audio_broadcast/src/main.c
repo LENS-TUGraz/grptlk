@@ -181,17 +181,18 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define NUM_PRIME_PACKETS 2
 
 /* Queues */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
-K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 4, 4);
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 4, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 3, 4);
+K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 3, 4);
 
 struct uplink_frame {
 	uint16_t len;
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+	uint8_t _pad[2]; /* Pad to 44 bytes to safely align with K_MSGQ 4-byte boundary */
 };
 struct k_msgq uplink_rx_q[NUM_RX_BIS];
-char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][8 * sizeof(struct uplink_frame)];
+char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][3 * sizeof(struct uplink_frame)];
 
 /* Decoder wakeup: first arriving BIS packet each interval gives the semaphore
  * immediately (zero drift, locked to BT anchor). The watchdog timer fires only
@@ -539,21 +540,15 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			mono_mix[i] = sample;
 		}
 		if (k_msgq_put(&uplink_mix_q, mono_mix, K_NO_WAIT) != 0) {
-			static uint32_t mix_overrun_cnt;
-			mix_overrun_cnt++;
-			if (mix_overrun_cnt == 1 || (mix_overrun_cnt % 100) == 0) {
-				printk("[dec] uplink_mix_q full — drop mix frame (cnt=%u)\n",
-				       mix_overrun_cnt);
-			}
+			int16_t dropped[PCM_SAMPLES_PER_FRAME];
+			(void)k_msgq_get(&uplink_mix_q, dropped, K_NO_WAIT);
+			(void)k_msgq_put(&uplink_mix_q, mono_mix, K_NO_WAIT);
 		}
 
 		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-			static uint32_t overrun_cnt;
-			overrun_cnt++;
-			if (overrun_cnt == 1 || (overrun_cnt % 100) == 0) {
-				printk("[dec] tx_msgq full — drop speaker frame (cnt=%u)\n",
-				       overrun_cnt);
-			}
+			uint32_t dropped[PCM_SAMPLES_PER_FRAME];
+			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
+			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
 		}
 	}
 }
@@ -640,7 +635,11 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	/* bis[0] is TX-only; uplink channels are bis[1..N] → uplink_rx_q[0..N-1] */
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		if (chan == bis[i + 1]) {
-			k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT);
+			if (k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT) != 0) {
+				struct uplink_frame dropped;
+				(void)k_msgq_get(&uplink_rx_q[i], &dropped, K_NO_WAIT);
+				(void)k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT);
+			}
 			break;
 		}
 	}
@@ -861,7 +860,7 @@ int main(void)
 	(void)ptt_init();
 
 	for (int i = 0; i < NUM_RX_BIS; i++) {
-		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 8);
+		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 3);
 	}
 
 	err = audio_init(&tx_msgq, audio_rx_mono_frame);

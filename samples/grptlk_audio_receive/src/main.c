@@ -206,16 +206,16 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,   \
 			 BT_GAP_SCAN_FAST_WINDOW)
 
-#define DECODER_STACK_SIZE 4096
+#define DECODER_STACK_SIZE 6144
 #define DECODER_PRIORITY   5
 #define ENCODER_STACK_SIZE 4096
 #define ENCODER_PRIORITY   5
 
 /* Mic PCM -> LC3 encoder */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 3, 4);
 
 /* LC3 decoded downlink -> audio backend playback queue */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 8, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 3, 4);
 
 struct lc3_frame {
 	uint16_t len;
@@ -223,10 +223,10 @@ struct lc3_frame {
 };
 
 /* Downlink encoded frames from BIS1 */
-K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 8, 4);
+K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 3, 4);
 
 /* Uplink encoded frames (mic -> LC3 -> ISO TX) */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 8, 4);
+K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 3, 4);
 
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
@@ -332,12 +332,10 @@ static struct bt_iso_big_sync_param big_sync_param = {
 
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
-	static uint32_t drop_cnt;
-
 	if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0) {
-		if ((drop_cnt++ % 200U) == 0U) {
-			printk("PCM queue full - dropping mic frame (cnt=%u)\n", drop_cnt);
-		}
+		int16_t dropped[PCM_SAMPLES_PER_FRAME];
+		(void)k_msgq_get(&pcm_msgq, dropped, K_NO_WAIT);
+		(void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
 	}
 }
 
@@ -346,7 +344,6 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	struct lc3_frame frame;
 	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
 	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * AUDIO_CHANNELS];
-	static uint32_t tx_q_drop_cnt;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -378,10 +375,9 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-			if ((tx_q_drop_cnt++ % 100U) == 0U) {
-				printk("Playback queue full - dropping decoded frame (cnt=%u)\n",
-				       tx_q_drop_cnt);
-			}
+			uint32_t dropped[PCM_SAMPLES_PER_FRAME];
+			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
+			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
 		}
 	}
 }
@@ -531,7 +527,11 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		frame.len = 0U;
 	}
 
-	(void)k_msgq_put(&lc3_rx_q, &frame, K_NO_WAIT);
+	if (k_msgq_put(&lc3_rx_q, &frame, K_NO_WAIT) != 0) {
+		struct lc3_frame dropped;
+		(void)k_msgq_get(&lc3_rx_q, &dropped, K_NO_WAIT);
+		(void)k_msgq_put(&lc3_rx_q, &frame, K_NO_WAIT);
+	}
 
 	/* Kickstart the uplink on first confirmed downlink reception.
 	 * This matches the iso_receive / grptlk_audio_receive pattern: the initial
