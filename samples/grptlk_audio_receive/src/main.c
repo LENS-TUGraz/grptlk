@@ -27,12 +27,7 @@
 #include "lc3.h"
 
 #define NUM_PRIME_PACKETS 2
-/* Defined early so ptt_isr_press can call k_sem_give(&tx_sem). */
 K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
-
-/* -------------------------------------------------------------------------- */
-/*                    Volume Buttons (sw0 = Vol Down, sw1 = Vol Up)           */
-/* -------------------------------------------------------------------------- */
 
 #define VOLUME_STEP_DB 3
 
@@ -59,7 +54,9 @@ static void vol_work_handler(struct k_work *work)
 
 static void vol_dn_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-	ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
 	printk("[VOL] down pressed\n");
 	atomic_add(&vol_pending_step, -VOLUME_STEP_DB);
 	k_work_submit(&vol_work);
@@ -67,7 +64,9 @@ static void vol_dn_isr(const struct device *dev, struct gpio_callback *cb, uint3
 
 static void vol_up_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-	ARG_UNUSED(dev); ARG_UNUSED(cb); ARG_UNUSED(pins);
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
 	printk("[VOL] up pressed\n");
 	atomic_add(&vol_pending_step, VOLUME_STEP_DB);
 	k_work_submit(&vol_work);
@@ -88,32 +87,35 @@ static int vol_buttons_init(void)
 		return -ENODEV;
 	}
 	err = gpio_pin_configure_dt(&vol_dn_btn, GPIO_INPUT);
-	if (err) { return err; }
+	if (err) {
+		return err;
+	}
 	err = gpio_pin_configure_dt(&vol_up_btn, GPIO_INPUT);
-	if (err) { return err; }
+	if (err) {
+		return err;
+	}
 
 	err = gpio_pin_interrupt_configure_dt(&vol_dn_btn, GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) { return err; }
+	if (err) {
+		return err;
+	}
 	err = gpio_pin_interrupt_configure_dt(&vol_up_btn, GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) { return err; }
+	if (err) {
+		return err;
+	}
 
 	gpio_init_callback(&vol_dn_cb_data, vol_dn_isr, BIT(vol_dn_btn.pin));
 	gpio_init_callback(&vol_up_cb_data, vol_up_isr, BIT(vol_up_btn.pin));
 	gpio_add_callback(vol_dn_btn.port, &vol_dn_cb_data);
 	gpio_add_callback(vol_up_btn.port, &vol_up_cb_data);
 
-	printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n",
-	       VOLUME_STEP_DB);
+	printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n", VOLUME_STEP_DB);
 	return 0;
 #else
 	printk("Volume buttons: sw0/sw1 not available on this board\n");
 	return 0;
 #endif
 }
-
-/* -------------------------------------------------------------------------- */
-/*                           PTT Button (BTN3 = sw2)                          */
-/* -------------------------------------------------------------------------- */
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
@@ -181,21 +183,16 @@ static int ptt_init(void)
 #endif
 }
 
-/* -------------------------------------------------------------------------- */
-/*                               Configuration                                */
-/* -------------------------------------------------------------------------- */
+static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
+	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
+	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
-static struct bt_bap_lc3_preset preset_active =
-	BT_BAP_LC3_BROADCAST_PRESET_16_2_1(BT_AUDIO_LOCATION_FRONT_LEFT |
-					       BT_AUDIO_LOCATION_FRONT_RIGHT,
-					       BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-
-#define SAMPLE_RATE_HZ              AUDIO_SAMPLE_RATE_HZ
-#define PCM_SAMPLES_PER_FRAME       AUDIO_SAMPLES_PER_FRAME
-#define BLOCK_BYTES                 AUDIO_BLOCK_BYTES
-#define TIMEOUT_SYNC_CREATE         K_SECONDS(10)
-#define PA_RETRY_COUNT              6
-#define BIS_ISO_CHAN_COUNT          5
+#define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
+#define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
+#define BLOCK_BYTES           AUDIO_BLOCK_BYTES
+#define TIMEOUT_SYNC_CREATE   K_SECONDS(10)
+#define PA_RETRY_COUNT        6
+#define BIS_ISO_CHAN_COUNT    5
 
 #if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > BIS_ISO_CHAN_COUNT)
 #error "CONFIG_GRPTLK_UPLINK_BIS must be in [2..BIS_ISO_CHAN_COUNT]"
@@ -205,19 +202,14 @@ static struct bt_bap_lc3_preset preset_active =
 #define CONFIG_BT_ISO_TX_MTU 40
 #endif
 
-#define BT_LE_SCAN_CUSTOM BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, \
-					   BT_LE_SCAN_OPT_NONE, \
-					   BT_GAP_SCAN_FAST_INTERVAL, \
-					   BT_GAP_SCAN_FAST_WINDOW)
+#define BT_LE_SCAN_CUSTOM                                                                          \
+	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,   \
+			 BT_GAP_SCAN_FAST_WINDOW)
 
-#define DECODER_STACK_SIZE          4096
-#define DECODER_PRIORITY            5
-#define ENCODER_STACK_SIZE          4096
-#define ENCODER_PRIORITY            5
-
-/* -------------------------------------------------------------------------- */
-/*                               Audio Objects                                */
-/* -------------------------------------------------------------------------- */
+#define DECODER_STACK_SIZE 4096
+#define DECODER_PRIORITY   5
+#define ENCODER_STACK_SIZE 4096
+#define ENCODER_PRIORITY   5
 
 /* Mic PCM -> LC3 encoder */
 K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 16, 4);
@@ -248,15 +240,11 @@ K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 static struct k_thread encoder_thread_data;
 
 /* ISO TX Thread Objects */
-#define TX_THREAD_STACK_SIZE        1024
-#define TX_THREAD_PRIORITY          5
+#define TX_THREAD_STACK_SIZE 1024
+#define TX_THREAD_PRIORITY   5
 
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 static struct k_thread tx_thread_data;
-
-/* -------------------------------------------------------------------------- */
-/*                               BT/ISO Objects                               */
-/* -------------------------------------------------------------------------- */
 
 /* Actual number of BISes in the discovered BIG, updated from biginfo_cb. */
 static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
@@ -288,11 +276,33 @@ static bool iso_datapaths_setup;
 /* Set once at least one uplink SDU was accepted for transmission. */
 static atomic_t uplink_tx_active;
 
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool,
-			  BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
+/* Timer to detect broadcaster disconnect (BIS1 inactivity) */
+static struct k_timer bis1_activity_timer;
+static struct k_work bis1_disconnect_work;
+static struct bt_iso_big *grptlk_big;
+
+static void bis1_disconnect_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	printk("BIS1 activity timeout! Terminating BIG sync.\n");
+	k_timer_stop(&bis1_activity_timer);
+
+	if (grptlk_big != NULL) {
+		int err = bt_iso_big_terminate(grptlk_big);
+		if (err != 0) {
+			printk("Failed to terminate BIG on timeout: %d\n", err);
+		}
+	}
+}
+
+static void bis1_activity_timeout_handler(struct k_timer *timer)
+{
+	k_work_submit(&bis1_disconnect_work);
+}
+
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT *NUM_PRIME_PACKETS,
 			  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
-			  CONFIG_BT_CONN_TX_USER_DATA_SIZE,
-			  NULL);
+			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
 static struct bt_iso_chan bis_iso_chan[BIS_ISO_CHAN_COUNT];
 static struct bt_iso_chan *bis[BIS_ISO_CHAN_COUNT];
@@ -320,10 +330,6 @@ static struct bt_iso_big_sync_param big_sync_param = {
 	.sync_timeout = 100, /* 10 ms units */
 };
 
-/* -------------------------------------------------------------------------- */
-/*                               Audio Helpers                                */
-/* -------------------------------------------------------------------------- */
-
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
 	static uint32_t drop_cnt;
@@ -334,10 +340,6 @@ static void audio_rx_mono_frame(const int16_t *mono_frame)
 		}
 	}
 }
-
-/* -------------------------------------------------------------------------- */
-/*                           LC3 Worker Threads                               */
-/* -------------------------------------------------------------------------- */
 
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
@@ -364,8 +366,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		 * the concealment audio and causes a click on every lost packet. */
 		const uint8_t *lc3_data = got_frame ? frame.data : NULL;
 		int lc3_len = got_frame ? (int)frame.len : 0;
-		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
-				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
+		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len, LC3_PCM_FORMAT_S16, mono_pcm, 1);
 		if (ret < 0) {
 			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
@@ -404,8 +405,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1,
-				 octets_per_frame, encoded_buf);
+		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1, octets_per_frame,
+				 encoded_buf);
 		if (ret < 0) {
 			continue;
 		}
@@ -416,18 +417,13 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			/* Keep newest frame for low-latency uplink behavior. */
 			(void)k_msgq_get(&lc3_tx_q, drop, K_NO_WAIT);
 			(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT);
-			if (atomic_get(&uplink_tx_active) != 0 &&
-			    (tx_drop_cnt++ % 100U) == 0U) {
+			if (atomic_get(&uplink_tx_active) != 0 && (tx_drop_cnt++ % 100U) == 0U) {
 				printk("Uplink encoded queue full - dropping oldest (cnt=%u)\n",
 				       tx_drop_cnt);
 			}
 		}
 	}
 }
-
-/* -------------------------------------------------------------------------- */
-/*                               ISO TX Thread                                */
-/* -------------------------------------------------------------------------- */
 
 static struct bt_iso_chan *iso_select_uplink_chan(void)
 {
@@ -467,10 +463,6 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	}
 }
 
-/* -------------------------------------------------------------------------- */
-/*                               ISO Callbacks                                */
-/* -------------------------------------------------------------------------- */
-
 static int uplink_send_next(struct bt_iso_chan *chan)
 {
 	struct net_buf *buf;
@@ -480,8 +472,7 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 	if (!buf) {
 		static uint32_t pool_err_cnt;
-		if (atomic_get(&uplink_tx_active) != 0 &&
-		    (pool_err_cnt++ % 50U) == 0U) {
+		if (atomic_get(&uplink_tx_active) != 0 && (pool_err_cnt++ % 50U) == 0U) {
 			printk("iso_sent: net_buf pool exhausted (cnt=%u)\n", pool_err_cnt);
 		}
 		return -ENOMEM;
@@ -489,10 +480,8 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 	if (k_msgq_get(&lc3_tx_q, enc_data, K_NO_WAIT) != 0) {
 		static uint32_t tx_underrun_cnt;
-		if (atomic_get(&uplink_tx_active) != 0 &&
-		    (tx_underrun_cnt++ % 100U) == 0U) {
-			printk("Uplink TX underrun - sending silence (cnt=%u)\n",
-			       tx_underrun_cnt);
+		if (atomic_get(&uplink_tx_active) != 0 && (tx_underrun_cnt++ % 100U) == 0U) {
+			printk("Uplink TX underrun - sending silence (cnt=%u)\n", tx_underrun_cnt);
 		}
 		memset(enc_data, 0, sizeof(enc_data));
 	}
@@ -521,8 +510,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 	}
 }
 
-static void iso_recv(struct bt_iso_chan *chan,
-		     const struct bt_iso_recv_info *info,
+static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 		     struct net_buf *buf)
 {
 	struct lc3_frame frame;
@@ -536,6 +524,8 @@ static void iso_recv(struct bt_iso_chan *chan,
 	    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
 		frame.len = buf->len;
 		memcpy(frame.data, buf->data, buf->len);
+		
+		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
 	} else {
 		/* Packet lost/invalid: decoder thread will run PLC. */
 		frame.len = 0U;
@@ -563,6 +553,10 @@ static void iso_connected(struct bt_iso_chan *chan)
 	printk("ISO Channel %p connected\n", chan);
 	atomic_inc(&big_chan_connected);
 	k_sem_give(&sem_big_sync);
+
+	if (chan == bis[0]) {
+		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
+	}
 }
 
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
@@ -572,8 +566,11 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 		atomic_set(&uplink_tx_active, 0);
 	}
 
-	if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB ||
-	    reason == BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
+	if (chan == bis[0]) {
+		k_timer_stop(&bis1_activity_timer);
+	}
+
+	if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB || reason == BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
 		/* Channel did not fully connect in current BIG sync attempt. */
 		k_sem_give(&sem_big_sync);
 	} else {
@@ -589,12 +586,7 @@ static struct bt_iso_chan_ops iso_ops = {
 	.recv = iso_recv,
 };
 
-/* -------------------------------------------------------------------------- */
-/*                               Scan/Sync CBs                                */
-/* -------------------------------------------------------------------------- */
-
-static void scan_recv(const struct bt_le_scan_recv_info *info,
-		      struct net_buf_simple *buf)
+static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf)
 {
 	ARG_UNUSED(buf);
 
@@ -611,8 +603,7 @@ static struct bt_le_scan_cb scan_callbacks = {
 	.recv = scan_recv,
 };
 
-static void sync_cb(struct bt_le_per_adv_sync *sync,
-		    struct bt_le_per_adv_sync_synced_info *info)
+static void sync_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_info *info)
 {
 	ARG_UNUSED(sync);
 	ARG_UNUSED(info);
@@ -633,8 +624,7 @@ static void term_cb(struct bt_le_per_adv_sync *sync,
 	k_sem_give(&sem_per_sync_lost);
 }
 
-static void biginfo_cb(struct bt_le_per_adv_sync *sync,
-		       const struct bt_iso_biginfo *biginfo)
+static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_biginfo *biginfo)
 {
 	ARG_UNUSED(sync);
 	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
@@ -682,10 +672,6 @@ static void wait_bis_channels_idle(k_timeout_t timeout)
 		(void)k_sem_take(&sem_big_sync_lost, K_MSEC(100));
 	}
 }
-
-/* -------------------------------------------------------------------------- */
-/*                               Setup Helpers                                */
-/* -------------------------------------------------------------------------- */
 
 static void bis_channels_init(void)
 {
@@ -762,44 +748,34 @@ static int lc3_workers_start(void)
 		return -EIO;
 	}
 
-	k_thread_create(&decoder_thread_data, decoder_stack,
-			K_THREAD_STACK_SIZEOF(decoder_stack), decoder_thread_func,
-			NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),
+			decoder_thread_func, NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&decoder_thread_data, "lc3_decoder");
 
-	k_thread_create(&encoder_thread_data, encoder_stack,
-			K_THREAD_STACK_SIZEOF(encoder_stack), encoder_thread_func,
-			NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),
+			encoder_thread_func, NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
 
-	k_thread_create(&tx_thread_data, tx_thread_stack,
-			K_THREAD_STACK_SIZEOF(tx_thread_stack), tx_thread,
-			NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&tx_thread_data, tx_thread_stack, K_THREAD_STACK_SIZEOF(tx_thread_stack),
+			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "iso_tx");
 
 	return 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/*                               Main Function                                */
-/* -------------------------------------------------------------------------- */
-
 int main(void)
 {
 	struct bt_le_per_adv_sync_param sync_create_param;
 	struct bt_le_per_adv_sync *sync;
-	struct bt_iso_big *big;
 	uint32_t sem_timeout_us;
 	int err;
 	int led_err;
 
 	printk("Starting GRPTLK Receiver\n");
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
-	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n",
-	       BIS_ISO_CHAN_COUNT);
+	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n", BIS_ISO_CHAN_COUNT);
 #else
-	printk("Config: downlink=BIS1, uplink=static BIS%u\n",
-	       CONFIG_GRPTLK_UPLINK_BIS);
+	printk("Config: downlink=BIS1, uplink=static BIS%u\n", CONFIG_GRPTLK_UPLINK_BIS);
 #endif
 
 	led_err = led_init();
@@ -810,6 +786,9 @@ int main(void)
 	}
 
 	(void)ptt_init();
+
+	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
+	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
 
 	bis_channels_init();
 
@@ -876,8 +855,8 @@ int main(void)
 		sync_create_param.options = 0;
 		sync_create_param.sid = per_sid;
 		sync_create_param.skip = 0;
-		sync_create_param.timeout = (per_interval_us * PA_RETRY_COUNT) /
-					   (10 * USEC_PER_MSEC);
+		sync_create_param.timeout =
+			(per_interval_us * PA_RETRY_COUNT) / (10 * USEC_PER_MSEC);
 		sem_timeout_us = per_interval_us * PA_RETRY_COUNT;
 
 		printk("Creating Periodic Advertising Sync...\n");
@@ -912,16 +891,17 @@ big_sync_create:
 		}
 
 		if (!bis_channels_idle()) {
-			printk("Previous BIG channels still allocated, waiting for new BIGInfo...\n");
+			printk("Previous BIG channels still allocated, waiting for new "
+			       "BIGInfo...\n");
 			goto per_sync_lost_check;
 		}
 
 		big_sync_param.num_bis = big_actual_num_bis;
 		big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
-		printk("Create BIG Sync (num_bis=%u, bitfield=0x%x)...\n",
-		       big_sync_param.num_bis, big_sync_param.bis_bitfield);
+		printk("Create BIG Sync (num_bis=%u, bitfield=0x%x)...\n", big_sync_param.num_bis,
+		       big_sync_param.bis_bitfield);
 		atomic_set(&big_chan_connected, 0);
-		err = bt_iso_big_sync(sync, &big_sync_param, &big);
+		err = bt_iso_big_sync(sync, &big_sync_param, &grptlk_big);
 		if (err) {
 			printk("bt_iso_big_sync failed: %d\n", err);
 			if (err == -EALREADY) {
@@ -941,10 +921,10 @@ big_sync_create:
 		}
 
 		if (err || (int)atomic_get(&big_chan_connected) < (int)big_actual_num_bis) {
-			printk("BIG sync failed (err %d, connected %d/%u)\n",
-			       err, (int)atomic_get(&big_chan_connected), big_actual_num_bis);
+			printk("BIG sync failed (err %d, connected %d/%u)\n", err,
+			       (int)atomic_get(&big_chan_connected), big_actual_num_bis);
 
-			err = bt_iso_big_terminate(big);
+			err = bt_iso_big_terminate(grptlk_big);
 			if ((err != 0) && (err != -EINVAL) && (err != -EIO)) {
 				printk("bt_iso_big_terminate failed: %d\n", err);
 				return err;
@@ -956,7 +936,7 @@ big_sync_create:
 		printk("BIG sync established.\n");
 		err = setup_iso_datapaths();
 		if (err) {
-			int term_err = bt_iso_big_terminate(big);
+			int term_err = bt_iso_big_terminate(grptlk_big);
 
 			if ((term_err != 0) && (term_err != -EINVAL) && (term_err != -EIO)) {
 				printk("bt_iso_big_terminate failed: %d\n", term_err);
