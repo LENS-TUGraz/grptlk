@@ -18,9 +18,6 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
-/* -------------------------------------------------------------------------- */
-/*                    Volume Buttons (sw0 = Vol Down, sw1 = Vol Up)           */
-/* -------------------------------------------------------------------------- */
 
 #define VOLUME_STEP_DB 3
 
@@ -110,10 +107,7 @@ static int vol_buttons_init(void)
 #endif
 }
 
-/* -------------------------------------------------------------------------- */
-/*                           PTT Button (BTN3 = sw2)                          */
-/* -------------------------------------------------------------------------- */
-
+/* PTT button (BTN3 = sw2): PTT starts inactive at boot. */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
 static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
@@ -132,7 +126,7 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 }
 #else
 #define PTT_AVAILABLE 0
-static atomic_t ptt_active = ATOMIC_INIT(1); /* always transmit if no button */
+static atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
 static int ptt_init(void)
@@ -157,12 +151,87 @@ static int ptt_init(void)
 	gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
 	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
 
-	int val = gpio_pin_get_dt(&ptt_btn);
-	atomic_set(&ptt_active, val > 0 ? 1 : 0);
-	printk("PTT init: button is %s\n", val > 0 ? "pressed" : "released");
+	atomic_set(&ptt_active, 0);
+	printk("PTT init: button ready, mic TX disabled at boot\n");
 	return 0;
 #else
 	printk("PTT: no sw2 alias, always transmitting mic\n");
+	return 0;
+#endif
+}
+
+/* PTT lock toggle: BTN4 (sw3) cycles between PTT mode and always-TX mode.
+ * When lock is active, LED1 (led0/rgb1_red) is lit and mic always transmits. */
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
+#define PTT_LOCK_AVAILABLE 1
+static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
+static const struct gpio_dt_spec ptt_lock_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static struct gpio_callback ptt_lock_cb_data;
+static atomic_t ptt_lock_active = ATOMIC_INIT(0);
+static struct k_work ptt_lock_toggle_work;
+
+static void ptt_lock_toggle_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (atomic_get(&ptt_lock_active)) {
+		atomic_set(&ptt_lock_active, 0);
+		gpio_pin_set_dt(&ptt_lock_led, 0);
+		atomic_set(&ptt_active, 0);
+		printk("[PTT-LOCK] disabled — PTT mode active\n");
+	} else {
+		atomic_set(&ptt_lock_active, 1);
+		gpio_pin_set_dt(&ptt_lock_led, 1);
+		atomic_set(&ptt_active, 1);
+		printk("[PTT-LOCK] enabled — always transmitting\n");
+	}
+}
+
+static void ptt_lock_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
+		k_work_submit(&ptt_lock_toggle_work);
+	}
+}
+#else
+#define PTT_LOCK_AVAILABLE 0
+#endif
+
+static int ptt_lock_init(void)
+{
+#if PTT_LOCK_AVAILABLE
+	int err;
+
+	k_work_init(&ptt_lock_toggle_work, ptt_lock_toggle_work_handler);
+
+	if (!gpio_is_ready_dt(&ptt_lock_btn) || !gpio_is_ready_dt(&ptt_lock_led)) {
+		printk("PTT-lock button/LED GPIO not ready\n");
+		return -ENODEV;
+	}
+	err = gpio_pin_configure_dt(&ptt_lock_btn, GPIO_INPUT);
+	if (err) {
+		printk("PTT-lock button configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_configure_dt(&ptt_lock_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		printk("PTT-lock LED configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_interrupt_configure_dt(&ptt_lock_btn, GPIO_INT_EDGE_BOTH);
+	if (err) {
+		printk("PTT-lock interrupt configure failed: %d\n", err);
+		return err;
+	}
+	gpio_init_callback(&ptt_lock_cb_data, ptt_lock_isr, BIT(ptt_lock_btn.pin));
+	gpio_add_callback(ptt_lock_btn.port, &ptt_lock_cb_data);
+
+	printk("PTT-lock init: BTN4=toggle, LED1=status indicator\n");
+	return 0;
+#else
+	printk("PTT-lock: sw3/led0 not available on this board\n");
 	return 0;
 #endif
 }
@@ -189,7 +258,7 @@ K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 3, 4);
 struct uplink_frame {
 	uint16_t len;
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
-	uint8_t _pad[2]; /* Pad to 44 bytes to safely align with K_MSGQ 4-byte boundary */
+	uint8_t _pad[2]; /* align struct size to 4-byte K_MSGQ boundary */
 };
 struct k_msgq uplink_rx_q[NUM_RX_BIS];
 char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][3 * sizeof(struct uplink_frame)];
@@ -199,12 +268,11 @@ char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][3 * sizeof(struct uplink_frame)
  * if the entire interval is lost — ensuring the decoder still runs PLC. */
 K_SEM_DEFINE(uplink_rx_sem, 0, 1);
 static struct k_timer uplink_watchdog_timer;
-/* 0 = decoder is idle / ready for next interval, 1 = already woken this interval */
 static atomic_t uplink_interval_fired = ATOMIC_INIT(0);
 
 static void uplink_watchdog_expiry(struct k_timer *timer)
 {
-	/* Only fires when no iso_recv arrived this interval — force a PLC pass. */
+	ARG_UNUSED(timer);
 	atomic_set(&uplink_interval_fired, 0);
 	k_sem_give(&uplink_rx_sem);
 }
@@ -276,9 +344,6 @@ static void audio_rx_mono_frame(const int16_t *mono_frame)
 		(void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
 	}
 
-	/* Clock the uplink decoder from the I2S DMA interrupt — same hardware
-	 * clock that drives the DAC — so tx_msgq never accumulates.
-	 * The watchdog timer remains as fallback if I2S is not running. */
 	if (atomic_cas(&uplink_interval_fired, 0, 1)) {
 		k_sem_give(&uplink_rx_sem);
 	}
@@ -311,7 +376,6 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			memcpy(last_uplink_mono, uplink_mono, sizeof(last_uplink_mono));
 			has_uplink = true;
 		}
-		/* Mix the last known uplink frame (or silence on first startup). */
 		if (has_uplink) {
 			for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
 				int32_t s =
@@ -401,28 +465,15 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				dbg_plc_streak[i]++;
 			}
 
-			/* Always run the LC3 decoder to keep its internal state advancing.
-			 * On a missing frame pass NULL (PLC mode) but discard the output —
-			 * this prevents phase discontinuities that cause bursts of crackling
-			 * every time a BT packet is dropped. */
 			const uint8_t *lc3_data = got_frame ? frame.data : NULL;
 			int lc3_len = got_frame ? (int)frame.len : 0;
 			int ret = lc3_decode(lc3_decoders[i], lc3_data, lc3_len, LC3_PCM_FORMAT_S16,
 					     stream_pcm, 1);
 
 			if (ret < 0) {
-				/* ret==1 means PLC operated (normal), ret<0 means bad params. */
 				dbg_dec_err[i]++;
 			}
 
-			/* Mix real frames (ret==0) and PLC frames (ret==1) for active
-			 * senders — PLC smooths over occasional dropped BT packets.
-			 * Never mix PLC output from idle BISes (bis_ever_rx[i]==false):
-			 * their decoder produces noise from an uninitialised state.
-			 *
-			 * LC3 PLC can over-synthesise from a high-energy preceding frame,
-			 * producing a spike 5-7x the normal amplitude — audible as a crack.
-			 * Attenuate PLC output by 50% (shift right by 1) to suppress this. */
 			if (ret >= 0 && bis_ever_rx[i]) {
 				int16_t peak = 0;
 				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
@@ -497,8 +548,7 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		uint32_t total_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0_total);
 		if (total_us > 8000U) {
-			printk("[dec] LATE frame=%u total=%u us — overran 10ms interval!\n",
-			       dec_frame_cnt, total_us);
+			printk("[dec] LATE frame=%u total=%u us\n", dec_frame_cnt, total_us);
 		}
 		if ((dec_frame_cnt++ % 100U) == 0U) {
 			printk("[dec] frame=%u total=%u us active=%d mixed_peak=%d tx_q=%u "
@@ -652,7 +702,6 @@ static struct bt_iso_chan_ops iso_ops = {
 	.recv = iso_recv,
 };
 
-/* -------------------------------------------------------------------------- */
 
 static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 {
@@ -712,7 +761,6 @@ static int setup_extended_adv(struct bt_le_ext_adv **adv)
 	};
 
 	err = bt_le_ext_adv_set_data(*adv, ext_ad, 2, NULL, 0);
-	// err = bt_le_ext_adv_set_data(*adv, ad, ARRAY_SIZE(ad), NULL, 0);
 	if (err) {
 		printk("Failed to set advertising data (err %d)\n", err);
 		return err;
@@ -858,6 +906,7 @@ int main(void)
 	}
 
 	(void)ptt_init();
+	(void)ptt_lock_init();
 
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 3);

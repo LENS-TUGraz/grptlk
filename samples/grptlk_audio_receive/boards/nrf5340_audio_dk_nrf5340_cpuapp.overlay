@@ -7,3 +7,11 @@
 &i2s0 {
 	clock-source = "ACLK";
 };
+
+/* Expose BTN4 (sw3) for PTT-lock toggle and LED1 (led0) for status indication. */
+/ {
+	aliases {
+		sw3 = &button4;
+		led0 = &rgb1_red;
+	};
+};
