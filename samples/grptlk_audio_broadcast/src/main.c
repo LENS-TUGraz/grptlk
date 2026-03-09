@@ -21,6 +21,7 @@
 
 #define VOLUME_STEP_DB 3
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -235,9 +236,10 @@ static int ptt_lock_init(void)
 	return 0;
 #endif
 }
+#endif /* CONFIG_GRPTLK_RELAY_ONLY */
 
 /* BAP preset: 16 kHz, 10 ms frames, 40 octets/frame, reliability class 1. */
-static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
+static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
@@ -250,11 +252,14 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define NUM_PRIME_PACKETS 2
 
 /* Queues */
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 5, 4);
 K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
+#endif
 K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 5, 4);
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 struct uplink_frame {
 	uint16_t len;
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
@@ -283,10 +288,11 @@ static lc3_encoder_mem_16k_t lc3_encoder_mem;
 static lc3_decoder_t lc3_decoders[NUM_RX_BIS];
 static lc3_decoder_mem_16k_t lc3_decoder_mems[NUM_RX_BIS];
 static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
+#endif
 
 /* BAP */
-static struct bt_bap_broadcast_source *broadcast_source;
-static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+static struct bt_bap_broadcast_source *broadcast_source __maybe_unused;
+static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
 
 /* ISO */
 NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT *NUM_PRIME_PACKETS,
@@ -297,45 +303,53 @@ static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
 static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
 static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
-static struct bt_iso_chan bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
-static uint16_t seq_num;
+static struct bt_iso_chan bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
+static uint16_t seq_num __maybe_unused;
 /* Set to true when a real uplink frame is received on bis[i+1].
  * Cleared on disconnect so PLC from a gone sender is not mixed in. */
-static bool bis_ever_rx[NUM_RX_BIS];
+static bool bis_ever_rx[NUM_RX_BIS] __maybe_unused;
 
-static struct bt_iso_big_create_param big_create_param = {
+static struct bt_iso_big_create_param big_create_param __maybe_unused = {
 	.num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
 	.bis_channels = bis,
 	.packing = BT_ISO_PACKING_SEQUENTIAL,
 	.framing = BT_ISO_FRAMING_UNFRAMED,
 };
 
-static struct bt_iso_chan_io_qos iso_rx_qos;
-static struct bt_iso_chan_io_qos iso_tx_qos = {
+static struct bt_iso_chan_io_qos iso_rx_qos __maybe_unused;
+static struct bt_iso_chan_io_qos iso_tx_qos __maybe_unused = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
 	.phy = BT_GAP_LE_PHY_2M,
 };
-static struct bt_iso_chan_qos bis_iso_qos = {
+static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 	.tx = &iso_tx_qos,
 	.rx = &iso_rx_qos,
 };
 
 /* Threads */
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 #define ENCODER_STACK_SIZE   4096
 #define ENCODER_PRIORITY     5
 #define DECODER_PRIORITY     5
+#endif
 #define TX_THREAD_STACK_SIZE 1024
 #define TX_THREAD_PRIORITY   5
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 K_THREAD_STACK_DEFINE(uplink_dec_stack, 6144);
+#endif
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
-static struct k_thread encoder_thread_data;
-static struct k_thread uplink_dec_thread_data;
-static struct k_thread tx_thread_data;
+
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+static struct k_thread encoder_thread_data __maybe_unused;
+static struct k_thread uplink_dec_thread_data __maybe_unused;
+#endif
+static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
 	if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0) {
@@ -602,6 +616,7 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 	}
 }
+#endif
 
 static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -656,7 +671,9 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		if (chan == bis[i + 1]) {
 			bis_ever_rx[i] = false;
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 			k_msgq_purge(&uplink_rx_q[i]);
+#endif
 			break;
 		}
 	}
@@ -672,6 +689,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 		     struct net_buf *buf)
 {
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	struct uplink_frame frame;
 
 	if (buf && buf->len > 0 && buf->len <= CONFIG_BT_ISO_TX_MTU &&
@@ -681,15 +699,29 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	} else {
 		frame.len = 0;
 	}
+#endif
 
 	/* bis[0] is TX-only; uplink channels are bis[1..N] → uplink_rx_q[0..N-1] */
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		if (chan == bis[i + 1]) {
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 			if (k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT) != 0) {
 				struct uplink_frame dropped;
 				(void)k_msgq_get(&uplink_rx_q[i], &dropped, K_NO_WAIT);
 				(void)k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT);
 			}
+#else
+			if (i == 0 && buf && buf->len > 0 && buf->len <= CONFIG_BT_ISO_TX_MTU &&
+			    (info->flags & BT_ISO_FLAGS_VALID)) {
+				uint8_t relay_buf[CONFIG_BT_ISO_TX_MTU] = {0};
+				memcpy(relay_buf, buf->data, buf->len);
+				if (k_msgq_put(&lc3_encoded_q, relay_buf, K_NO_WAIT) != 0) {
+					uint8_t dropped[CONFIG_BT_ISO_TX_MTU];
+					(void)k_msgq_get(&lc3_encoded_q, dropped, K_NO_WAIT);
+					(void)k_msgq_put(&lc3_encoded_q, relay_buf, K_NO_WAIT);
+				}
+			}
+#endif
 			break;
 		}
 	}
@@ -905,9 +937,12 @@ int main(void)
 		(void)led_set_broadcast_running(false);
 	}
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	(void)ptt_init();
 	(void)ptt_lock_init();
+#endif
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 5);
 	}
@@ -950,6 +985,7 @@ int main(void)
 			K_THREAD_STACK_SIZEOF(uplink_dec_stack), uplink_decoder_thread_func, NULL,
 			NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&uplink_dec_thread_data, "uplink_dec");
+#endif
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -993,8 +1029,10 @@ int main(void)
 			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "iso_tx");
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	k_timer_init(&uplink_watchdog_timer, uplink_watchdog_expiry, NULL);
 	k_timer_start(&uplink_watchdog_timer, K_USEC(preset_active.qos.interval), K_NO_WAIT);
+#endif
 
 	prime_and_start_iso_transmission();
 	led_err = led_set_broadcast_running(true);
