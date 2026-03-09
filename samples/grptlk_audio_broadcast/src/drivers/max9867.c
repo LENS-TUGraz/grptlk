@@ -8,7 +8,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(MAX9867, CONFIG_MAX9867_LOG_LEVEL);
 
-static const struct device *i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c20));
+#if DT_NODE_HAS_STATUS(DT_ALIAS(max9867_i2c), okay)
+static const struct device *i2c_dev = DEVICE_DT_GET(DT_ALIAS(max9867_i2c));
+#elif DT_HAS_COMPAT_STATUS_OKAY(maxim_max9867)
+static const struct device *i2c_dev = DEVICE_DT_GET(DT_PARENT(DT_COMPAT_GET_ANY_STATUS_OKAY(maxim_max9867)));
+#else
+#error "MAX9867 audio backend enabled but no compatible i2c device found in devicetree"
+#endif
 
 static int reg_read(uint8_t reg, uint8_t *val)
 {
