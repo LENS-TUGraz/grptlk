@@ -19,11 +19,11 @@ endchoice
 
 config GRPTLK_RELAY_ONLY
 	bool "Audio Broadcast Relay Mode"
-	default y if BT_BAP_BROADCAST_SRC_STREAM_COUNT = 2
-	depends on BT_BAP_BROADCAST_SRC_STREAM_COUNT = 2
+	default n
 	help
 	  When enabled, audio decoding, mixing, and the local microphone are disabled.
 	  Incoming LC3 audio from the first RX BIS is relayed directly to the TX BIS.
+	  Enable this in the board conf for relay-only platforms (e.g. nrf5340dk).
 
 choice GRPTLK_AUDIO_BACKEND
 	bool "Audio Backend"
