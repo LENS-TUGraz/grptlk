@@ -271,7 +271,7 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		.word_size = 16,
 		.channels = CHANNELS,
 		.format = I2S_FMT_DATA_FORMAT_I2S,
-		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+		.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER,
 		.frame_clk_freq = AUDIO_SAMPLE_RATE_HZ,
 		.mem_slab = &rx_slab,
 		.block_size = BLOCK_BYTES,
@@ -288,7 +288,7 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		.word_size = 16,
 		.channels = CHANNELS,
 		.format = I2S_FMT_DATA_FORMAT_I2S,
-		.options = I2S_OPT_BIT_CLK_SLAVE | I2S_OPT_FRAME_CLK_SLAVE,
+		.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER,
 		.frame_clk_freq = AUDIO_SAMPLE_RATE_HZ,
 		.mem_slab = &tx_slab,
 		.block_size = BLOCK_BYTES,
@@ -350,4 +350,26 @@ int audio_start(void)
 
 	started = true;
 	return 0;
+}
+
+static int32_t current_vol_q15 = 13668; /* Start at MAX_VOL_Q15 */
+
+int audio_volume_adjust(int8_t step_db)
+{
+	/* MAX_VOL_Q15 is 13668. A 3dB step corresponds to roughly 1/15th of the range, so let's step by 911 */
+	current_vol_q15 += (step_db * 911 / 3); 
+	if (current_vol_q15 > 13668) {
+		current_vol_q15 = 13668;
+	} else if (current_vol_q15 < 0) {
+		current_vol_q15 = 0;
+	}
+
+#if !AUDIO_HAS_VOLUME_CTRL
+	/* If ADC isn't actively overwriting the volume, set it directly */
+	return max9867_set_volume((int16_t)current_vol_q15, (int16_t)13668);
+#else
+	/* If ADC is enabled, this function will simply fight with the volume_thread_fn overriding the register.
+	 * We'll still return 0. The buttons might still do something if mapped, but ADC has the final say. */
+	return 0;
+#endif
 }

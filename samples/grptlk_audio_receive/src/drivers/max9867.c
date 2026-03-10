@@ -51,21 +51,21 @@ int max9867_init()
 	}
 	LOG_DBG("Master clock set between 20 and 40 MHz and Normal Mode!");
 
-	err = reg_write(MAX9867_REG_STEREO_CLK_HI, 0x20);
+	err = reg_write(MAX9867_REG_STEREO_CLK_HI, 0x80);
 	if (err) {
-		LOG_ERR("Failed to disable the codec PLL!");
+		LOG_ERR("Failed to enable the codec PLL!");
 		return -EFAULT;
 	}
 	err = reg_write(MAX9867_REG_STEREO_CLK_LOW, 0x00);
 	if (err) {
-		LOG_ERR("Failed to disable the rapid lock mode!");
+		LOG_ERR("Failed to configure stereo clock low!");
 		return -EFAULT;
 	}
-	LOG_DBG("Disabled the codec PLL and set NI divider bits to a 16kHz LRCLK!");
+	LOG_DBG("Enabled the codec PLL to lock to external LRCLK!");
 
-	err = reg_write(MAX9867_REG_IF_MODE_ONE, 0x90);
+	err = reg_write(MAX9867_REG_IF_MODE_ONE, 0x10);
 	if (err) {
-		LOG_ERR("Failed to set audio interface register one!");
+		LOG_ERR("Failed to set audio interface register one (Slave Mode)!");
 		return -EFAULT;
 	}
 	err = reg_write(MAX9867_REG_IF_MODE_TWO, 0x01);
@@ -73,7 +73,7 @@ int max9867_init()
 		LOG_ERR("Failed to set audio interface register two (MONO OUT ONLY)!");
 		return -EFAULT;
 	}
-	LOG_DBG("Set master mode and BCLK to 64x LRCLK");
+	LOG_DBG("Set Slave mode (MAS=0) and default I2S timings");
 
 	err = reg_write(MAX9867_REG_SIDETONE, 0x80);
 	if (err) {
