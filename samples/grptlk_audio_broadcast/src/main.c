@@ -238,10 +238,19 @@ static int ptt_lock_init(void)
 }
 #endif /* CONFIG_GRPTLK_RELAY_ONLY */
 
-/* BAP preset: 16 kHz, 10 ms frames, 40 octets/frame, reliability class 1. */
+/* BAP preset base: kept as-is per project requirement.
+ * Runtime QoS fields are overridden below for LC3Plus 5 ms operation. */
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2 */
+static void override_preset_for_lc3plus_5ms(void)
+{
+	preset_active.qos.interval = 5000U;
+	preset_active.qos.sdu      = 20U;
+	preset_active.qos.latency  = 8U;
+	preset_active.qos.rtn      = 2U;
+}
 
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
@@ -253,11 +262,11 @@ static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADC
 
 /* Queues */
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 5, 4);
-K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
+K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 4);
 #endif
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 5, 4);
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
 
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 struct uplink_frame {
@@ -266,7 +275,7 @@ struct uplink_frame {
 	uint8_t _pad[2]; /* align struct size to 4-byte K_MSGQ boundary */
 };
 struct k_msgq uplink_rx_q[NUM_RX_BIS];
-char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][5 * sizeof(struct uplink_frame)];
+char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][2 * sizeof(struct uplink_frame)];
 
 /* Decoder wakeup: first arriving BIS packet each interval gives the semaphore
  * immediately (zero drift, locked to BT anchor). The watchdog timer fires only
@@ -329,11 +338,11 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 /* Threads */
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 #define ENCODER_STACK_SIZE   4096
-#define ENCODER_PRIORITY     5
-#define DECODER_PRIORITY     5
+#define ENCODER_PRIORITY     2
+#define DECODER_PRIORITY     3
 #endif
 #define TX_THREAD_STACK_SIZE 1024
-#define TX_THREAD_PRIORITY   5
+#define TX_THREAD_PRIORITY   2
 
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
@@ -919,6 +928,8 @@ int main(void)
 	int err;
 	int led_err;
 
+	override_preset_for_lc3plus_5ms();
+
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 	int clk_ret = nrfx_clock_divider_set(NRF_CLOCK_DOMAIN_HFCLK, NRF_CLOCK_HFCLK_DIV_1);
 	clk_ret -= NRFX_ERROR_BASE_NUM;
@@ -944,7 +955,7 @@ int main(void)
 
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 	for (int i = 0; i < NUM_RX_BIS; i++) {
-		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 5);
+		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 2);
 	}
 
 	err = audio_init(&tx_msgq, audio_rx_mono_frame);

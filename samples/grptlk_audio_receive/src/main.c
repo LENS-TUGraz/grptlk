@@ -260,9 +260,18 @@ static int ptt_lock_init(void)
 #endif
 }
 
+/* BAP preset base: kept as-is per project requirement.
+ * Runtime QoS fields are overridden below for LC3Plus 5 ms operation. */
 static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2 */
+static void override_preset_for_lc3plus_5ms(void)
+{
+	preset_active.qos.interval = 5000U;
+	preset_active.qos.sdu      = 20U;
+	preset_active.qos.rtn      = 2U;
+}
 
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
@@ -284,15 +293,15 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 			 BT_GAP_SCAN_FAST_WINDOW)
 
 #define DECODER_STACK_SIZE 6144
-#define DECODER_PRIORITY   5
+#define DECODER_PRIORITY   3
 #define ENCODER_STACK_SIZE 4096
-#define ENCODER_PRIORITY   5
+#define ENCODER_PRIORITY   2
 
 /* Mic PCM -> LC3 encoder */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 5, 4);
+K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 4);
 
 /* LC3 decoded downlink -> audio backend playback queue */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 5, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
 
 struct lc3_frame {
 	uint16_t len;
@@ -301,10 +310,10 @@ struct lc3_frame {
 };
 
 /* Downlink encoded frames from BIS1 */
-K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 5, 4);
+K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 2, 4);
 
 /* Uplink encoded frames (mic -> LC3 -> ISO TX) */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 5, 4);
+K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
 
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
@@ -319,7 +328,7 @@ static struct k_thread encoder_thread_data;
 
 /* ISO TX Thread Objects */
 #define TX_THREAD_STACK_SIZE 1024
-#define TX_THREAD_PRIORITY   5
+#define TX_THREAD_PRIORITY   2
 
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 static struct k_thread tx_thread_data;
@@ -430,7 +439,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		ret = k_msgq_get(&lc3_rx_q, &frame, K_MSEC(12));
+		ret = k_msgq_get(&lc3_rx_q, &frame, K_MSEC(6));
 
 		bool got_frame = (ret == 0 && frame.len > 0U);
 
@@ -848,6 +857,8 @@ int main(void)
 	uint32_t sem_timeout_us;
 	int err;
 	int led_err;
+
+	override_preset_for_lc3plus_5ms();
 
 	printk("Starting GRPTLK Receiver\n");
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM)

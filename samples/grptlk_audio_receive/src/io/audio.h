@@ -5,7 +5,7 @@
 #include <zephyr/kernel.h>
 
 #define AUDIO_SAMPLE_RATE_HZ 16000
-#define AUDIO_FRAME_DURATION_MS 10
+#define AUDIO_FRAME_DURATION_MS 5
 #define AUDIO_CHANNELS 2
 #define AUDIO_BITS_PER_SAMPLE 16
 #define AUDIO_SAMPLES_PER_FRAME \

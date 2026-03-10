@@ -19,7 +19,7 @@
 #define RX_BLOCK_COUNT 16
 #define TX_BLOCK_COUNT 8
 
-BUILD_ASSERT(BLOCK_BYTES == 640, "max9867 backend expects 10 ms stereo 16-bit blocks");
+BUILD_ASSERT(BLOCK_BYTES == 320, "max9867 backend expects 5 ms stereo 16-bit blocks");
 
 #if DT_NODE_EXISTS(DT_PATH(zephyr_user)) && \
 	DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels) && \
@@ -80,14 +80,13 @@ static void tx_thread_fn(void *p1, void *p2, void *p3)
 		uint32_t free_slabs = k_mem_slab_num_free_get(&tx_slab);
 		uint32_t in_i2s = TX_BLOCK_COUNT - free_slabs;
 
-		if (in_i2s < 2) {
-			if (playback_q == NULL ||
-			    k_msgq_get(playback_q, in, K_NO_WAIT) != 0) {
+		if (playback_q == NULL ||
+		    k_msgq_get(playback_q, in, K_NO_WAIT) != 0) {
+			if (in_i2s < 2) {
+				/* DMA underrun imminent — pad with silence. */
 				memset(in, 0, BLOCK_BYTES);
-			}
-		} else {
-			if (playback_q == NULL ||
-			    k_msgq_get(playback_q, in, K_MSEC(5)) != 0) {
+			} else {
+				/* I2S well-fed, no new data yet — skip. */
 				continue;
 			}
 		}
@@ -301,7 +300,7 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		return err;
 	}
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < 1; i++) {
 		void *txblk;
 		if (k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER) == 0) {
 			memset(txblk, 0, BLOCK_BYTES);
@@ -329,7 +328,7 @@ int audio_start(void)
 	}
 
 	k_thread_create(&tx_thread_data, tx_stack, K_THREAD_STACK_SIZEOF(tx_stack),
-			tx_thread_fn, NULL, NULL, NULL, 6, 0, K_NO_WAIT);
+			tx_thread_fn, NULL, NULL, NULL, 4, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "audio_tx");
 
 	err = i2s_trigger(i2s_dev, I2S_DIR_BOTH, I2S_TRIGGER_START);

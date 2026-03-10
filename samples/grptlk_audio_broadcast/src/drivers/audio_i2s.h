@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define AUDIO_I2S_SAMPLE_RATE_HZ      16000U
-#define AUDIO_I2S_FRAME_DURATION_MS   10U
+#define AUDIO_I2S_FRAME_DURATION_MS   5U
 #define AUDIO_I2S_CHANNELS            2U
 #define AUDIO_I2S_BITS_PER_SAMPLE     16U
 #define AUDIO_I2S_SAMPLES_PER_BLOCK \
