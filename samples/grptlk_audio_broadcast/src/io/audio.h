@@ -13,9 +13,9 @@
 #define AUDIO_BLOCK_BYTES \
 	(AUDIO_SAMPLES_PER_FRAME * AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8))
 
-typedef void (*audio_rx_cb_t)(const int16_t *mono_frame);
+#include "audio_drift.h"
 
-int audio_init(struct k_msgq *playback_q, audio_rx_cb_t rx_cb);
+int audio_init(struct audio_drift_ctx *playback_drift, struct audio_drift_ctx *capture_drift);
 int audio_start(void);
 
 /* Adjust output volume by step_db dB (+3 = up, -3 = down).

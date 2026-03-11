@@ -42,7 +42,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_broadcast)
 
 target_include_directories(app PRIVATE src src/io src/drivers)
-target_sources(app PRIVATE src/io/led.c)
+target_sources(app PRIVATE src/io/led.c src/audio_drift.c)
 
 if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
   if(NOT CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)

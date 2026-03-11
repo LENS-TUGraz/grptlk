@@ -34,8 +34,8 @@ static const struct device *i2s_dev;
 K_MEM_SLAB_DEFINE_STATIC(rx_slab, BLOCK_BYTES, RX_BLOCK_COUNT, 4);
 K_MEM_SLAB_DEFINE_STATIC(tx_slab, BLOCK_BYTES, TX_BLOCK_COUNT, 4);
 
-static struct k_msgq *playback_q;
-static audio_rx_cb_t rx_cb;
+static struct audio_drift_ctx *playback_drift;
+static struct audio_drift_ctx *capture_drift;
 static bool initialized;
 static bool started;
 
@@ -77,26 +77,17 @@ static void tx_thread_fn(void *p1, void *p2, void *p3)
 	printk("audio tx thread running\n");
 
 	while (1) {
-		uint32_t free_slabs = k_mem_slab_num_free_get(&tx_slab);
-		uint32_t in_i2s = TX_BLOCK_COUNT - free_slabs;
-
-		if (playback_q == NULL ||
-		    k_msgq_get(playback_q, in, K_NO_WAIT) != 0) {
-			if (in_i2s < 2) {
-				/* DMA underrun imminent — pad with silence. */
-				memset(in, 0, BLOCK_BYTES);
-			} else {
-				/* I2S well-fed, no new data yet — skip. */
-				continue;
-			}
-		}
-
 		void *txblk;
 		err = k_mem_slab_alloc(&tx_slab, &txblk, K_FOREVER);
 		if (err) {
 			continue;
 		}
-		memcpy(txblk, in, BLOCK_BYTES);
+
+		if (playback_drift != NULL) {
+			audio_drift_read(playback_drift, txblk, 1);
+		} else {
+			memset(txblk, 0, BLOCK_BYTES);
+		}
 
 		while ((ret = i2s_write(i2s_dev, txblk, BLOCK_BYTES)) == -EAGAIN) {
 			k_msleep(1);
@@ -141,12 +132,14 @@ static void rx_thread_fn(void *p1, void *p2, void *p3)
 		err = i2s_buf_read(i2s_dev, stereo_buf, &got);
 		if (err == 0 && got == BLOCK_BYTES) {
 			downmix_stereo_block_to_mono((const int16_t *)stereo_buf, mono_frame);
-			if (rx_cb != NULL) {
-				rx_cb(mono_frame);
+			if (capture_drift != NULL) {
+				audio_drift_write(capture_drift, mono_frame, 1);
 			}
 		} else if (err != -EAGAIN && err != -ETIMEDOUT) {
-			printk("i2s read error: %d\n", err);
+			printk("i2s read error: %d, recovering rx\n", err);
+			i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_DROP);
 			k_sleep(K_MSEC(10));
+			i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
 		}
 	}
 }
@@ -222,11 +215,11 @@ static void volume_thread_fn(void *p1, void *p2, void *p3)
 }
 #endif
 
-int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
+int audio_init(struct audio_drift_ctx *dl_drift, struct audio_drift_ctx *ul_drift)
 {
 	int err;
 
-	if (tx_q == NULL || mono_rx_cb == NULL) {
+	if (dl_drift == NULL || ul_drift == NULL) {
 		return -EINVAL;
 	}
 
@@ -234,8 +227,8 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		return 0;
 	}
 
-	playback_q = tx_q;
-	rx_cb = mono_rx_cb;
+	playback_drift = dl_drift;
+	capture_drift = ul_drift;
 
 #if AUDIO_HAS_VOLUME_CTRL
 	if (!adc_is_ready_dt(&pot)) {
