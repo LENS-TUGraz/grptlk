@@ -583,6 +583,12 @@ void iso_stats_rx(int chan_idx, const struct bt_iso_recv_info *info, struct net_
 		{
 			rx_stats->seq_gap_events++;
 			rx_stats->seq_gap_packets += delta;
+			/*
+			 * In GRPTLK runs the controller path may not always emit BT_ISO_FLAGS_LOST
+			 * events for every missed SDU. Reflect observed sequence gaps as lost
+			 * packets so UL RX "lost" tracks effective over-the-air loss.
+			 */
+			rx_stats->lost_flag += delta;
 		}
 		else if (delta >= 0x8000U)
 		{
