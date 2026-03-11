@@ -18,6 +18,7 @@ if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
     src/io/audio_cs47l63.c
     src/drivers/audio_i2s.c
     src/drivers/cs47l63_comm.c
+    src/audio_drift.c
   )
 
   if (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
@@ -36,6 +37,7 @@ elseif(CONFIG_GRPTLK_AUDIO_BACKEND_MAX9867)
     src/main.c
     src/io/audio_max9867.c
     src/drivers/max9867.c
+    src/audio_drift.c
   )
 else()
   message(FATAL_ERROR "No GRPTLK audio backend selected")

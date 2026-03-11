@@ -21,6 +21,7 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
+#include <zephyr/sys/ring_buffer.h>
 
 #include "io/audio.h"
 #include "io/led.h"
@@ -123,24 +124,32 @@ static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios
 static struct gpio_callback ptt_cb_data;
 
 static atomic_t ptt_active = ATOMIC_INIT(0);
+static struct k_work_delayable ptt_debounce_work;
+
+static void ptt_debounce_handler(struct k_work *work)
+{
+	int val = gpio_pin_get_dt(&ptt_btn);
+	if (val > 0) {
+		if (atomic_get(&ptt_active) == 0) {
+			atomic_set(&ptt_active, 1);
+			printk("[PTT] pressed\n");
+			k_sem_give(&tx_sem);
+		}
+	} else {
+		if (atomic_get(&ptt_active) == 1) {
+			atomic_set(&ptt_active, 0);
+			printk("[PTT] released\n");
+		}
+	}
+}
 
 static void ptt_isr_press(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
-	int val = gpio_pin_get_dt(&ptt_btn);
 
-	if (val > 0) {
-		/* Button pressed: start TX chain by priming the semaphore. */
-		atomic_set(&ptt_active, 1);
-		printk("[PTT] pressed\n");
-		k_sem_give(&tx_sem);
-	} else {
-		/* Button released: clear flag so iso_sent stops re-arming tx_sem. */
-		atomic_set(&ptt_active, 0);
-		printk("[PTT] released\n");
-	}
+	k_work_reschedule(&ptt_debounce_work, K_MSEC(50));
 }
 #else
 #define PTT_AVAILABLE 0
@@ -154,6 +163,7 @@ static const struct gpio_dt_spec ptt_lock_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0),
 static struct gpio_callback ptt_lock_cb_data;
 static atomic_t ptt_lock_active = ATOMIC_INIT(0);
 static struct k_work ptt_lock_toggle_work;
+static struct k_work_delayable ptt_lock_debounce_work;
 
 static void ptt_lock_toggle_work_handler(struct k_work *work)
 {
@@ -172,14 +182,20 @@ static void ptt_lock_toggle_work_handler(struct k_work *work)
 	}
 }
 
+static void ptt_lock_debounce_handler(struct k_work *work)
+{
+	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
+		k_work_submit(&ptt_lock_toggle_work);
+	}
+}
+
 static void ptt_lock_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
-	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
-		k_work_submit(&ptt_lock_toggle_work);
-	}
+
+	k_work_reschedule(&ptt_lock_debounce_work, K_MSEC(50));
 }
 #else
 #define PTT_LOCK_AVAILABLE 0
@@ -207,6 +223,8 @@ static int ptt_init(void)
 		return err;
 	}
 
+	k_work_init_delayable(&ptt_debounce_work, ptt_debounce_handler);
+
 	gpio_init_callback(&ptt_cb_data, ptt_isr_press, BIT(ptt_btn.pin));
 	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
 
@@ -225,6 +243,7 @@ static int ptt_lock_init(void)
 	int err;
 
 	k_work_init(&ptt_lock_toggle_work, ptt_lock_toggle_work_handler);
+	k_work_init_delayable(&ptt_lock_debounce_work, ptt_lock_debounce_handler);
 
 	if (!gpio_is_ready_dt(&ptt_lock_btn) || !gpio_is_ready_dt(&ptt_lock_led)) {
 		printk("PTT-lock button/LED GPIO not ready\n");
@@ -294,14 +313,24 @@ static void override_preset_for_lc3plus_5ms(void)
 
 #define DECODER_STACK_SIZE 6144
 #define DECODER_PRIORITY   3
-#define ENCODER_STACK_SIZE 4096
+#define ENCODER_STACK_SIZE 6144
 #define ENCODER_PRIORITY   2
 
-/* Mic PCM -> LC3 encoder */
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 4);
+/* Downlink playback drift buffer (stereo, 320 bytes per frame) */
+#define DL_RINGBUF_SIZE 4096
+#define DL_PREFILL_FRAMES 6
+#define DL_LOW_WATER_FRAMES 3
+#define DL_HIGH_WATER_FRAMES 10
+RING_BUF_DECLARE(dl_ringbuf, DL_RINGBUF_SIZE);
+static struct audio_drift_ctx dl_drift;
 
-/* LC3 decoded downlink -> audio backend playback queue */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
+/* Uplink capture drift buffer (mono, 160 bytes per frame) */
+#define UL_RINGBUF_SIZE 2048
+#define UL_PREFILL_FRAMES 6
+#define UL_LOW_WATER_FRAMES 3
+#define UL_HIGH_WATER_FRAMES 10
+RING_BUF_DECLARE(ul_ringbuf, UL_RINGBUF_SIZE);
+static struct audio_drift_ctx ul_drift;
 
 struct lc3_frame {
 	uint16_t len;
@@ -316,9 +345,9 @@ K_MSGQ_DEFINE(lc3_rx_q, sizeof(struct lc3_frame), 2, 4);
 K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
 
 static lc3_decoder_t lc3_decoder;
-static lc3_decoder_mem_16k_t lc3_decoder_mem;
+static lc3_decoder_mem_16k_t lc3_decoder_mem __aligned(4);
 static lc3_encoder_t lc3_encoder;
-static lc3_encoder_mem_16k_t lc3_encoder_mem;
+static lc3_encoder_mem_16k_t lc3_encoder_mem __aligned(4);
 
 K_THREAD_STACK_DEFINE(decoder_stack, DECODER_STACK_SIZE);
 static struct k_thread decoder_thread_data;
@@ -417,14 +446,12 @@ static struct bt_iso_big_sync_param big_sync_param = {
 	.sync_timeout = 100, /* 10 ms units */
 };
 
+#if 0
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
-	if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0) {
-		int16_t dropped[PCM_SAMPLES_PER_FRAME];
-		(void)k_msgq_get(&pcm_msgq, dropped, K_NO_WAIT);
-		(void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
-	}
+	audio_drift_write(&ul_drift, mono_frame, 1);
 }
+#endif
 
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
@@ -461,20 +488,23 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			stereo_buf[2 * i + 1] = mono_pcm[i];
 		}
 
-		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-			uint32_t dropped[PCM_SAMPLES_PER_FRAME];
-			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
-			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
+		audio_drift_write(&dl_drift, stereo_buf, 1);
+
+		static uint32_t log_cnt = 0;
+		if ((log_cnt++ % 200U) == 0U) {
+			printk("Drift DL: fill=%u | errs(U=%u O=%u) | slip(D=%u I=%u)\n",
+			       audio_drift_fill_level(&dl_drift), dl_drift.underruns, dl_drift.overruns, dl_drift.dropped_frames, dl_drift.inserted_frames);
+			printk("Drift UL: fill=%u | errs(U=%u O=%u) | slip(D=%u I=%u)\n",
+			       audio_drift_fill_level(&ul_drift), ul_drift.underruns, ul_drift.overruns, ul_drift.dropped_frames, ul_drift.inserted_frames);
 		}
 	}
 }
 
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
-	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
+	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME] __aligned(4);
+	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU] __aligned(4);
 	const int octets_per_frame = preset_active.qos.sdu;
-	static uint32_t tx_drop_cnt;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -482,11 +512,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 	while (1) {
 		int ret;
-
-		ret = k_msgq_get(&pcm_msgq, mono_pcm, K_FOREVER);
-		if (ret != 0) {
-			continue;
-		}
+		uint32_t read = audio_drift_read(&ul_drift, mono_pcm, 1);
+		(void)read;
 
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1, octets_per_frame,
 				 encoded_buf);
@@ -494,17 +521,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		if (k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT) != 0) {
-			uint8_t drop[CONFIG_BT_ISO_TX_MTU];
-
-			/* Keep newest frame for low-latency uplink behavior. */
-			(void)k_msgq_get(&lc3_tx_q, drop, K_NO_WAIT);
-			(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT);
-			if (atomic_get(&uplink_tx_active) != 0 && (tx_drop_cnt++ % 100U) == 0U) {
-				printk("Uplink encoded queue full - dropping oldest (cnt=%u)\n",
-				       tx_drop_cnt);
-			}
-		}
+		/* Paces encoder thread to the BLE ISO transmit speed */
+		(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_FOREVER);
 	}
 }
 
@@ -715,7 +733,12 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 {
 	ARG_UNUSED(sync);
 	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
-	printk("BIG has %u BIS(es), syncing to %u\n", biginfo->num_bis, big_actual_num_bis);
+	
+	static bool printed = false;
+	if (!printed) {
+		printk("BIG has %u BIS(es), syncing to %u\n", biginfo->num_bis, big_actual_num_bis);
+		printed = true;
+	}
 	k_sem_give(&sem_per_big_info);
 }
 
@@ -882,8 +905,12 @@ int main(void)
 
 	bis_channels_init();
 
-	/* --- Audio setup --- */
-	err = audio_init(&tx_msgq, audio_rx_mono_frame);
+	audio_drift_init(&dl_drift, &dl_ringbuf, BLOCK_BYTES,
+					 DL_PREFILL_FRAMES, DL_LOW_WATER_FRAMES, DL_HIGH_WATER_FRAMES);
+	audio_drift_init(&ul_drift, &ul_ringbuf, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME,
+					 UL_PREFILL_FRAMES, UL_LOW_WATER_FRAMES, UL_HIGH_WATER_FRAMES);
+
+	err = audio_init(&dl_drift, &ul_drift);
 	if (err) {
 		printk("audio_init failed: %d\n", err);
 		return err;

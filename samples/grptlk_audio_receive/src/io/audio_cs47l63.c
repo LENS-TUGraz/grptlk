@@ -25,8 +25,8 @@ BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
 
 #define MIC_PEAK_DETECT_THRESHOLD 64
 
-static audio_rx_cb_t rx_cb;
-static struct k_msgq *playback_q;
+static struct audio_drift_ctx *rx_drift;
+static struct audio_drift_ctx *tx_drift;
 static bool is_initialized;
 static bool is_started;
 
@@ -193,8 +193,8 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	ch = mic_channel_pick(left_peak, right_peak);
 	extract_selected_channel_to_mono(rx_words, mono_frame, ch);
 
-	if (rx_cb != NULL) {
-		rx_cb(mono_frame);
+	if (rx_drift != NULL) {
+		audio_drift_write(rx_drift, mono_frame, 1);
 	}
 }
 
@@ -202,13 +202,10 @@ static void tx_buffer_fill(uint32_t *tx_words)
 {
 	static uint32_t silence_inject_cnt;
 
-	if (playback_q == NULL ||
-	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) != 0) {
+	if (tx_drift) {
+		audio_drift_read(tx_drift, tx_words, 1);
+	} else {
 		memset(tx_words, 0, AUDIO_I2S_BLOCK_BYTES);
-		if ((silence_inject_cnt++ % 200U) == 0U) {
-			printk("Uplink RX playback: injecting silence (cnt=%u)\n",
-			       silence_inject_cnt);
-		}
 	}
 }
 
@@ -267,11 +264,11 @@ int audio_volume_adjust(int8_t step_db)
 	return 0;
 }
 
-int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
+int audio_init(struct audio_drift_ctx *dl_drift, struct audio_drift_ctx *ul_drift)
 {
 	int err;
 
-	if (tx_q == NULL || mono_rx_cb == NULL) {
+	if (dl_drift == NULL || ul_drift == NULL) {
 		return -EINVAL;
 	}
 
@@ -279,8 +276,8 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		return 0;
 	}
 
-	playback_q = tx_q;
-	rx_cb = mono_rx_cb;
+	tx_drift = dl_drift;
+	rx_drift = ul_drift;
 	selected_mic_channel = -1;
 
 	err = codec_mic_path_prepare();
