@@ -21,6 +21,7 @@ choice GRPTLK_AUDIO_BACKEND
 	bool "Audio Backend"
 	default GRPTLK_AUDIO_BACKEND_CS47L63 if BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
 	default GRPTLK_AUDIO_BACKEND_MAX9867 if BOARD_HWN001_NRF54L15_CPUAPP
+	default GRPTLK_AUDIO_BACKEND_MAX9867 if BOARD_RBV2H_NRF5340_CPUAPP
 	default GRPTLK_AUDIO_BACKEND_MAX9867
 
 config GRPTLK_AUDIO_BACKEND_CS47L63
@@ -29,11 +30,22 @@ config GRPTLK_AUDIO_BACKEND_CS47L63
 	  Use the CS47L63 codec path used on nrf5340_audio_dk.
 
 config GRPTLK_AUDIO_BACKEND_MAX9867
-	bool "MAX9867 on HWN001 / nRF54L15"
+	bool "MAX9867 on HWN001 / RBV2H"
 	help
-	  Use the MAX9867 codec path used on HWN001 and nRF54L15 targets.
+	  Use the MAX9867 codec path used on HWN001 (nRF54L15) and RBV2H (nRF5340) targets.
 
 endchoice
+
+config GRPTLK_I2S_CODEC_MASTER
+	bool "MAX9867 is I2S master (nRF is slave)"
+	depends on GRPTLK_AUDIO_BACKEND_MAX9867
+	default y if BOARD_HWN001_NRF54L15_CPUAPP
+	default n if BOARD_RBV2H_NRF5340_CPUAPP
+	default y
+	help
+	  When enabled, the MAX9867 generates BCLK and LRCLK and the nRF acts as
+	  I2S slave (HWN001 configuration). When disabled, the nRF generates clocks
+	  and the MAX9867 acts as I2S slave (RBV2H configuration).
 
 if GRPTLK_AUDIO_BACKEND_CS47L63
 
@@ -50,6 +62,16 @@ config HW_CODEC_CIRRUS_LOGIC
 	default y
 
 endif # GRPTLK_AUDIO_BACKEND_CS47L63
+
+if GRPTLK_AUDIO_BACKEND_MAX9867
+
+config NRFX_I2S0
+	default y if BOARD_RBV2H_NRF5340_CPUAPP || BOARD_RBV2H_NRF5340_CPUAPP_NS
+
+config NRFX_CLOCK
+	default y if BOARD_RBV2H_NRF5340_CPUAPP || BOARD_RBV2H_NRF5340_CPUAPP_NS
+
+endif # GRPTLK_AUDIO_BACKEND_MAX9867
 
 config GRPTLK_UPLINK_BIS
 	int "Static uplink BIS index (1-based, BIS1 is downlink)"

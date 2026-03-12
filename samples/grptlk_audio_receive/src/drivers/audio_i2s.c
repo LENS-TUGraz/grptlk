@@ -17,6 +17,10 @@
 
 #define I2S_NL DT_NODELABEL(i2s0)
 
+#define AUDIO_I2S_CFG_RATIO NRF_I2S_RATIO_384X
+#define AUDIO_I2S_CFG_MCK   0x66666000
+#define AUDIO_I2S_CFG_BYPASS false
+
 /*
  * Calculation from nRF5340 Audio reference:
  * FREQ_VALUE = 2^16 * ((12 * f_out / 32M) - 4), f_out = 12.288 MHz
@@ -43,13 +47,13 @@ static nrfx_i2s_config_t cfg = {
 	.mode = NRF_I2S_MODE_MASTER,
 	.format = NRF_I2S_FORMAT_I2S,
 	.alignment = NRF_I2S_ALIGN_LEFT,
-	.ratio = NRF_I2S_RATIO_384X,
-	.mck_setup = 0x66666000,
+	.ratio = AUDIO_I2S_CFG_RATIO,
+	.mck_setup = AUDIO_I2S_CFG_MCK,
 	.sample_width = NRF_I2S_SWIDTH_16BIT,
 	.channels = NRF_I2S_CHANNELS_STEREO,
 #if NRF_I2S_HAS_CLKCONFIG
 	.clksrc = NRF_I2S_CLKSRC_ACLK,
-	.enable_bypass = false,
+	.enable_bypass = AUDIO_I2S_CFG_BYPASS,
 #endif
 };
 
@@ -98,6 +102,15 @@ int audio_i2s_init(void)
 	if (ret != NRFX_SUCCESS) {
 		return -EIO;
 	}
+
+	printk("audio_i2s: ratio=0x%x mck=0x%08x bypass=%u clksrc=%u\n",
+	       cfg.ratio, cfg.mck_setup,
+#if NRF_I2S_HAS_CLKCONFIG
+	       cfg.enable_bypass, cfg.clksrc
+#else
+	       0U, 0U
+#endif
+	);
 
 	state = AUDIO_I2S_STATE_IDLE;
 	return 0;

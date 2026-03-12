@@ -28,14 +28,17 @@ if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
       "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
   endif()
 elseif(CONFIG_GRPTLK_AUDIO_BACKEND_MAX9867)
-  if(NOT CONFIG_BOARD_HWN001_NRF54L15_CPUAPP)
+  if(NOT CONFIG_BOARD_HWN001_NRF54L15_CPUAPP
+     AND NOT CONFIG_BOARD_RBV2H_NRF5340_CPUAPP
+     AND NOT CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)
     message(FATAL_ERROR
-      "MAX9867 backend is only supported on hwn001/nrf54l15/cpuapp")
+      "MAX9867 backend is only supported on hwn001/nrf54l15/cpuapp and rbv2h/nrf5340/cpuapp[/ns]")
   endif()
 
   target_sources(app PRIVATE
     src/main.c
     src/io/audio_max9867.c
+    src/drivers/audio_i2s.c
     src/drivers/max9867.c
     src/audio_drift.c
   )

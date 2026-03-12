@@ -32,7 +32,14 @@ K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
 #define VOLUME_STEP_DB 3
 
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
+#if defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP) || defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)
+#define RBV2H_BUTTON_LAYOUT 1
+#else
+#define RBV2H_BUTTON_LAYOUT 0
+#endif
+
+#if !RBV2H_BUTTON_LAYOUT && DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -113,22 +120,40 @@ static int vol_buttons_init(void)
 	printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n", VOLUME_STEP_DB);
 	return 0;
 #else
-	printk("Volume buttons: sw0/sw1 not available on this board\n");
+	printk("Volume buttons: not used on this board\n");
 	return 0;
 #endif
 }
 
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#if RBV2H_BUTTON_LAYOUT
 #define PTT_AVAILABLE 1
-static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const char *const ptt_btn_name = "sw1/mute";
 static struct gpio_callback ptt_cb_data;
 
 static atomic_t ptt_active = ATOMIC_INIT(0);
 static struct k_work_delayable ptt_debounce_work;
+#elif DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#define PTT_AVAILABLE 1
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const char *const ptt_btn_name = "sw2";
+static struct gpio_callback ptt_cb_data;
 
+static atomic_t ptt_active = ATOMIC_INIT(0);
+static struct k_work_delayable ptt_debounce_work;
+#else
+#define PTT_AVAILABLE 0
+static atomic_t ptt_active = ATOMIC_INIT(1);
+#endif
+
+#if PTT_AVAILABLE
 static void ptt_debounce_handler(struct k_work *work)
 {
-	int val = gpio_pin_get_dt(&ptt_btn);
+	int val;
+
+	ARG_UNUSED(work);
+
+	val = gpio_pin_get_dt(&ptt_btn);
 	if (val > 0) {
 		if (atomic_get(&ptt_active) == 0) {
 			atomic_set(&ptt_active, 1);
@@ -151,9 +176,6 @@ static void ptt_isr_press(const struct device *dev, struct gpio_callback *cb, ui
 
 	k_work_reschedule(&ptt_debounce_work, K_MSEC(50));
 }
-#else
-#define PTT_AVAILABLE 0
-static atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
@@ -229,10 +251,10 @@ static int ptt_init(void)
 	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
 
 	atomic_set(&ptt_active, 0);
-	printk("PTT init: button ready, mic TX disabled at boot\n");
+	printk("PTT init: %s ready, mic TX disabled at boot\n", ptt_btn_name);
 	return 0;
 #else
-	printk("PTT: no sw2 alias, always transmitting\n");
+	printk("PTT: no dedicated button alias, always transmitting\n");
 	return 0;
 #endif
 }
@@ -490,15 +512,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		audio_drift_write(&dl_drift, stereo_buf, 1);
 
-		static uint32_t log_cnt = 0;
-		if ((log_cnt++ % 200U) == 0U) {
-			printk("Drift DL: fill=%u | errs(U=%u O=%u) | slip(D=%u I=%u)\n",
-			       audio_drift_fill_level(&dl_drift), dl_drift.underruns, dl_drift.overruns, dl_drift.dropped_frames, dl_drift.inserted_frames);
-			printk("Drift UL: fill=%u | errs(U=%u O=%u) | slip(D=%u I=%u)\n",
-			       audio_drift_fill_level(&ul_drift), ul_drift.underruns, ul_drift.overruns, ul_drift.dropped_frames, ul_drift.inserted_frames);
 		}
 	}
-}
 
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
@@ -513,7 +528,29 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 		uint32_t read = audio_drift_read(&ul_drift, mono_pcm, 1);
-		(void)read;
+		static uint32_t mic_log_count;
+
+		if (mic_log_count < 10U || (mic_log_count % 200U) == 0U) {
+			int32_t peak = 0;
+
+			for (size_t i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+				int32_t sample = mono_pcm[i];
+
+				if (sample < 0) {
+					sample = -sample;
+				}
+
+				if (sample > peak) {
+					peak = sample;
+				}
+			}
+
+			printk("mic pre-lc3: read=%u peak=%ld samples=[%d,%d,%d,%d,%d,%d,%d,%d]\n",
+			       read, (long)peak,
+			       mono_pcm[0], mono_pcm[1], mono_pcm[2], mono_pcm[3],
+			       mono_pcm[4], mono_pcm[5], mono_pcm[6], mono_pcm[7]);
+		}
+		mic_log_count++;
 
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1, octets_per_frame,
 				 encoded_buf);

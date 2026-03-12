@@ -12,6 +12,12 @@
 #define RECEIVE_LED_AVAILABLE 1
 static const struct gpio_dt_spec receive_led =
 	GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+#elif (defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP) || defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led2), okay) && \
+	DT_NODE_HAS_STATUS(DT_GPIO_CTLR(DT_ALIAS(led2), gpios), okay)
+#define RECEIVE_LED_AVAILABLE 1
+static const struct gpio_dt_spec receive_led =
+	GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 #elif CONFIG_BOARD_HWN001_NRF54L15_CPUAPP && \
 	DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay) && \
 	DT_NODE_HAS_STATUS(DT_GPIO_CTLR(DT_ALIAS(led0), gpios), okay)
@@ -24,6 +30,16 @@ static const struct gpio_dt_spec receive_led =
 
 #if RECEIVE_LED_AVAILABLE
 static bool led_ready;
+
+#if (defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP) || defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay) && \
+	DT_NODE_HAS_STATUS(DT_GPIO_CTLR(DT_ALIAS(led1), gpios), okay)
+#define POWER_LED_AVAILABLE 1
+static const struct gpio_dt_spec power_led =
+	GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+#else
+#define POWER_LED_AVAILABLE 0
+#endif
 
 static int led_set_synced_state(bool synced)
 {
@@ -57,10 +73,35 @@ int led_init(void)
 		return -ENODEV;
 	}
 
+#if POWER_LED_AVAILABLE
+	if (!gpio_is_ready_dt(&power_led)) {
+		return -ENODEV;
+	}
+#endif
+
 	err = gpio_pin_configure_dt(&receive_led, GPIO_OUTPUT_INACTIVE);
 	if (err) {
 		return err;
 	}
+
+#if POWER_LED_AVAILABLE
+	err = gpio_pin_configure_dt(&power_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		return err;
+	}
+
+	err = gpio_pin_set_dt(&power_led, 1);
+	if (err) {
+		return err;
+	}
+
+	k_msleep(200);
+
+	err = gpio_pin_set_dt(&power_led, 0);
+	if (err) {
+		return err;
+	}
+#endif
 
 	err = led_set_synced_state(false);
 	if (err) {

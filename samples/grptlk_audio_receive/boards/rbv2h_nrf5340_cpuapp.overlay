@@ -1,0 +1,22 @@
+/* RBV2H (nRF5340) overlay for grptlk_audio_receive with MAX9867 codec.
+ *
+ * The MAX9867 is I2S slave; nRF5340 is I2S master and generates BCLK/LRCK.
+ * ACLK at 12.288 MHz gives a stable 16 kHz LRCLK (12288000 / 768 = 16000).
+ * I2C1 (GPIO0.26/27) is used to control the codec over I2C.
+ */
+
+/* Use ACLK/HFCLKAUDIO for stable 16 kHz I2S master clocking on nRF5340. */
+&clock {
+	hfclkaudio-frequency = <12288000>;
+};
+
+&i2s0 {
+	clock-source = "ACLK";
+};
+
+/ {
+	aliases {
+		i2c-codec = &i2c1;
+		i2s-node0 = &i2s0;
+	};
+};

@@ -10,4 +10,9 @@
     chosen {
         zephyr,bt-hci = &bt_hci_controller;
     };
+
+    aliases {
+        i2c-codec = &i2c20;
+        i2s-node0 = &i2s20;
+    };
 };

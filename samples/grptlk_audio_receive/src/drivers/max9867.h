@@ -45,6 +45,7 @@
 
 int max9867_init();
 int max9867_status();
+int max9867_dump_state(const char *tag);
 int max9867_set_volume(int16_t vol, int16_t max_vol);
 int max9867_set_mute(bool mute);
 

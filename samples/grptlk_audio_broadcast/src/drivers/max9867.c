@@ -7,6 +7,7 @@
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(MAX9867, CONFIG_MAX9867_LOG_LEVEL);
+static uint8_t dac_lvl_reg = 0x0F;
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(max9867_i2c), okay)
 static const struct device *i2c_dev = DEVICE_DT_GET(DT_ALIAS(max9867_i2c));
@@ -87,7 +88,8 @@ int max9867_init()
 		return -EFAULT;
 	}
 	// set internal DAC gain to -15dB -> audio is too loud without this
-	err = reg_write(MAX9867_REG_DAC_LVL, 0x0F);
+	dac_lvl_reg = 0x0F;
+	err = reg_write(MAX9867_REG_DAC_LVL, dac_lvl_reg);
 	if (err) {
 		LOG_ERR("Failed to set DAC gain!");
 		return -EFAULT;
@@ -188,13 +190,14 @@ int max9867_set_volume(int16_t vol, int16_t max_vol)
 int max9867_set_mute(bool mute)
 {
 	int err;
-	uint8_t register_mute = (mute << 6);
+	uint8_t register_mute = (mute ? BIT(6) : 0U) | (dac_lvl_reg & 0x3F);
 
 	err = reg_write(MAX9867_REG_DAC_LVL, register_mute);
 	if (err) {
 		LOG_ERR("Failed to set left volume register!");
 		return -EFAULT;
 	}
+	dac_lvl_reg = register_mute;
 	LOG_DBG("Mute set to %d!", mute);
 
 	return 0;

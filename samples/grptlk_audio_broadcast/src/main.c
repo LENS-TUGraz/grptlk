@@ -21,8 +21,15 @@
 
 #define VOLUME_STEP_DB 3
 
+#if defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP) || defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)
+#define RBV2H_BUTTON_LAYOUT 1
+#else
+#define RBV2H_BUTTON_LAYOUT 0
+#endif
+
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
+#if !RBV2H_BUTTON_LAYOUT && DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -103,31 +110,50 @@ static int vol_buttons_init(void)
 	printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n", VOLUME_STEP_DB);
 	return 0;
 #else
-	printk("Volume buttons: sw0/sw1 not available on this board\n");
+	printk("Volume buttons: not used on this board\n");
 	return 0;
 #endif
 }
 
-/* PTT button (BTN3 = sw2): PTT starts inactive at boot. */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+/* On RBV2H the headset mute button is the PTT button. */
+#if RBV2H_BUTTON_LAYOUT
 #define PTT_AVAILABLE 1
-static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const char *const ptt_btn_name = "sw1/mute";
 static struct gpio_callback ptt_cb_data;
 static atomic_t ptt_active = ATOMIC_INIT(0);
+static struct k_work_delayable ptt_debounce_work;
+#elif DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#define PTT_AVAILABLE 1
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const char *const ptt_btn_name = "sw2";
+static struct gpio_callback ptt_cb_data;
+static atomic_t ptt_active = ATOMIC_INIT(0);
+static struct k_work_delayable ptt_debounce_work;
+#else
+#define PTT_AVAILABLE 0
+static atomic_t ptt_active = ATOMIC_INIT(1);
+#endif
+
+#if PTT_AVAILABLE
+static void ptt_debounce_handler(struct k_work *work)
+{
+	int val;
+
+	ARG_UNUSED(work);
+
+	val = gpio_pin_get_dt(&ptt_btn);
+	atomic_set(&ptt_active, val > 0 ? 1 : 0);
+	printk("[PTT] %s\n", val > 0 ? "pressed" : "released");
+}
 
 static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
-	int val = gpio_pin_get_dt(&ptt_btn);
-
-	atomic_set(&ptt_active, val > 0 ? 1 : 0);
-	printk("[PTT] %s\n", val > 0 ? "pressed" : "released");
+	k_work_reschedule(&ptt_debounce_work, K_MSEC(50));
 }
-#else
-#define PTT_AVAILABLE 0
-static atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
 static int ptt_init(void)
@@ -149,14 +175,15 @@ static int ptt_init(void)
 		printk("PTT interrupt configure failed: %d\n", err);
 		return err;
 	}
+	k_work_init_delayable(&ptt_debounce_work, ptt_debounce_handler);
 	gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
 	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
 
 	atomic_set(&ptt_active, 0);
-	printk("PTT init: button ready, mic TX disabled at boot\n");
+	printk("PTT init: %s ready, mic TX disabled at boot\n", ptt_btn_name);
 	return 0;
 #else
-	printk("PTT: no sw2 alias, always transmitting mic\n");
+	printk("PTT: no dedicated button alias, always transmitting mic\n");
 	return 0;
 #endif
 }
