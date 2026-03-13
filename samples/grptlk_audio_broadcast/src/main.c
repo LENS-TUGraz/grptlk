@@ -350,7 +350,11 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 };
 
 /* Threads */
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+#define TX_THREAD_STACK_SIZE 4096
+#else
 #define TX_THREAD_STACK_SIZE 1024
+#endif
 #define TX_THREAD_PRIORITY   2
 
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
