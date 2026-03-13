@@ -35,12 +35,13 @@ static void on_ptt_activated(void)
 static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2 */
+
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, rtn=1 */
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu = 20U;
-	preset_active.qos.rtn = 2U;
+	preset_active.qos.rtn = BT_ISO_BROADCAST_RTN_MAX;
 }
 
 #define SAMPLE_RATE_HZ	      AUDIO_SAMPLE_RATE_HZ
@@ -69,17 +70,17 @@ static void override_preset_for_lc3plus_5ms(void)
 
 /* Downlink playback drift buffer (stereo, 320 bytes per frame) */
 #define DL_RINGBUF_SIZE	     4096
-#define DL_PREFILL_FRAMES    6
-#define DL_LOW_WATER_FRAMES  3
-#define DL_HIGH_WATER_FRAMES 10
+#define DL_PREFILL_FRAMES    1
+#define DL_LOW_WATER_FRAMES  1
+#define DL_HIGH_WATER_FRAMES 4
 RING_BUF_DECLARE(dl_ringbuf, DL_RINGBUF_SIZE);
 static struct audio_drift_ctx dl_drift;
 
 /* Uplink capture drift buffer (mono, 160 bytes per frame) */
 #define UL_RINGBUF_SIZE	     2048
-#define UL_PREFILL_FRAMES    6
-#define UL_LOW_WATER_FRAMES  3
-#define UL_HIGH_WATER_FRAMES 10
+#define UL_PREFILL_FRAMES    1
+#define UL_LOW_WATER_FRAMES  1
+#define UL_HIGH_WATER_FRAMES 4
 RING_BUF_DECLARE(ul_ringbuf, UL_RINGBUF_SIZE);
 static struct audio_drift_ctx ul_drift;
 
