@@ -1,26 +1,22 @@
-/*
- * Copyright (c) 2018 Nordic Semiconductor ASA
- *
- * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
- */
-
 #define DT_DRV_COMPAT cirrus_cs47l63
 
 #include "cs47l63_comm.h"
 
-#include <zephyr/kernel.h>
-#include <zephyr/drivers/spi.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(cs47l63_comm);
 
 #include "bsp_driver_if.h"
 #include "cs47l63.h"
 
-#define CS47L63_DEVID_VAL 0x47A63
-#define PAD_LEN 4 /* Four bytes padding after address */
+#define CS47L63_DEVID_VAL		0x47A63
+#define PAD_LEN				4 /* Four bytes padding after address */
 /* Delay the processing thread to allow interrupts to settle after boot */
 #define CS47L63_PROCESS_THREAD_DELAY_MS 10
 
@@ -46,56 +42,46 @@ static struct k_mutex cirrus_reg_oper_mutex;
 
 static void notification_callback(uint32_t event_flags, void *arg)
 {
-	printk("Notification from CS47L63, flags: %d\n", event_flags);
+	LOG_DBG("CS47L63 notification, flags: %d", event_flags);
 }
 
-/* Locks the mutex and holds the CS pin
- * for consecutive transactions
- */
 static int spi_mutex_lock(void)
 {
 	int ret;
 
 	ret = k_mutex_lock(&cirrus_reg_oper_mutex, K_FOREVER);
 	if (ret) {
-		printk("Failed to lock mutex: %d\n", ret);
+		LOG_ERR("Failed to lock mutex: %d", ret);
 		return ret;
 	}
 
-	/* If operation mode set to HOLD or the SPI_LOCK_ON is set when
-	 * taking the mutex something is wrong
-	 */
+	/* SPI_HOLD_ON_CS / SPI_LOCK_ON must be cleared before acquiring the mutex. */
 	if ((spi.config.operation & SPI_HOLD_ON_CS) || (spi.config.operation & SPI_LOCK_ON)) {
-		printk("SPI_HOLD_ON_CS and SPI_LOCK_ON must be freed before releasing mutex\n");
+		LOG_ERR("SPI_HOLD_ON_CS and SPI_LOCK_ON must be freed before releasing mutex");
 		return -EPERM;
 	}
 
 	return 0;
 }
 
-/* Unlocks mutex and CS pin */
 static int spi_mutex_unlock(void)
 {
 	int ret;
-	/* If operation mode still set to HOLD or
-	 * the SPI_LOCK_ON is still set when releasing the mutex
-	 * something is wrong
-	 */
+
 	if ((spi.config.operation & SPI_HOLD_ON_CS) || (spi.config.operation & SPI_LOCK_ON)) {
-		printk("SPI_HOLD_ON_CS and SPI_LOCK_ON must be freed before releasing mutex\n");
+		LOG_ERR("SPI_HOLD_ON_CS and SPI_LOCK_ON must be freed before releasing mutex");
 		return -EPERM;
 	}
 
 	ret = k_mutex_unlock(&cirrus_reg_oper_mutex);
 	if (ret) {
-		printk("Failed to unlock mutex: %d\n", ret);
+		LOG_ERR("Failed to unlock mutex: %d", ret);
 		return ret;
 	}
 
 	return 0;
 }
 
-/* Pin interrupt handler for CS47L63 */
 static void cs47l63_comm_pin_int_handler(const struct device *gpio_port, struct gpio_callback *cb,
 					 uint32_t pins)
 {
@@ -112,18 +98,18 @@ static uint32_t cs47l63_comm_reg_read(uint32_t bsp_dev_id, uint8_t *addr_buffer,
 				      uint32_t data_length, uint32_t pad_len)
 {
 	if (pad_len != PAD_LEN) {
-		printk("Trying to pad more than 4 bytes: %d\n", pad_len);
+		LOG_ERR("Unexpected pad length: %d", pad_len);
 		return BSP_STATUS_FAIL;
 	}
 
 	int ret;
 
-	uint8_t pad_buffer[PAD_LEN] = { 0 };
+	uint8_t pad_buffer[PAD_LEN] = {0};
 
 	struct spi_buf_set rx;
-	struct spi_buf rx_buf[] = { { .buf = addr_buffer, .len = addr_length },
-				    { .buf = pad_buffer, .len = pad_len },
-				    { .buf = data_buffer, .len = data_length } };
+	struct spi_buf rx_buf[] = {{.buf = addr_buffer, .len = addr_length},
+				   {.buf = pad_buffer, .len = pad_len},
+				   {.buf = data_buffer, .len = data_length}};
 
 	rx.buffers = rx_buf;
 	rx.count = ARRAY_SIZE(rx_buf);
@@ -135,7 +121,7 @@ static uint32_t cs47l63_comm_reg_read(uint32_t bsp_dev_id, uint8_t *addr_buffer,
 
 	ret = spi_transceive_dt(&spi, &rx, &rx);
 	if (ret) {
-		printk("Failed transceive operation: %d\n", ret);
+		LOG_ERR("SPI transceive failed: %d", ret);
 		return BSP_STATUS_FAIL;
 	}
 
@@ -152,18 +138,18 @@ static uint32_t cs47l63_comm_reg_write(uint32_t bsp_dev_id, uint8_t *addr_buffer
 				       uint32_t data_length, uint32_t pad_len)
 {
 	if (pad_len != PAD_LEN) {
-		printk("Trying to pad more than 4 bytes: %d\n", pad_len);
+		LOG_ERR("Unexpected pad length: %d", pad_len);
 		return BSP_STATUS_FAIL;
 	}
 
 	int ret;
 
-	uint8_t pad_buffer[PAD_LEN] = { 0 };
+	uint8_t pad_buffer[PAD_LEN] = {0};
 
 	struct spi_buf_set tx;
-	struct spi_buf tx_buf[] = { { .buf = addr_buffer, .len = addr_length },
-				    { .buf = pad_buffer, .len = pad_len },
-				    { .buf = data_buffer, .len = data_length } };
+	struct spi_buf tx_buf[] = {{.buf = addr_buffer, .len = addr_length},
+				   {.buf = pad_buffer, .len = pad_len},
+				   {.buf = data_buffer, .len = data_length}};
 
 	tx.buffers = tx_buf;
 	tx.count = ARRAY_SIZE(tx_buf);
@@ -175,7 +161,7 @@ static uint32_t cs47l63_comm_reg_write(uint32_t bsp_dev_id, uint8_t *addr_buffer
 
 	ret = spi_write_dt(&spi, &tx);
 	if (ret) {
-		printk("SPI failed to write: %d\n", ret);
+		LOG_ERR("SPI write failed: %d", ret);
 		return BSP_STATUS_FAIL;
 	}
 
@@ -192,16 +178,14 @@ static uint32_t cs47l63_comm_gpio_set(uint32_t gpio_id, uint8_t gpio_state)
 	int ret;
 
 	ret = gpio_pin_set_raw(gpio_dev, gpio_id, gpio_state);
-
 	if (ret) {
-		printk("Failed to set gpio state, ret: %d\n", ret);
+		LOG_ERR("Failed to set gpio state: %d", ret);
 		return BSP_STATUS_FAIL;
 	}
 
 	return BSP_STATUS_OK;
 }
 
-/* Register callback for pin interrupt from CS47L63 */
 static uint32_t cs47l63_comm_gpio_cb_register(uint32_t gpio_id, bsp_callback_t cb, void *cb_arg)
 {
 	int ret;
@@ -227,7 +211,7 @@ static uint32_t cs47l63_comm_gpio_cb_register(uint32_t gpio_id, bsp_callback_t c
 static uint32_t cs47l63_comm_timer_set(uint32_t duration_ms, bsp_callback_t cb, void *cb_arg)
 {
 	if (cb != NULL || cb_arg != NULL) {
-		printk("Timer with callback not supported\n");
+		LOG_ERR("Timer with callback not supported");
 		return BSP_STATUS_FAIL;
 	}
 
@@ -238,13 +222,13 @@ static uint32_t cs47l63_comm_timer_set(uint32_t duration_ms, bsp_callback_t cb, 
 
 static uint32_t cs47l63_comm_set_supply(uint32_t supply_id, uint8_t supply_state)
 {
-	/* OK is returned in order to make reset function work */
+	/* Supply control not wired on this board; return OK so reset sequence proceeds. */
 	return BSP_STATUS_OK;
 }
 
 static uint32_t cs47l63_comm_i2c_reset(uint32_t bsp_dev_id, bool *was_i2c_busy)
 {
-	printk("Tried to reset I2C, not supported\n");
+	LOG_ERR("I2C reset not supported");
 	return BSP_STATUS_FAIL;
 }
 
@@ -253,14 +237,14 @@ static uint32_t cs47l63_comm_i2c_read_repeated_start(uint32_t bsp_dev_id, uint8_
 						     uint32_t read_length, bsp_callback_t cb,
 						     void *cb_arg)
 {
-	printk("Tried to read repeated start I2C, not supported\n");
+	LOG_ERR("I2C repeated-start read not supported");
 	return BSP_STATUS_FAIL;
 }
 
 static uint32_t cs47l63_comm_i2c_write(uint32_t bsp_dev_id, uint8_t *write_buffer,
 				       uint32_t write_length, bsp_callback_t cb, void *cb_arg)
 {
-	printk("Tried writing to I2C, not supported\n");
+	LOG_ERR("I2C write not supported");
 	return BSP_STATUS_FAIL;
 }
 
@@ -268,35 +252,34 @@ static uint32_t cs47l63_comm_i2c_db_write(uint32_t bsp_dev_id, uint8_t *write_bu
 					  uint32_t write_length_0, uint8_t *write_buffer_1,
 					  uint32_t write_length_1, bsp_callback_t cb, void *cb_arg)
 {
-	printk("Tried to write double buffered I2C, not supported\n");
+	LOG_ERR("I2C double-buffered write not supported");
 	return BSP_STATUS_FAIL;
 }
 
 static uint32_t cs47l63_comm_enable_irq(void)
 {
-	printk("Tried to enable irq, not supported\n");
+	LOG_ERR("enable_irq not supported");
 	return BSP_STATUS_FAIL;
 }
 
 static uint32_t cs47l63_comm_disable_irq(void)
 {
-	printk("Tried to disable irq, not supported\n");
+	LOG_ERR("disable_irq not supported");
 	return BSP_STATUS_FAIL;
 }
 
 static uint32_t cs47l63_comm_spi_throttle_speed(uint32_t speed_hz)
 {
-	printk("Tried to throttle SPI speed, not supported\n");
+	LOG_ERR("SPI throttle speed not supported");
 	return BSP_STATUS_FAIL;
 }
 
 static uint32_t cs47l63_comm_spi_restore_speed(void)
 {
-	printk("Tried to restore SPI speed, not supported\n");
+	LOG_ERR("SPI restore speed not supported");
 	return BSP_STATUS_FAIL;
 }
 
-/* Thread to process events from CS47L63 */
 static void cs47l63_comm_thread(void *cs47l63_driver, void *dummy2, void *dummy3)
 {
 	int ret;
@@ -305,17 +288,17 @@ static void cs47l63_comm_thread(void *cs47l63_driver, void *dummy2, void *dummy3
 		k_sem_take(&sem_cs47l63, K_FOREVER);
 		ret = cs47l63_process((cs47l63_t *)cs47l63_driver);
 		if (ret) {
-			printk("CS47L63 failed to process event\n");
+			LOG_ERR("CS47L63 failed to process event");
 		}
 	}
 }
 
-static cs47l63_bsp_config_t bsp_config = { .bsp_reset_gpio_id = hw_codec_reset.pin,
-					   .bsp_int_gpio_id = hw_codec_irq.pin,
-					   .cp_config.bus_type = CS47L63_BUS_TYPE_SPI,
-					   .cp_config.spi_pad_len = 4,
-					   .notification_cb = &notification_callback,
-					   .notification_cb_arg = NULL };
+static cs47l63_bsp_config_t bsp_config = {.bsp_reset_gpio_id = hw_codec_reset.pin,
+					  .bsp_int_gpio_id = hw_codec_irq.pin,
+					  .cp_config.bus_type = CS47L63_BUS_TYPE_SPI,
+					  .cp_config.spi_pad_len = 4,
+					  .notification_cb = &notification_callback,
+					  .notification_cb_arg = NULL};
 
 int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 {
@@ -328,12 +311,12 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 	k_mutex_init(&cirrus_reg_oper_mutex);
 
 	if (!spi_is_ready_dt(&spi)) {
-		printk("CS47L63 is not ready!\n");
+		LOG_ERR("CS47L63 SPI not ready");
 		return -ENXIO;
 	}
 
 	if (!gpio_is_ready_dt(&hw_codec_gpio)) {
-		printk("GPIO is not ready!\n");
+		LOG_ERR("hw_codec_gpio not ready");
 		return -ENXIO;
 	}
 
@@ -343,7 +326,7 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 	}
 
 	if (!gpio_is_ready_dt(&hw_codec_irq)) {
-		printk("GPIO is not ready!\n");
+		LOG_ERR("hw_codec_irq not ready");
 		return -ENXIO;
 	}
 
@@ -353,7 +336,7 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 	}
 
 	if (!gpio_is_ready_dt(&hw_codec_reset)) {
-		printk("GPIO is not ready!\n");
+		LOG_ERR("hw_codec_reset not ready");
 		return -ENXIO;
 	}
 
@@ -362,7 +345,6 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 		return ret;
 	}
 
-	/* Start thread to handle events from CS47L63 */
 	(void)k_thread_create(&cs47l63_data, cs47l63_stack, CS47L63_STACK_SIZE,
 			      (k_thread_entry_t)cs47l63_comm_thread, (void *)cs47l63_driver, NULL,
 			      NULL, K_PRIO_PREEMPT(CS47L63_THREAD_PRIO), 0,
@@ -373,10 +355,9 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 		return ret;
 	}
 
-	/* Initialize CS47L63 drivers */
 	ret = cs47l63_initialize(cs47l63_driver);
 	if (ret != CS47L63_STATUS_OK) {
-		printk("Failed to initialize CS47L63\n");
+		LOG_ERR("Failed to initialize CS47L63");
 		return -ENXIO;
 	}
 
@@ -387,19 +368,19 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 
 	ret = cs47l63_configure(cs47l63_driver, &cs47l63_config);
 	if (ret != CS47L63_STATUS_OK) {
-		printk("Failed to configure CS47L63\n");
+		LOG_ERR("Failed to configure CS47L63");
 		return -ENXIO;
 	}
 
-	/* Will pin reset the device and wait until boot done */
+	/* Pin-resets the device and waits until boot is done. */
 	ret = cs47l63_reset(cs47l63_driver);
 	if (ret != CS47L63_STATUS_OK) {
-		printk("Failed to reset CS47L63\n");
+		LOG_ERR("Failed to reset CS47L63");
 		return -ENXIO;
 	}
 
 	if (cs47l63_driver->devid != CS47L63_DEVID_VAL) {
-		printk("Wrong device id: 0x%02x, should be 0x%02x\n", cs47l63_driver->devid,
+		LOG_ERR("Wrong device id: 0x%02x, expected 0x%02x", cs47l63_driver->devid,
 			CS47L63_DEVID_VAL);
 		return -EIO;
 	}
@@ -407,22 +388,21 @@ int cs47l63_comm_init(cs47l63_t *cs47l63_driver)
 	return 0;
 }
 
-static bsp_driver_if_t bsp_driver_if_s = { .set_gpio = &cs47l63_comm_gpio_set,
-					   .register_gpio_cb = &cs47l63_comm_gpio_cb_register,
-					   .set_timer = &cs47l63_comm_timer_set,
-					   .spi_read = &cs47l63_comm_reg_read,
-					   .spi_write = &cs47l63_comm_reg_write,
+static bsp_driver_if_t bsp_driver_if_s = {.set_gpio = &cs47l63_comm_gpio_set,
+					  .register_gpio_cb = &cs47l63_comm_gpio_cb_register,
+					  .set_timer = &cs47l63_comm_timer_set,
+					  .spi_read = &cs47l63_comm_reg_read,
+					  .spi_write = &cs47l63_comm_reg_write,
 
-					   /* Functions not supported */
-					   .set_supply = &cs47l63_comm_set_supply,
-					   .i2c_read_repeated_start =
-						   &cs47l63_comm_i2c_read_repeated_start,
-					   .i2c_write = &cs47l63_comm_i2c_write,
-					   .i2c_db_write = &cs47l63_comm_i2c_db_write,
-					   .i2c_reset = &cs47l63_comm_i2c_reset,
-					   .enable_irq = &cs47l63_comm_enable_irq,
-					   .disable_irq = &cs47l63_comm_disable_irq,
-					   .spi_throttle_speed = &cs47l63_comm_spi_throttle_speed,
-					   .spi_restore_speed = &cs47l63_comm_spi_restore_speed };
+					  .set_supply = &cs47l63_comm_set_supply,
+					  .i2c_read_repeated_start =
+						  &cs47l63_comm_i2c_read_repeated_start,
+					  .i2c_write = &cs47l63_comm_i2c_write,
+					  .i2c_db_write = &cs47l63_comm_i2c_db_write,
+					  .i2c_reset = &cs47l63_comm_i2c_reset,
+					  .enable_irq = &cs47l63_comm_enable_irq,
+					  .disable_irq = &cs47l63_comm_disable_irq,
+					  .spi_throttle_speed = &cs47l63_comm_spi_throttle_speed,
+					  .spi_restore_speed = &cs47l63_comm_spi_restore_speed};
 
 bsp_driver_if_t *bsp_driver_if_g = &bsp_driver_if_s;

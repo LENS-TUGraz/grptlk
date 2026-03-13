@@ -5,7 +5,10 @@
 #include <string.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
+
+LOG_MODULE_REGISTER(audio_cs47l63);
 
 #include "audio_i2s.h"
 #include "cs47l63.h"
@@ -30,7 +33,6 @@ static struct audio_drift_ctx *tx_drift;
 static bool is_initialized;
 static bool is_started;
 
-/* I2S RX/TX buffers (double-buffered as in nrf5340_audio). */
 static uint32_t i2s_rx_buf_a[AUDIO_I2S_WORDS_PER_BLOCK];
 static uint32_t i2s_rx_buf_b[AUDIO_I2S_WORDS_PER_BLOCK];
 static uint32_t i2s_tx_buf_a[AUDIO_I2S_WORDS_PER_BLOCK];
@@ -53,8 +55,8 @@ static int codec_reg_conf_write(const uint32_t config[][2], size_t num_of_regs)
 
 		ret = cs47l63_write_reg(&codec_driver, reg, value);
 		if (ret != CS47L63_STATUS_OK) {
-			printk("CS47L63 write failed: reg=0x%08x val=0x%08x ret=%u\n",
-			       reg, value, ret);
+			LOG_ERR("CS47L63 write failed: reg=0x%08x val=0x%08x ret=%u", reg, value,
+				ret);
 			return -EIO;
 		}
 	}
@@ -68,7 +70,7 @@ static int codec_mic_path_prepare(void)
 
 	err = cs47l63_comm_init(&codec_driver);
 	if (err) {
-		printk("cs47l63_comm_init failed: %d\n", err);
+		LOG_ERR("cs47l63_comm_init failed: %d", err);
 		return err;
 	}
 
@@ -92,8 +94,7 @@ static int codec_mic_path_prepare(void)
 		return err;
 	}
 
-	err = codec_reg_conf_write(pdm_mic_enable_configure,
-				   ARRAY_SIZE(pdm_mic_enable_configure));
+	err = codec_reg_conf_write(pdm_mic_enable_configure, ARRAY_SIZE(pdm_mic_enable_configure));
 	if (err) {
 		return err;
 	}
@@ -106,7 +107,7 @@ static int codec_mic_path_prepare(void)
 	err = cs47l63_write_reg(&codec_driver, CS47L63_OUT1L_VOLUME_1,
 				OUT_VOLUME_DEFAULT | VOLUME_UPDATE_BIT);
 	if (err != CS47L63_STATUS_OK) {
-		printk("CS47L63 output volume set failed: %d\n", err);
+		LOG_ERR("CS47L63 output volume set failed: %d", err);
 		return -EIO;
 	}
 
@@ -132,12 +133,12 @@ static inline void i2s_word_unpack(uint32_t word, int16_t *left, int16_t *right)
 	/* NRF_I2S_ALIGN_LEFT with NRF_I2S_SWIDTH_16BIT: the 16-bit sample
 	 * occupies the upper half of the 32-bit word (bits [31:16] = left
 	 * channel, bits [15:0] = right channel). */
-	*left  = (int16_t)(word >> 16);
+	*left = (int16_t)(word >> 16);
 	*right = (int16_t)(word & 0xFFFF);
 }
 
-static void stereo_peak_analyze_words(const uint32_t *rx_words,
-				      int32_t *left_peak, int32_t *right_peak)
+static void stereo_peak_analyze_words(const uint32_t *rx_words, int32_t *left_peak,
+				      int32_t *right_peak)
 {
 	int32_t l_peak = 0;
 	int32_t r_peak = 0;
@@ -183,11 +184,10 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	stereo_peak_analyze_words(rx_words, &left_peak, &right_peak);
 
 	if (selected_mic_channel < 0 &&
-	    (left_peak > MIC_PEAK_DETECT_THRESHOLD ||
-	     right_peak > MIC_PEAK_DETECT_THRESHOLD)) {
+	    (left_peak > MIC_PEAK_DETECT_THRESHOLD || right_peak > MIC_PEAK_DETECT_THRESHOLD)) {
 		selected_mic_channel = (right_peak > left_peak) ? 1 : 0;
-		printk("MIC channel auto-selected: %s\n",
-		       selected_mic_channel == 0 ? "LEFT" : "RIGHT");
+		LOG_INF("MIC channel auto-selected: %s",
+			selected_mic_channel == 0 ? "LEFT" : "RIGHT");
 	}
 
 	ch = mic_channel_pick(left_peak, right_peak);
@@ -200,8 +200,6 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	static uint32_t silence_inject_cnt;
-
 	if (tx_drift) {
 		audio_drift_read(tx_drift, tx_words, 1);
 	} else {
@@ -229,8 +227,8 @@ static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf
 	err = audio_i2s_set_next_buf(rx_buf_released, next_tx_buf);
 	if (err != 0) {
 		if ((i2s_requeue_err_cnt++ % 50U) == 0U) {
-			printk("audio_i2s_set_next_buf failed: %d (cnt=%u)\n",
-			       err, i2s_requeue_err_cnt);
+			LOG_ERR("audio_i2s_set_next_buf failed: %d (cnt=%u)", err,
+				i2s_requeue_err_cnt);
 		}
 	}
 }
@@ -259,8 +257,8 @@ int audio_volume_adjust(int8_t step_db)
 		return -EIO;
 	}
 
-	printk("[VOL] %+d dB -> reg=0x%02x (%d dB)\n",
-	       step_db, (uint8_t)new_vol, (int)(new_vol / 2) - MAX_VOLUME_DB);
+	LOG_INF("[VOL] %+d dB -> reg=0x%02x (%d dB)", step_db, (uint8_t)new_vol,
+		(int)(new_vol / 2) - MAX_VOLUME_DB);
 	return 0;
 }
 
@@ -303,7 +301,7 @@ int audio_start(void)
 
 	err = codec_reg_conf_write(FLL_toggle, ARRAY_SIZE(FLL_toggle));
 	if (err) {
-		printk("Codec FLL toggle failed: %d\n", err);
+		LOG_ERR("Codec FLL toggle failed: %d", err);
 		return err;
 	}
 
@@ -311,7 +309,7 @@ int audio_start(void)
 
 	err = audio_i2s_init();
 	if (err) {
-		printk("audio_i2s_init failed: %d\n", err);
+		LOG_ERR("audio_i2s_init failed: %d", err);
 		return err;
 	}
 
@@ -320,17 +318,17 @@ int audio_start(void)
 
 	err = audio_i2s_start(i2s_rx_buf_a, i2s_tx_buf_a);
 	if (err) {
-		printk("audio_i2s_start failed: %d\n", err);
+		LOG_ERR("audio_i2s_start failed: %d", err);
 		return err;
 	}
 
 	err = audio_i2s_set_next_buf(i2s_rx_buf_b, i2s_tx_buf_b);
 	if (err) {
-		printk("audio_i2s_set_next_buf failed: %d\n", err);
+		LOG_ERR("audio_i2s_set_next_buf failed: %d", err);
 		return err;
 	}
 
-	printk("I2S RX/TX started via NRFX API (ACLK + DTS pinctrl)\n");
+	LOG_INF("I2S RX/TX started (ACLK + DTS pinctrl)");
 	is_started = true;
 	return 0;
 }

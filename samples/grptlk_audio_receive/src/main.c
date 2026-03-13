@@ -1,9 +1,3 @@
-/*
- * Copyright (c) 2026
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
@@ -12,7 +6,6 @@
 #include <zephyr/random/random.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <zephyr/drivers/gpio.h>
 
 #include <zephyr/bluetooth/audio/audio.h>
 #include <zephyr/bluetooth/audio/bap.h>
@@ -23,282 +16,18 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/ring_buffer.h>
 
-#include "io/audio.h"
-#include "io/led.h"
+#include "audio.h"
+#include "led.h"
 #include "lc3.h"
+#include "button.h"
 
 #define NUM_PRIME_PACKETS 2
 K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
-#define VOLUME_STEP_DB 3
-
-#if defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP) || defined(CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)
-#define RBV2H_BUTTON_LAYOUT 1
-#else
-#define RBV2H_BUTTON_LAYOUT 0
-#endif
-
-#if !RBV2H_BUTTON_LAYOUT && DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && \
-	DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
-#define VOL_BTN_AVAILABLE 1
-static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-static struct gpio_callback vol_dn_cb_data;
-static struct gpio_callback vol_up_cb_data;
-
-/* Deferred volume work: ISRs cannot call SPI directly. */
-static struct k_work vol_work;
-static atomic_t vol_pending_step = ATOMIC_INIT(0);
-
-static void vol_work_handler(struct k_work *work)
+/* Called from button.c work queue when PTT becomes active. */
+static void on_ptt_activated(void)
 {
-	ARG_UNUSED(work);
-	int step = (int)atomic_set(&vol_pending_step, 0);
-
-	if (step != 0) {
-		audio_volume_adjust((int8_t)step);
-	}
-}
-
-static void vol_dn_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-	printk("[VOL] down pressed\n");
-	atomic_add(&vol_pending_step, -VOLUME_STEP_DB);
-	k_work_submit(&vol_work);
-}
-
-static void vol_up_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-	printk("[VOL] up pressed\n");
-	atomic_add(&vol_pending_step, VOLUME_STEP_DB);
-	k_work_submit(&vol_work);
-}
-#else
-#define VOL_BTN_AVAILABLE 0
-#endif
-
-static int vol_buttons_init(void)
-{
-#if VOL_BTN_AVAILABLE
-	int err;
-
-	k_work_init(&vol_work, vol_work_handler);
-
-	if (!gpio_is_ready_dt(&vol_dn_btn) || !gpio_is_ready_dt(&vol_up_btn)) {
-		printk("Volume button GPIO not ready\n");
-		return -ENODEV;
-	}
-	err = gpio_pin_configure_dt(&vol_dn_btn, GPIO_INPUT);
-	if (err) {
-		return err;
-	}
-	err = gpio_pin_configure_dt(&vol_up_btn, GPIO_INPUT);
-	if (err) {
-		return err;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&vol_dn_btn, GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) {
-		return err;
-	}
-	err = gpio_pin_interrupt_configure_dt(&vol_up_btn, GPIO_INT_EDGE_TO_ACTIVE);
-	if (err) {
-		return err;
-	}
-
-	gpio_init_callback(&vol_dn_cb_data, vol_dn_isr, BIT(vol_dn_btn.pin));
-	gpio_init_callback(&vol_up_cb_data, vol_up_isr, BIT(vol_up_btn.pin));
-	gpio_add_callback(vol_dn_btn.port, &vol_dn_cb_data);
-	gpio_add_callback(vol_up_btn.port, &vol_up_cb_data);
-
-	printk("Volume buttons init: sw0=vol_down, sw1=vol_up, step=%d dB\n", VOLUME_STEP_DB);
-	return 0;
-#else
-	printk("Volume buttons: not used on this board\n");
-	return 0;
-#endif
-}
-
-#if RBV2H_BUTTON_LAYOUT
-#define PTT_AVAILABLE 1
-static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
-static const char *const ptt_btn_name = "sw1/mute";
-static struct gpio_callback ptt_cb_data;
-
-static atomic_t ptt_active = ATOMIC_INIT(0);
-static struct k_work_delayable ptt_debounce_work;
-#elif DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
-#define PTT_AVAILABLE 1
-static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
-static const char *const ptt_btn_name = "sw2";
-static struct gpio_callback ptt_cb_data;
-
-static atomic_t ptt_active = ATOMIC_INIT(0);
-static struct k_work_delayable ptt_debounce_work;
-#else
-#define PTT_AVAILABLE 0
-static atomic_t ptt_active = ATOMIC_INIT(1);
-#endif
-
-#if PTT_AVAILABLE
-static void ptt_debounce_handler(struct k_work *work)
-{
-	int val;
-
-	ARG_UNUSED(work);
-
-	val = gpio_pin_get_dt(&ptt_btn);
-	if (val > 0) {
-		if (atomic_get(&ptt_active) == 0) {
-			atomic_set(&ptt_active, 1);
-			printk("[PTT] pressed\n");
-			k_sem_give(&tx_sem);
-		}
-	} else {
-		if (atomic_get(&ptt_active) == 1) {
-			atomic_set(&ptt_active, 0);
-			printk("[PTT] released\n");
-		}
-	}
-}
-
-static void ptt_isr_press(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-
-	k_work_reschedule(&ptt_debounce_work, K_MSEC(50));
-}
-#endif
-
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
-#define PTT_LOCK_AVAILABLE 1
-static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
-static const struct gpio_dt_spec ptt_lock_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static struct gpio_callback ptt_lock_cb_data;
-static atomic_t ptt_lock_active = ATOMIC_INIT(0);
-static struct k_work ptt_lock_toggle_work;
-static struct k_work_delayable ptt_lock_debounce_work;
-
-static void ptt_lock_toggle_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-	if (atomic_get(&ptt_lock_active)) {
-		atomic_set(&ptt_lock_active, 0);
-		gpio_pin_set_dt(&ptt_lock_led, 0);
-		atomic_set(&ptt_active, 0);
-		printk("[PTT-LOCK] disabled — PTT mode active\n");
-	} else {
-		atomic_set(&ptt_lock_active, 1);
-		gpio_pin_set_dt(&ptt_lock_led, 1);
-		atomic_set(&ptt_active, 1);
-		k_sem_give(&tx_sem);
-		printk("[PTT-LOCK] enabled — always transmitting\n");
-	}
-}
-
-static void ptt_lock_debounce_handler(struct k_work *work)
-{
-	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
-		k_work_submit(&ptt_lock_toggle_work);
-	}
-}
-
-static void ptt_lock_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-
-	k_work_reschedule(&ptt_lock_debounce_work, K_MSEC(50));
-}
-#else
-#define PTT_LOCK_AVAILABLE 0
-#endif
-
-static int ptt_init(void)
-{
-#if PTT_AVAILABLE
-	int err;
-
-	if (!gpio_is_ready_dt(&ptt_btn)) {
-		printk("PTT button GPIO not ready\n");
-		return -ENODEV;
-	}
-
-	err = gpio_pin_configure_dt(&ptt_btn, GPIO_INPUT);
-	if (err) {
-		printk("PTT button configure failed: %d\n", err);
-		return err;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&ptt_btn, GPIO_INT_EDGE_BOTH);
-	if (err) {
-		printk("PTT interrupt configure failed: %d\n", err);
-		return err;
-	}
-
-	k_work_init_delayable(&ptt_debounce_work, ptt_debounce_handler);
-
-	gpio_init_callback(&ptt_cb_data, ptt_isr_press, BIT(ptt_btn.pin));
-	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
-
-	atomic_set(&ptt_active, 0);
-	printk("PTT init: %s ready, mic TX disabled at boot\n", ptt_btn_name);
-	return 0;
-#else
-	printk("PTT: no dedicated button alias, always transmitting\n");
-	return 0;
-#endif
-}
-
-static int ptt_lock_init(void)
-{
-#if PTT_LOCK_AVAILABLE
-	int err;
-
-	k_work_init(&ptt_lock_toggle_work, ptt_lock_toggle_work_handler);
-	k_work_init_delayable(&ptt_lock_debounce_work, ptt_lock_debounce_handler);
-
-	if (!gpio_is_ready_dt(&ptt_lock_btn) || !gpio_is_ready_dt(&ptt_lock_led)) {
-		printk("PTT-lock button/LED GPIO not ready\n");
-		return -ENODEV;
-	}
-
-	err = gpio_pin_configure_dt(&ptt_lock_btn, GPIO_INPUT);
-	if (err) {
-		printk("PTT-lock button configure failed: %d\n", err);
-		return err;
-	}
-
-	err = gpio_pin_configure_dt(&ptt_lock_led, GPIO_OUTPUT_INACTIVE);
-	if (err) {
-		printk("PTT-lock LED configure failed: %d\n", err);
-		return err;
-	}
-
-	err = gpio_pin_interrupt_configure_dt(&ptt_lock_btn, GPIO_INT_EDGE_BOTH);
-	if (err) {
-		printk("PTT-lock interrupt configure failed: %d\n", err);
-		return err;
-	}
-
-	gpio_init_callback(&ptt_lock_cb_data, ptt_lock_isr, BIT(ptt_lock_btn.pin));
-	gpio_add_callback(ptt_lock_btn.port, &ptt_lock_cb_data);
-
-	printk("PTT-lock init: BTN4=toggle, LED1=status indicator\n");
-	return 0;
-#else
-	printk("PTT-lock: sw3/led0 not available on this board\n");
-	return 0;
-#endif
+	k_sem_give(&tx_sem);
 }
 
 /* BAP preset base: kept as-is per project requirement.
@@ -310,15 +39,15 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
-	preset_active.qos.sdu      = 20U;
-	preset_active.qos.rtn      = 2U;
+	preset_active.qos.sdu = 20U;
+	preset_active.qos.rtn = 2U;
 }
 
-#define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
+#define SAMPLE_RATE_HZ	      AUDIO_SAMPLE_RATE_HZ
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
-#define BLOCK_BYTES           AUDIO_BLOCK_BYTES
+#define BLOCK_BYTES	      AUDIO_BLOCK_BYTES
 #define TIMEOUT_SYNC_CREATE   K_SECONDS(10)
-#define PA_RETRY_COUNT        6
+#define PA_RETRY_COUNT	      6
 #define BIS_ISO_CHAN_COUNT    5
 
 #if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > BIS_ISO_CHAN_COUNT)
@@ -334,22 +63,22 @@ static void override_preset_for_lc3plus_5ms(void)
 			 BT_GAP_SCAN_FAST_WINDOW)
 
 #define DECODER_STACK_SIZE 6144
-#define DECODER_PRIORITY   3
+#define DECODER_PRIORITY   2
 #define ENCODER_STACK_SIZE 6144
-#define ENCODER_PRIORITY   2
+#define ENCODER_PRIORITY   3
 
 /* Downlink playback drift buffer (stereo, 320 bytes per frame) */
-#define DL_RINGBUF_SIZE 4096
-#define DL_PREFILL_FRAMES 6
-#define DL_LOW_WATER_FRAMES 3
+#define DL_RINGBUF_SIZE	     4096
+#define DL_PREFILL_FRAMES    6
+#define DL_LOW_WATER_FRAMES  3
 #define DL_HIGH_WATER_FRAMES 10
 RING_BUF_DECLARE(dl_ringbuf, DL_RINGBUF_SIZE);
 static struct audio_drift_ctx dl_drift;
 
 /* Uplink capture drift buffer (mono, 160 bytes per frame) */
-#define UL_RINGBUF_SIZE 2048
-#define UL_PREFILL_FRAMES 6
-#define UL_LOW_WATER_FRAMES 3
+#define UL_RINGBUF_SIZE	     2048
+#define UL_PREFILL_FRAMES    6
+#define UL_LOW_WATER_FRAMES  3
 #define UL_HIGH_WATER_FRAMES 10
 RING_BUF_DECLARE(ul_ringbuf, UL_RINGBUF_SIZE);
 static struct audio_drift_ctx ul_drift;
@@ -377,7 +106,6 @@ static struct k_thread decoder_thread_data;
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 static struct k_thread encoder_thread_data;
 
-/* ISO TX Thread Objects */
 #define TX_THREAD_STACK_SIZE 1024
 #define TX_THREAD_PRIORITY   2
 
@@ -468,13 +196,6 @@ static struct bt_iso_big_sync_param big_sync_param = {
 	.sync_timeout = 100, /* 10 ms units */
 };
 
-#if 0
-static void audio_rx_mono_frame(const int16_t *mono_frame)
-{
-	audio_drift_write(&ul_drift, mono_frame, 1);
-}
-#endif
-
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
 	struct lc3_frame frame;
@@ -511,9 +232,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		audio_drift_write(&dl_drift, stereo_buf, 1);
-
-		}
 	}
+}
 
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
@@ -546,8 +266,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 
 			printk("mic pre-lc3: read=%u peak=%ld samples=[%d,%d,%d,%d,%d,%d,%d,%d]\n",
-			       read, (long)peak,
-			       mono_pcm[0], mono_pcm[1], mono_pcm[2], mono_pcm[3],
+			       read, (long)peak, mono_pcm[0], mono_pcm[1], mono_pcm[2], mono_pcm[3],
 			       mono_pcm[4], mono_pcm[5], mono_pcm[6], mono_pcm[7]);
 		}
 		mic_log_count++;
@@ -558,7 +277,6 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		/* Paces encoder thread to the BLE ISO transmit speed */
 		(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_FOREVER);
 	}
 }
@@ -643,7 +361,7 @@ static void iso_sent(struct bt_iso_chan *chan)
 {
 	/* Re-arm TX only for uplink BISes and only while PTT is held.
 	 * When PTT is released the chain starves: no more packets are sent. */
-	if (chan != bis[0] && atomic_get(&ptt_active) != 0) {
+	if (chan != bis[0] && button_ptt_is_active()) {
 		k_sem_give(&tx_sem);
 	}
 }
@@ -662,7 +380,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
 		frame.len = buf->len;
 		memcpy(frame.data, buf->data, buf->len);
-		
+
 		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
 	} else {
 		/* Packet lost/invalid: decoder thread will run PLC. */
@@ -684,7 +402,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	if (iso_datapaths_setup) {
 		iso_datapaths_setup = false;
 		/* Only kickstart the uplink chain if PTT is already held at sync time. */
-		if (atomic_get(&ptt_active) != 0) {
+		if (button_ptt_is_active()) {
 			k_sem_give(&tx_sem);
 		}
 	}
@@ -770,7 +488,7 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 {
 	ARG_UNUSED(sync);
 	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
-	
+
 	static bool printed = false;
 	if (!printed) {
 		printk("BIG has %u BIS(es), syncing to %u\n", biginfo->num_bis, big_actual_num_bis);
@@ -843,8 +561,6 @@ static int setup_iso_datapaths(void)
 		uint8_t dir = (i == 0U) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
 					: BT_HCI_DATAPATH_DIR_HOST_TO_CTLR;
 
-		printk("Setting data path chan %u...\n", i);
-
 		err = bt_iso_setup_data_path(chan, dir, &hci_path);
 		if (err == -EACCES) {
 			/* Controller reports "command disallowed" when a stale path is
@@ -861,8 +577,6 @@ static int setup_iso_datapaths(void)
 			printk("Failed to setup ISO data path for chan %u: %d\n", i, err);
 			return err;
 		}
-
-		printk("Setting data path complete chan %u.\n", i);
 	}
 
 	seq_num = 0U;
@@ -934,18 +648,17 @@ int main(void)
 		(void)led_set_receiver_synced(false);
 	}
 
-	(void)ptt_init();
-	(void)ptt_lock_init();
+	(void)button_init(audio_volume_adjust, on_ptt_activated);
 
 	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
 	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
 
 	bis_channels_init();
 
-	audio_drift_init(&dl_drift, &dl_ringbuf, BLOCK_BYTES,
-					 DL_PREFILL_FRAMES, DL_LOW_WATER_FRAMES, DL_HIGH_WATER_FRAMES);
+	audio_drift_init(&dl_drift, &dl_ringbuf, BLOCK_BYTES, DL_PREFILL_FRAMES,
+			 DL_LOW_WATER_FRAMES, DL_HIGH_WATER_FRAMES);
 	audio_drift_init(&ul_drift, &ul_ringbuf, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME,
-					 UL_PREFILL_FRAMES, UL_LOW_WATER_FRAMES, UL_HIGH_WATER_FRAMES);
+			 UL_PREFILL_FRAMES, UL_LOW_WATER_FRAMES, UL_HIGH_WATER_FRAMES);
 
 	err = audio_init(&dl_drift, &ul_drift);
 	if (err) {
@@ -959,14 +672,11 @@ int main(void)
 		return err;
 	}
 
-	(void)vol_buttons_init();
-
 	err = lc3_workers_start();
 	if (err) {
 		return err;
 	}
 
-	/* --- Bluetooth setup --- */
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);

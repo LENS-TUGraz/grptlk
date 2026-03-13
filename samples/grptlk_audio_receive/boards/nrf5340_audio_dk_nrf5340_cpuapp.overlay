@@ -1,5 +1,3 @@
-/* Use ACLK/HFCLKAUDIO for stable 16 kHz I2S master clocking on nRF5340 Audio DK. */
-
 &clock {
 	hfclkaudio-frequency = <12288000>;
 };
@@ -8,7 +6,6 @@
 	clock-source = "ACLK";
 };
 
-/* Expose BTN4 (sw3) for PTT-lock toggle and LED1 (led0) for status indication. */
 / {
 	aliases {
 		sw3 = &button4;

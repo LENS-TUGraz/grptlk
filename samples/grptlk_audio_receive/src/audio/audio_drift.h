@@ -21,15 +21,14 @@ struct audio_drift_ctx {
 	uint32_t high_watermark_frames;
 
 	bool is_started; /* False until prefill is reached */
-	
+
 	/* Statistics */
 	uint32_t dropped_frames;
 	uint32_t inserted_frames;
 	uint32_t underruns;
 	uint32_t overruns;
 
-	/* State for duplication */
-	uint8_t last_frame[512]; 
+	uint8_t last_frame[512];
 };
 
 /**
@@ -37,14 +36,15 @@ struct audio_drift_ctx {
  *
  * @param ctx The context to initialize.
  * @param rb The backing ring buffer (must be initialized by the caller).
- * @param frame_size Size of a single PCM frame in bytes (e.g. 2 for mono 16-bit, 4 for stereo 16-bit).
+ * @param frame_size Size of a single PCM frame in bytes (e.g. 2 for mono 16-bit, 4 for stereo
+ * 16-bit).
  * @param prefill_frames Number of frames to buffer before starting reads.
  * @param low_water_frames Low watermark; below this, duplicate frames are inserted.
  * @param high_water_frames High watermark; above this, frames are dropped.
  */
-void audio_drift_init(struct audio_drift_ctx *ctx, struct ring_buf *rb,
-		      uint32_t frame_size, uint32_t prefill_frames,
-		      uint32_t low_water_frames, uint32_t high_water_frames);
+void audio_drift_init(struct audio_drift_ctx *ctx, struct ring_buf *rb, uint32_t frame_size,
+		      uint32_t prefill_frames, uint32_t low_water_frames,
+		      uint32_t high_water_frames);
 
 /**
  * @brief Write PCM frames into the drift buffer.

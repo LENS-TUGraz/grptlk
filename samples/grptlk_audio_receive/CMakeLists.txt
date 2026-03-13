@@ -4,8 +4,12 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_receive)
 
-target_include_directories(app PRIVATE src src/io src/drivers)
-target_sources(app PRIVATE src/io/led.c)
+target_include_directories(app PRIVATE src src/audio src/io src/drivers)
+target_sources(app PRIVATE
+  src/io/led.c
+  src/io/button.c
+  src/io/qdec.c
+)
 
 if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
   if(NOT CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)
@@ -15,10 +19,10 @@ if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
 
   target_sources(app PRIVATE
     src/main.c
-    src/io/audio_cs47l63.c
+    src/audio/audio_cs47l63.c
+    src/audio/audio_drift.c
     src/drivers/audio_i2s.c
     src/drivers/cs47l63_comm.c
-    src/audio_drift.c
   )
 
   if (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
@@ -28,19 +32,17 @@ if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
       "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
   endif()
 elseif(CONFIG_GRPTLK_AUDIO_BACKEND_MAX9867)
-  if(NOT CONFIG_BOARD_HWN001_NRF54L15_CPUAPP
-     AND NOT CONFIG_BOARD_RBV2H_NRF5340_CPUAPP
-     AND NOT CONFIG_BOARD_RBV2H_NRF5340_CPUAPP_NS)
+  if(NOT CONFIG_BOARD_RBV2H_NRF5340_CPUAPP)
     message(FATAL_ERROR
-      "MAX9867 backend is only supported on hwn001/nrf54l15/cpuapp and rbv2h/nrf5340/cpuapp[/ns]")
+      "MAX9867 backend is only supported on rbv2h/nrf5340/cpuapp")
   endif()
 
   target_sources(app PRIVATE
     src/main.c
-    src/io/audio_max9867.c
+    src/audio/audio_max9867.c
+    src/audio/audio_drift.c
     src/drivers/audio_i2s.c
     src/drivers/max9867.c
-    src/audio_drift.c
   )
 else()
   message(FATAL_ERROR "No GRPTLK audio backend selected")

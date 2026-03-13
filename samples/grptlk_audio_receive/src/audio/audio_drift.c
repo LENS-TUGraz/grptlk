@@ -1,9 +1,9 @@
 #include "audio_drift.h"
 #include <string.h>
 
-void audio_drift_init(struct audio_drift_ctx *ctx, struct ring_buf *rb,
-		      uint32_t frame_size, uint32_t prefill_frames,
-		      uint32_t low_water_frames, uint32_t high_water_frames)
+void audio_drift_init(struct audio_drift_ctx *ctx, struct ring_buf *rb, uint32_t frame_size,
+		      uint32_t prefill_frames, uint32_t low_water_frames,
+		      uint32_t high_water_frames)
 {
 	ctx->ringbuf = rb;
 	ctx->frame_size = frame_size;
@@ -37,7 +37,7 @@ uint32_t audio_drift_write(struct audio_drift_ctx *ctx, const void *data, uint32
 {
 	uint32_t bytes = frames * ctx->frame_size;
 	uint32_t written = ring_buf_put(ctx->ringbuf, (const uint8_t *)data, bytes);
-	
+
 	if (written < bytes) {
 		ctx->overruns++;
 	}
@@ -56,7 +56,6 @@ uint32_t audio_drift_read(struct audio_drift_ctx *ctx, void *data, uint32_t fram
 		if (available >= ctx->prefill_frames) {
 			ctx->is_started = true;
 		} else {
-			/* Still prefilling */
 			memset(data, 0, frames * ctx->frame_size);
 			return 0;
 		}
@@ -66,7 +65,6 @@ uint32_t audio_drift_read(struct audio_drift_ctx *ctx, void *data, uint32_t fram
 		available = audio_drift_fill_level(ctx);
 
 		if (available == 0) {
-			/* Underrun */
 			ctx->is_started = false;
 			ctx->underruns++;
 			memset(dst, 0, ctx->frame_size);
@@ -75,7 +73,8 @@ uint32_t audio_drift_read(struct audio_drift_ctx *ctx, void *data, uint32_t fram
 			continue;
 		}
 
-		/* Check if we should insert to avoid underrun. Max 1 adjust per read call */
+		/* Below low watermark: duplicate last frame to stretch the buffer. Max 1 per call.
+		 */
 		if (!modified_this_tx && available < ctx->low_watermark_frames) {
 			memcpy(dst, ctx->last_frame, ctx->frame_size);
 			ctx->inserted_frames++;
@@ -84,7 +83,7 @@ uint32_t audio_drift_read(struct audio_drift_ctx *ctx, void *data, uint32_t fram
 			continue;
 		}
 
-		/* Check if we should drop to avoid overrun. Max 1 adjust per read call */
+		/* Above high watermark: drop one frame to drain the buffer. Max 1 per call. */
 		if (!modified_this_tx && available > ctx->high_watermark_frames) {
 			uint8_t temp[512];
 			ring_buf_get(ctx->ringbuf, temp, ctx->frame_size);
@@ -98,7 +97,7 @@ uint32_t audio_drift_read(struct audio_drift_ctx *ctx, void *data, uint32_t fram
 			memcpy(ctx->last_frame, dst, ctx->frame_size);
 			out_frames++;
 		} else {
-			/* We dropped the last available frame */
+			/* drop_frame consumed the last available frame */
 			memset(dst, 0, ctx->frame_size);
 			memset(ctx->last_frame, 0, ctx->frame_size);
 			ctx->underruns++;

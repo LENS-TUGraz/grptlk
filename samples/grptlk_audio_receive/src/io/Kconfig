@@ -1,7 +1,7 @@
-module = MAX9867
-module-str = max9867
+module = BUTTON
+module-str = button
 source "subsys/logging/Kconfig.template.log_config"
 
-module = AUDIO_I2S
-module-str = audio_i2s
+module = QDEC
+module-str = qdec
 source "subsys/logging/Kconfig.template.log_config"
