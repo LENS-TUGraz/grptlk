@@ -270,12 +270,11 @@ static int ptt_lock_init(void)
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2 */
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, rtn=2 */
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu      = 20U;
-	preset_active.qos.latency  = 8U;
 	preset_active.qos.rtn      = 2U;
 }
 
@@ -323,6 +322,7 @@ NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT 
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
 static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
+/* tx_sem: given by iso_sent, taken by process_thread to pace encode at the ISO interval. */
 static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
 static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
@@ -351,25 +351,27 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 
 /* Threads */
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
-#define TX_THREAD_STACK_SIZE 4096
-#else
-#define TX_THREAD_STACK_SIZE 1024
+#define PROCESS_THREAD_STACK_SIZE 4096
+#define PROCESS_THREAD_PRIORITY   3
 #endif
+#define TX_THREAD_STACK_SIZE 1024
 #define TX_THREAD_PRIORITY   2
 
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+K_THREAD_STACK_DEFINE(process_thread_stack, PROCESS_THREAD_STACK_SIZE);
+static struct k_thread process_thread_data;
+#endif
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
 
-static void tx_thread(void *arg1, void *arg2, void *arg3)
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+static void process_thread(void *arg1, void *arg2, void *arg3)
 {
-	int err;
-	struct net_buf *buf;
 	uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
 	static uint32_t process_frame_cnt;
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	/* Per-BIS debug counters, reset on printk interval. */
 	static uint32_t dbg_rx_cnt[NUM_RX_BIS];
 	static uint32_t dbg_plc_cnt[NUM_RX_BIS];
@@ -381,12 +383,12 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	static uint32_t dbg_clip_cnt;
 	static int dbg_last_active;
 	static uint32_t dbg_active_change_cnt;
-#endif
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
 
 	while (true) {
-		k_sem_take(&tx_sem, K_FOREVER);
-
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 		uint32_t t0_total = k_cycle_get_32();
 		int16_t mic_pcm[PCM_SAMPLES_PER_FRAME];
 		audio_drift_read(&capture_drift, mic_pcm, 1);
@@ -546,11 +548,28 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 				dbg_plc_streak_max[i] = 0;
 			}
 		}
-#else
+
+		(void)k_msgq_put(&lc3_encoded_q, enc_data, K_FOREVER);
+	}
+}
+#endif /* CONFIG_GRPTLK_RELAY_ONLY */
+
+static void tx_thread(void *arg1, void *arg2, void *arg3)
+{
+	int err;
+	struct net_buf *buf;
+	uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (true) {
+		k_sem_take(&tx_sem, K_FOREVER);
+
 		if (k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT) != 0) {
 			memset(enc_data, 0, sizeof(enc_data));
 		}
-#endif
 
 		buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 		if (!buf) {
@@ -865,8 +884,8 @@ int main(void)
 		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 2);
 	}
 
-	audio_drift_init(&playback_drift, &playback_ringbuf, BLOCK_BYTES, 2, 1, 4);
-	audio_drift_init(&capture_drift, &capture_ringbuf, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 2, 1, 4);
+	audio_drift_init(&playback_drift, &playback_ringbuf, BLOCK_BYTES, 1, 1, 4);
+	audio_drift_init(&capture_drift, &capture_ringbuf, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 1, 4);
 
 	err = audio_init(&playback_drift, &capture_drift);
 	if (err) {
@@ -936,6 +955,13 @@ int main(void)
 	if (err) {
 		return err;
 	}
+
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+	k_thread_create(&process_thread_data, process_thread_stack,
+			K_THREAD_STACK_SIZEOF(process_thread_stack),
+			process_thread, NULL, NULL, NULL, PROCESS_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&process_thread_data, "lc3_process");
+#endif
 
 	k_thread_create(&tx_thread_data, tx_thread_stack, K_THREAD_STACK_SIZEOF(tx_thread_stack),
 			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
