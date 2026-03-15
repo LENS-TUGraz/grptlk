@@ -5,7 +5,7 @@
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #include <nrfx_clock.h>
 #endif
-#include "io/audio.h"
+#include "audio/audio.h"
 #include "io/led.h"
 #include <stdint.h>
 #include <zephyr/device.h>
@@ -18,6 +18,10 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
+BUILD_ASSERT(!IS_ENABLED(CONFIG_GRPTLK_RELAY_ONLY) ||
+	     CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT == 2,
+	     "GRPTLK_RELAY_ONLY requires BT_BAP_BROADCAST_SRC_STREAM_COUNT=2 "
+	     "(exactly one uplink BIS)");
 
 #define VOLUME_STEP_DB 3
 

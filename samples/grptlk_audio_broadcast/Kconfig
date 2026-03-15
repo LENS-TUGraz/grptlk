@@ -5,6 +5,30 @@ menuconfig GRPTLK
 
 if GRPTLK
 
+comment "---- Frequently changed: BIS layout and relay mode ----"
+
+config BT_BAP_BROADCAST_SRC_STREAM_COUNT
+	int "Number of BIS channels (1 TX downlink + N-1 RX uplink)"
+	default 2
+	range 2 5
+	help
+	  Total BIS count including the mandatory TX downlink (BIS1).
+	  Must be 2 to enable relay-only mode (exactly one uplink BIS).
+	  Increase to support more simultaneous uplink speakers.
+
+config GRPTLK_RELAY_ONLY
+	bool "Relay-only mode (no local audio codec)"
+	default n
+	depends on BT_BAP_BROADCAST_SRC_STREAM_COUNT = 2
+	help
+	  When enabled, audio decoding, mixing, and the local microphone are
+	  disabled. The first RX BIS is relayed directly to the TX BIS without
+	  decoding or re-encoding locally.
+	  Only valid when BT_BAP_BROADCAST_SRC_STREAM_COUNT=2 (one uplink BIS).
+	  Set via boards/nrf5340dk_nrf5340_cpuapp.conf for relay-only platforms.
+
+comment "------------------------------------------------"
+
 choice GRPTLK_ROLE
 	bool "GRPTLK Role"
 	default GRPTLK_BCST
@@ -17,32 +41,7 @@ config GRPTLK_RECV
 
 endchoice
 
-config GRPTLK_RELAY_ONLY
-	bool "Audio Broadcast Relay Mode"
-	default n
-	help
-	  When enabled, audio decoding, mixing, and the local microphone are disabled.
-	  Incoming LC3 audio from the first RX BIS is relayed directly to the TX BIS.
-	  Enable this in the board conf for relay-only platforms (e.g. nrf5340dk).
-
-choice GRPTLK_AUDIO_BACKEND
-	bool "Audio Backend"
-	default GRPTLK_AUDIO_BACKEND_CS47L63 if BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
-	default GRPTLK_AUDIO_BACKEND_MAX9867
-
-config GRPTLK_AUDIO_BACKEND_CS47L63
-	bool "CS47L63 on nRF5340 Audio DK"
-	help
-	  Use the CS47L63 codec path used on nrf5340_audio_dk.
-
-config GRPTLK_AUDIO_BACKEND_MAX9867
-	bool "MAX9867 on HWN001 / nRF54L15"
-	help
-	  Use the MAX9867 codec path used on HWN001 and nRF54L15 targets.
-
-endchoice
-
-if GRPTLK_AUDIO_BACKEND_CS47L63
+if HW_CODEC_CIRRUS_LOGIC
 
 config NRFX_I2S
 	default y
@@ -53,12 +52,7 @@ config NRFX_I2S0
 config NRFX_CLOCK
 	default y
 
-config HW_CODEC_CIRRUS_LOGIC
-	default y
-
-endif # GRPTLK_AUDIO_BACKEND_CS47L63
-
-rsource "src/drivers/Kconfig"
+endif # HW_CODEC_CIRRUS_LOGIC
 
 endif # GRPTLK
 

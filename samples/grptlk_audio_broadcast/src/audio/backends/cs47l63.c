@@ -1,4 +1,4 @@
-#include "audio.h"
+#include "audio/audio.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -7,9 +7,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 
-#include "audio_i2s.h"
+#include "audio/drivers/audio_i2s.h"
 #include "cs47l63.h"
-#include "cs47l63_comm.h"
+#include "audio/drivers/cs47l63_comm.h"
 #include "cs47l63_reg_conf.h"
 
 #if !DT_HAS_COMPAT_STATUS_OKAY(cirrus_cs47l63)

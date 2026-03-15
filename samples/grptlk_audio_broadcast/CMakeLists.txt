@@ -41,69 +41,44 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_broadcast)
 
-target_include_directories(app PRIVATE src src/io src/drivers)
-target_sources(app PRIVATE src/io/led.c)
+# Supported targets:
+#   nrf5340_audio_dk/nrf5340/cpuapp  — CS47L63 codec + mic + speaker
+#   nrf5340dk/nrf5340/cpuapp         — relay mode (no audio codec)
+#
+# Source tree layout:
+#   src/
+#     main.c                         — BLE BIG broadcaster + LC3 threads
+#     audio/
+#       audio.h                      — public audio API (init/start/volume)
+#       backends/cs47l63.c           — CS47L63 codec backend (I2S DMA, mic, DAC)
+#       backends/cs47l63_reg_conf.h  — CS47L63 register configuration tables
+#       drivers/audio_i2s.c          — nrfx I2S DMA low-level driver
+#       drivers/audio_i2s.h
+#       drivers/cs47l63_comm.c       — CS47L63 SPI communication layer
+#       drivers/cs47l63_comm.h
+#     io/
+#       led.c / led.h                — broadcast status LED
 
-if(CONFIG_GRPTLK_AUDIO_BACKEND_CS47L63)
-  if(NOT CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)
-    message(FATAL_ERROR
-      "CS47L63 backend is only supported on nrf5340_audio_dk/nrf5340/cpuapp")
-  endif()
+target_include_directories(app PRIVATE src)
 
+# Common sources (all boards)
+target_sources(app PRIVATE
+  src/main.c
+  src/io/led.c
+)
+
+# CS47L63 codec sources (nrf5340_audio_dk only)
+if(CONFIG_HW_CODEC_CIRRUS_LOGIC)
   target_sources(app PRIVATE
-    src/main.c
-    src/io/audio_cs47l63.c
-    src/drivers/audio_i2s.c
-    src/drivers/cs47l63_comm.c
+    src/audio/backends/cs47l63.c
+    src/audio/drivers/audio_i2s.c
+    src/audio/drivers/cs47l63_comm.c
   )
 
-  if (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
-    add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
-  else()
+  if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
     message(FATAL_ERROR
       "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
   endif()
-elseif(CONFIG_GRPTLK_AUDIO_BACKEND_MAX9867)
-  if(NOT (CONFIG_BOARD_HWN001_NRF54L15_CPUAPP
-          OR CONFIG_BOARD_NRF54L15DK_NRF54L15_CPUAPP
-          OR CONFIG_BOARD_NRF54L15BSIM_NRF54L15_CPUAPP
-          OR CONFIG_BOARD_NRF5340DK_NRF5340_CPUAPP))
-    message(FATAL_ERROR
-      "MAX9867 backend is only supported on hwn001/nrf54l15/cpuapp, "
-      "nrf54l15dk/nrf54l15/cpuapp, nrf54l15bsim/nrf54l15/cpuapp, and nrf5340dk/nrf5340/cpuapp")
-  endif()
 
-  target_sources(app PRIVATE
-    src/main.c
-    src/io/audio_max9867.c
-    src/drivers/max9867.c
-  )
-else()
-  # Kconfig backend symbols not resolved (e.g. when the build system passes an
-  # empty CONF_FILE before prj.conf is merged). Fall back to board-based detection.
-  if(CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)
-    target_sources(app PRIVATE
-      src/main.c
-      src/io/audio_cs47l63.c
-      src/drivers/audio_i2s.c
-      src/drivers/cs47l63_comm.c
-    )
-    if (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
-      add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
-    else()
-      message(FATAL_ERROR
-        "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
-    endif()
-  elseif(CONFIG_BOARD_HWN001_NRF54L15_CPUAPP
-         OR CONFIG_BOARD_NRF54L15DK_NRF54L15_CPUAPP
-         OR CONFIG_BOARD_NRF54L15BSIM_NRF54L15_CPUAPP
-         OR CONFIG_BOARD_NRF5340DK_NRF5340_CPUAPP)
-    target_sources(app PRIVATE
-      src/main.c
-      src/io/audio_max9867.c
-      src/drivers/max9867.c
-    )
-  else()
-    message(FATAL_ERROR "No GRPTLK audio backend selected and board not recognised")
-  endif()
+  add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
 endif()
