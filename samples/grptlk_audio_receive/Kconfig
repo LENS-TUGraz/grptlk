@@ -17,26 +17,7 @@ config GRPTLK_RECV
 
 endchoice
 
-choice GRPTLK_AUDIO_BACKEND
-	bool "Audio Backend"
-	default GRPTLK_AUDIO_BACKEND_CS47L63 if BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
-	default GRPTLK_AUDIO_BACKEND_MAX9867 if BOARD_HWN001_NRF54L15_CPUAPP
-	default GRPTLK_AUDIO_BACKEND_MAX9867
-
-config GRPTLK_AUDIO_BACKEND_CS47L63
-	bool "CS47L63 on nRF5340 Audio DK"
-	help
-	  Use the CS47L63 codec path used on nrf5340_audio_dk.
-
-config GRPTLK_AUDIO_BACKEND_MAX9867
-	bool "MAX9867 on HWN001 / nRF54L15"
-	help
-	  Use the MAX9867 codec path used on HWN001 and nRF54L15 targets.
-
-endchoice
-
-if GRPTLK_AUDIO_BACKEND_CS47L63
-
+# Audio backend: CS47L63 on nRF5340 Audio DK (the only supported target).
 config NRFX_I2S
 	default y
 
@@ -48,8 +29,6 @@ config NRFX_CLOCK
 
 config HW_CODEC_CIRRUS_LOGIC
 	default y
-
-endif # GRPTLK_AUDIO_BACKEND_CS47L63
 
 config GRPTLK_UPLINK_BIS
 	int "Static uplink BIS index (1-based, BIS1 is downlink)"
@@ -68,8 +47,6 @@ config GRPTLK_UPLINK_RANDOM
 	  every transmission interval instead of always using GRPTLK_UPLINK_BIS.
 	  The broadcaster must use a single shared LC3 decoder for all uplink
 	  BISes to handle the stream correctly.
-
-rsource "src/drivers/Kconfig"
 
 endif # GRPTLK
 
