@@ -247,22 +247,30 @@ static int ptt_lock_init(void)
 
 /* BAP preset base: kept as-is per project requirement.
  * Runtime QoS fields are overridden below for LC3Plus 5 ms operation. */
+#define GRPTLK_VENDOR_CODEC_ID  BT_HCI_CODING_FORMAT_VS
+#define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
+#define GRPTLK_VENDOR_VENDOR_ID  0xBEEF
+#define GRPTLK_CODEC_INTERVAL_US            5000U
+#define GRPTLK_CODEC_SDU_BYTES              20U
+
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 /* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2.
  *
- * Note: codec_cfg.id/cid/vid are intentionally left at the LC3 defaults from the
- * BT_BAP_LC3_BROADCAST_PRESET_16_2_1 macro (id=0x06, cid=0, vid=0).  Setting id=0xFF
- * (vendor-specific) breaks the BAP stack's update_codec_cfg_data() which appends BIS LTV
- * data instead of merging it when id != LC3, overflowing codec_cfg->data.
- * The receiver identifies the actual codec via biginfo.sdu_interval, not codec_cfg. */
+ * The receiver reads the vendor codec identity from the BASE and the transport
+ * sizing from BIGInfo, so there is no need for extra private codec-config
+ * fields here. */
 static void override_preset_for_lc3plus_5ms(void)
 {
-	preset_active.qos.interval = 5000U;
-	preset_active.qos.sdu      = 20U;
+	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
+	preset_active.qos.sdu      = GRPTLK_CODEC_SDU_BYTES;
 	preset_active.qos.latency  = 8U;
 	preset_active.qos.rtn      = 2U;
+	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
+	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
+	preset_active.codec_cfg.vid = GRPTLK_VENDOR_VENDOR_ID;
+	preset_active.codec_cfg.data_len = 0U;
 }
 
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME

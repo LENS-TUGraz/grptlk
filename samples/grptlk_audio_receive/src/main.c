@@ -105,6 +105,8 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/bluetooth/iso.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/net_buf.h>
 
 #include "audio/audio.h"
 #include "audio/drivers/audio_i2s.h"
@@ -122,7 +124,7 @@
 
 /* Compile-time sizing aliases — used for static buffers, msgq item size, and LC3 setup.
  * Sample rate stays fixed at 16 kHz; frame duration and SDU size are derived at runtime
- * from biginfo (big_sdu_interval_us / big_max_sdu) and applied to preset_active.qos. */
+ * from BIGInfo (big_sdu_interval_us / big_max_sdu) and applied to preset_active.qos. */
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
 #define BLOCK_BYTES           AUDIO_BLOCK_BYTES
@@ -277,13 +279,18 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
+#define GRPTLK_VENDOR_CODEC_ID   BT_HCI_CODING_FORMAT_VS
+#define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
+#define GRPTLK_VENDOR_VENDOR_ID  0xBEEF
+
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu      = 20U;
 	preset_active.qos.rtn      = 2U;
-	/* codec_cfg.id/cid/vid intentionally left at LC3 defaults — receiver uses
-	 * biginfo.sdu_interval for LC3 setup, not codec_cfg fields. */
+	/* qos.interval/qos.sdu are updated from BIGInfo before BIG sync. The
+	 * broadcast codec identity is logged from the BASE in periodic
+	 * advertising. */
 }
 
 static lc3_decoder_t lc3_decoder;
@@ -306,6 +313,8 @@ static bool         per_adv_lost;
 static bt_addr_le_t per_addr;
 static uint8_t      per_sid;
 static uint32_t     per_interval_us;
+static atomic_t     base_logged;
+static atomic_t     base_parse_warned;
 
 static K_SEM_DEFINE(sem_per_adv,       0, 1);
 static K_SEM_DEFINE(sem_per_sync,      0, 1);
@@ -643,6 +652,151 @@ static struct bt_iso_chan_ops iso_ops = {
  * BLE scan and periodic advertising callbacks
  * ========================================================================= */
 
+static bool base_skip_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len_out)
+{
+	uint8_t len;
+
+	if (buf->len < sizeof(len)) {
+		return false;
+	}
+
+	len = net_buf_simple_pull_u8(buf);
+	if (buf->len < len) {
+		return false;
+	}
+
+	if (len_out != NULL) {
+		*len_out = len;
+	}
+
+	net_buf_simple_pull_mem(buf, len);
+
+	return true;
+}
+
+static bool base_is_grptlk_vendor_codec(uint8_t codec_id, uint16_t cid, uint16_t vid)
+{
+	return (codec_id == GRPTLK_VENDOR_CODEC_ID) &&
+	       (cid == GRPTLK_VENDOR_COMPANY_ID) &&
+	       (vid == GRPTLK_VENDOR_VENDOR_ID);
+}
+
+static int base_log_service_data(const struct bt_data *data)
+{
+	struct net_buf_simple buf;
+	uint32_t presentation_delay_us;
+	uint8_t subgroup_count;
+
+	if ((data == NULL) || (data->type != BT_DATA_SVC_DATA16) ||
+	    (data->data_len < (BT_UUID_SIZE_16 + 3U + 1U))) {
+		return -ENOENT;
+	}
+
+	net_buf_simple_init_with_data(&buf, (void *)data->data, data->data_len);
+	if (net_buf_simple_pull_le16(&buf) != BT_UUID_BASIC_AUDIO_VAL) {
+		return -ENOENT;
+	}
+
+	if (buf.len < 4U) {
+		return -EINVAL;
+	}
+
+	presentation_delay_us = net_buf_simple_pull_le24(&buf);
+	subgroup_count = net_buf_simple_pull_u8(&buf);
+	if (subgroup_count == 0U) {
+		return -EINVAL;
+	}
+
+	printk("BASE: presentation_delay=%u us, num_subgroups=%u\n",
+	       presentation_delay_us, subgroup_count);
+
+	for (uint8_t subgroup_idx = 0U; subgroup_idx < subgroup_count; subgroup_idx++) {
+		uint8_t bis_count;
+		uint8_t codec_id;
+		uint8_t codec_cfg_len;
+		uint8_t meta_len;
+		uint16_t cid;
+		uint16_t vid;
+		uint32_t bis_bitfield = 0U;
+		const char *codec_note = "";
+
+		if (buf.len < 1U + 1U + 2U + 2U + 1U + 1U) {
+			return -EINVAL;
+		}
+
+		bis_count = net_buf_simple_pull_u8(&buf);
+		if (bis_count == 0U) {
+			return -EINVAL;
+		}
+
+		codec_id = net_buf_simple_pull_u8(&buf);
+		cid = net_buf_simple_pull_le16(&buf);
+		vid = net_buf_simple_pull_le16(&buf);
+
+		if (!base_skip_len_prefixed_blob(&buf, &codec_cfg_len) ||
+		    !base_skip_len_prefixed_blob(&buf, &meta_len)) {
+			return -EINVAL;
+		}
+
+		for (uint8_t bis_idx = 0U; bis_idx < bis_count; bis_idx++) {
+			uint8_t bis_index;
+			uint8_t bis_codec_cfg_len;
+
+			if (buf.len < 2U) {
+				return -EINVAL;
+			}
+
+			bis_index = net_buf_simple_pull_u8(&buf);
+			bis_codec_cfg_len = net_buf_simple_pull_u8(&buf);
+			if (buf.len < bis_codec_cfg_len) {
+				return -EINVAL;
+			}
+
+			net_buf_simple_pull_mem(&buf, bis_codec_cfg_len);
+
+			if ((bis_index > 0U) && (bis_index <= 32U)) {
+				bis_bitfield |= (uint32_t)1U << (bis_index - 1U);
+			}
+		}
+
+		if (base_is_grptlk_vendor_codec(codec_id, cid, vid)) {
+			codec_note = " (GRPTLK vendor codec)";
+		} else if (codec_id == BT_HCI_CODING_FORMAT_VS) {
+			codec_note = " (vendor specific)";
+		}
+
+		printk("BASE subgroup %u: codec_id=0x%02x%s, cid=0x%04x, vid=0x%04x, "
+		       "codec_cfg_len=%u, meta_len=%u, num_bis=%u, bis_bitfield=0x%08x\n",
+		       subgroup_idx + 1U, codec_id, codec_note, cid, vid,
+		       codec_cfg_len, meta_len, bis_count, bis_bitfield);
+	}
+
+	return (buf.len == 0U) ? 0 : -EINVAL;
+}
+
+static bool pa_decode_base(struct bt_data *data, void *user_data)
+{
+	int err;
+
+	ARG_UNUSED(user_data);
+
+	err = base_log_service_data(data);
+	if (err == -ENOENT) {
+		return true;
+	}
+
+	if (err != 0) {
+		if (atomic_cas(&base_parse_warned, 0, 1)) {
+			printk("BASE parse failed: %d\n", err);
+		}
+		return false;
+	}
+
+	atomic_set(&base_logged, 1);
+
+	return false;
+}
+
 static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf)
 {
 	ARG_UNUSED(buf);
@@ -663,6 +817,22 @@ static void sync_cb(struct bt_le_per_adv_sync *sync,
 	ARG_UNUSED(sync);
 	ARG_UNUSED(info);
 	k_sem_give(&sem_per_sync);
+}
+
+static void pa_recv_cb(struct bt_le_per_adv_sync *sync,
+		       const struct bt_le_per_adv_sync_recv_info *info,
+		       struct net_buf_simple *buf)
+{
+	struct net_buf_simple ad_copy = *buf;
+
+	ARG_UNUSED(sync);
+	ARG_UNUSED(info);
+
+	if (atomic_get(&base_logged) != 0) {
+		return;
+	}
+
+	bt_data_parse(&ad_copy, pa_decode_base, NULL);
 }
 
 static void term_cb(struct bt_le_per_adv_sync *sync,
@@ -691,6 +861,7 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 
 static struct bt_le_per_adv_sync_cb sync_callbacks = {
 	.synced  = sync_cb,
+	.recv    = pa_recv_cb,
 	.term    = term_cb,
 	.biginfo = biginfo_cb,
 };
@@ -707,6 +878,8 @@ static void reset_semaphores(void)
 	k_sem_reset(&sem_per_big_info);
 	k_sem_reset(&sem_big_sync);
 	k_sem_reset(&sem_big_sync_lost);
+	atomic_set(&base_logged, 0);
+	atomic_set(&base_parse_warned, 0);
 }
 
 static bool bis_channels_idle(void)
@@ -853,7 +1026,7 @@ static int lc3_workers_start(void)
  *   4. Bluetooth enable + scan
  *
  * BIG sync loop (restarts on every loss or timeout):
- *   scan → PA found → PA sync → BIG info → BIG sync → data paths
+ *   scan → PA found → PA sync → BIGInfo → BIG sync → data paths
  *      └──────────── re-scan on any failure ──────────────────────┘
  */
 int main(void)
@@ -991,11 +1164,11 @@ int main(void)
 		}
 
 		/* Synchronise preset_active QoS to what the broadcaster is actually sending.
-		 * big_sdu_interval_us = LC3 frame duration; big_max_sdu = octets/frame. */
+		 * big_sdu_interval_us = frame duration; big_max_sdu = octets per SDU. */
 		preset_active.qos.interval = big_sdu_interval_us;
 		preset_active.qos.sdu      = big_max_sdu;
 
-		/* Update I2S DMA block size to match the frame duration from biginfo.
+		/* Update I2S DMA block size to match the frame duration from BIGInfo.
 		 * words_per_block = sample_rate_hz * frame_duration_ms / 1000
 		 * (sample rate is always 16 kHz; only frame duration may change). */
 		audio_i2s_set_block_size((AUDIO_SAMPLE_RATE_HZ * (big_sdu_interval_us / 1000U))
