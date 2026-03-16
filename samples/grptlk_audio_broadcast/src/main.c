@@ -250,7 +250,13 @@ static int ptt_lock_init(void)
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2 */
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2.
+ *
+ * Note: codec_cfg.id/cid/vid are intentionally left at the LC3 defaults from the
+ * BT_BAP_LC3_BROADCAST_PRESET_16_2_1 macro (id=0x06, cid=0, vid=0).  Setting id=0xFF
+ * (vendor-specific) breaks the BAP stack's update_codec_cfg_data() which appends BIS LTV
+ * data instead of merging it when id != LC3, overflowing codec_cfg->data.
+ * The receiver identifies the actual codec via biginfo.sdu_interval, not codec_cfg. */
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;

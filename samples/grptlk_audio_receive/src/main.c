@@ -107,6 +107,7 @@
 #include <zephyr/bluetooth/iso.h>
 
 #include "audio/audio.h"
+#include "audio/drivers/audio_i2s.h"
 #include "audio/sync/clk_sync.h"
 #include "io/buttons.h"
 #include "io/led.h"
@@ -119,7 +120,9 @@
 /* BIG topology: BIS1 = downlink (broadcaster→receiver), BIS2..5 = uplink. */
 #define BIS_ISO_CHAN_COUNT 5
 
-/* LC3Plus 5 ms @ 16 kHz: 80 samples/frame, 20 bytes/SDU, max transport 8 ms. */
+/* Compile-time sizing aliases — used for static buffers, msgq item size, and LC3 setup.
+ * Sample rate stays fixed at 16 kHz; frame duration and SDU size are derived at runtime
+ * from biginfo (big_sdu_interval_us / big_max_sdu) and applied to preset_active.qos. */
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
 #define BLOCK_BYTES           AUDIO_BLOCK_BYTES
@@ -279,6 +282,8 @@ static void override_preset_for_lc3plus_5ms(void)
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu      = 20U;
 	preset_active.qos.rtn      = 2U;
+	/* codec_cfg.id/cid/vid intentionally left at LC3 defaults — receiver uses
+	 * biginfo.sdu_interval for LC3 setup, not codec_cfg fields. */
 }
 
 static lc3_decoder_t lc3_decoder;
@@ -290,8 +295,11 @@ static lc3_encoder_mem_16k_t lc3_encoder_mem;
  * BLE ISO / BIG state
  * ========================================================================= */
 
-static uint8_t big_actual_num_bis = BIS_ISO_CHAN_COUNT;
-static uint8_t active_uplink_bis  = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+static uint8_t  big_actual_num_bis  = BIS_ISO_CHAN_COUNT;
+static uint8_t  active_uplink_bis   = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+/* Populated in biginfo_cb; used to configure LC3 and I2S after BIG info arrives. */
+static uint32_t big_sdu_interval_us = 5000U;  /* frame duration µs — default 5 ms */
+static uint16_t big_max_sdu         = 20U;    /* octets per frame  — default 20 B  */
 
 static bool         per_adv_found;
 static bool         per_adv_lost;
@@ -673,8 +681,11 @@ static void term_cb(struct bt_le_per_adv_sync *sync,
 static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_biginfo *biginfo)
 {
 	ARG_UNUSED(sync);
-	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
-	printk("BIG has %u BIS(es), syncing to %u\n", biginfo->num_bis, big_actual_num_bis);
+	big_actual_num_bis  = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+	big_sdu_interval_us = biginfo->sdu_interval;
+	big_max_sdu         = biginfo->max_sdu;
+	printk("BIG: %u BIS(es), sdu_interval=%u us, max_sdu=%u B, syncing to %u\n",
+	       biginfo->num_bis, big_sdu_interval_us, big_max_sdu, big_actual_num_bis);
 	k_sem_give(&sem_per_big_info);
 }
 
@@ -977,6 +988,34 @@ int main(void)
 				(void)bt_le_per_adv_sync_delete(sync);
 			}
 			continue;
+		}
+
+		/* Synchronise preset_active QoS to what the broadcaster is actually sending.
+		 * big_sdu_interval_us = LC3 frame duration; big_max_sdu = octets/frame. */
+		preset_active.qos.interval = big_sdu_interval_us;
+		preset_active.qos.sdu      = big_max_sdu;
+
+		/* Update I2S DMA block size to match the frame duration from biginfo.
+		 * words_per_block = sample_rate_hz * frame_duration_ms / 1000
+		 * (sample rate is always 16 kHz; only frame duration may change). */
+		audio_i2s_set_block_size((AUDIO_SAMPLE_RATE_HZ * (big_sdu_interval_us / 1000U))
+					 / 1000U);
+
+		/* Re-initialise LC3 codec instances with the discovered frame duration.
+		 * lc3_setup_decoder/encoder are fast pointer-setup calls; the worker
+		 * threads are already running but will not consume stale data because
+		 * the BIG is not yet synced — downlink_ring and uplink_ring are empty. */
+		lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
+						0, &lc3_decoder_mem);
+		if (lc3_decoder == NULL) {
+			printk("ERROR: lc3_setup_decoder failed\n");
+			goto per_sync_lost_check;
+		}
+		lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
+						0, &lc3_encoder_mem);
+		if (lc3_encoder == NULL) {
+			printk("ERROR: lc3_setup_encoder failed\n");
+			goto per_sync_lost_check;
 		}
 
 big_sync_create:
