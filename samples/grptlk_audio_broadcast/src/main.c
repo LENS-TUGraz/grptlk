@@ -264,6 +264,10 @@ static void override_preset_for_lc3plus_5ms(void)
 #define BLOCK_BYTES           AUDIO_BLOCK_BYTES
 /* Maximum absolute value of a signed 16-bit PCM sample (2^15 − 1 = 32767). */
 #define PCM_INT16_MAX         INT16_MAX
+/* Consecutive PLC frames after which a stream is muted in the mix.
+ * Covers brief radio dropouts (PLC concealment) without adding sustained
+ * comfort noise from a device that has gone silent or disconnected. */
+#define PLC_MUTE_FRAMES       40
 
 /* BIS layout: bis[0] = TX (BIS1), bis[1..N] = RX uplink */
 #define NUM_RX_BIS        (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
@@ -478,20 +482,35 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		atomic_set(&uplink_interval_fired, 0);
 
 		uint32_t t0_total = k_cycle_get_32();
+		/* Shared deadline for all BIS stream waits. Sequential BIG guarantees
+		 * every stream's last RTN arrives within the interval, so 90% of the
+		 * interval is sufficient. A fixed per-stream timeout would stack and
+		 * exceed the interval budget with NUM_RX_BIS > 1. */
+		uint32_t deadline_cyc = t0_total +
+			k_us_to_cyc_ceil32(preset_active.qos.interval * 9 / 10);
 		uint32_t dec_us[NUM_RX_BIS];
 		int32_t mixed_pcm[PCM_SAMPLES_PER_FRAME] = {0};
 		int active_streams = 0;
 
 		for (int i = 0; i < NUM_RX_BIS; i++) {
+			/* Skip BIS slots with no device connected — saves the full deadline
+			 * wait and the lc3_decode call, keeping total decode time within
+			 * the interval budget. The queue check ensures a connecting device
+			 * is picked up on the very first frame it sends. */
+			if (!bis_ever_rx[i] && k_msgq_num_used_get(&uplink_rx_q[i]) == 0) {
+				dec_us[i] = 0;
+				continue;
+			}
+
 			struct uplink_frame frame;
 			int16_t stream_pcm[PCM_SAMPLES_PER_FRAME];
 
 			uint32_t t0 = k_cycle_get_32();
-			/* Wait for iso_recv to deliver the frame. The decoder wakes at the
-			 * I2S DMA boundary; the BLE RX subevent fires at a fixed phase offset
-			 * within the interval. Without this wait, frames arriving after the
-			 * I2S boundary appear as packet loss and trigger spurious PLC. */
-			bool got_frame = (k_msgq_get(&uplink_rx_q[i], &frame, K_USEC(3500)) == 0 &&
+			uint32_t remaining_us = (t0 < deadline_cyc)
+				? k_cyc_to_us_floor32(deadline_cyc - t0) : 0U;
+			bool got_frame = (k_msgq_get(&uplink_rx_q[i], &frame,
+						     remaining_us ? K_USEC(remaining_us)
+								  : K_NO_WAIT) == 0 &&
 					  frame.len > 0);
 
 			if (got_frame) {
@@ -524,7 +543,8 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				dbg_dec_err[i]++;
 			}
 
-			if (ret >= 0 && bis_ever_rx[i]) {
+			if (ret >= 0 && bis_ever_rx[i] &&
+			    dbg_plc_streak[i] <= PLC_MUTE_FRAMES) {
 				int16_t peak = 0;
 				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
 					int16_t a =
