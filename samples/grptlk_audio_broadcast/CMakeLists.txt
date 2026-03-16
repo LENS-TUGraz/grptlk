@@ -67,12 +67,13 @@ target_sources(app PRIVATE
   src/io/led.c
 )
 
-# CS47L63 codec sources (nrf5340_audio_dk only)
+# CS47L63 codec + HFCLKAUDIO clock sync sources (nrf5340_audio_dk only)
 if(CONFIG_HW_CODEC_CIRRUS_LOGIC)
   target_sources(app PRIVATE
     src/audio/backends/cs47l63.c
     src/audio/drivers/audio_i2s.c
     src/audio/drivers/cs47l63_comm.c
+    src/audio/sync/clk_sync.c
   )
 
   if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
