@@ -62,9 +62,13 @@
 #define MAX_STEP_PER_WINDOW 1
 
 /* Accumulated error threshold (µs over FILTER_FRAMES) to trigger a step.
- * 2 µs over 20 frames ≈ 20 ppm drift — real correction needed.
- * Below this we assume noise and do nothing. */
-#define CORRECTION_THRESH_US 2
+ * The BLE ticker runs at 32.768 kHz (1 tick = 30.5 µs).  A 5 ms BIG interval
+ * is 163.84 ticks, which rounds to 163 or 164 — producing ±25 µs quantisation
+ * noise in every anchor timestamp.  This noise is ~250× larger than the real
+ * 20 ppm crystal drift (0.1 µs/frame).  Setting the threshold above the noise
+ * ceiling (40 µs) means the PLL ignores ticker artefacts entirely and only
+ * corrects genuine multi-tick accumulated bias. */
+#define CORRECTION_THRESH_US 40
 
 /* Windup limit on the accumulated error (µs).
  * Caps to ±500 µs to handle startup or large one-off jitter events. */
@@ -78,8 +82,11 @@
 #define FREQ_MIN     0x8000u
 #define FREQ_MAX     0xBFFFu
 
-/* Lock: accumulated error over FILTER_FRAMES must be below this (µs). */
-#define LOCK_THRESH_US 2
+/* Lock: single-window accumulated error must be below this (µs).
+ * Must be < CORRECTION_THRESH_US (40) for hysteresis.  35 µs is just inside
+ * the 32kHz ticker noise ceiling (~37 µs max), so a freq sitting at the
+ * quantisation boundary with |window_err| ≤ 35 µs counts as locked. */
+#define LOCK_THRESH_US 35
 
 /* Number of consecutive filter windows within threshold before "locked". */
 #define LOCK_COUNT 20

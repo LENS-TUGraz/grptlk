@@ -59,8 +59,10 @@ BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
 	     "audio and audio_i2s block size must match");
 
 /* Threshold (absolute sample value) above which a mic channel is considered
- * active for auto-selection. Keeps silent channels from being chosen. */
-#define MIC_PEAK_DETECT_THRESHOLD 64
+ * active for auto-selection. Keeps silent channels from being chosen.
+ * 512 ≈ 1.5% FS — rejects background hiss (was 64 = 0.2% FS, too easily
+ * triggered by ambient noise causing wrong/noisy channel selection). */
+#define MIC_PEAK_DETECT_THRESHOLD 512
 
 /* --- State set by audio_init() ------------------------------------------- */
 

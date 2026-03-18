@@ -259,8 +259,11 @@ K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
 /* =========================================================================
  * Encoded uplink queue: encoder thread → iso_tx thread
  *
- * Still a K_MSGQ.  The iso_tx thread is the sole consumer and blocks on
- * tx_sem (not on this queue), so there is no ISR involvement here.
+ * Depth=1: safe once clk_sync has locked HFCLKAUDIO to the BLE anchor.
+ * After lock the encoder (DMA-clocked) and iso_tx (BIG-anchor-clocked) run
+ * from the same effective oscillator (±5 µs), so one slot is sufficient.
+ * During the ~10 s convergence window the drop-oldest policy discards the
+ * stale frame silently; iso_tx falls back to silence on underrun.
  * ========================================================================= */
 K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
 
@@ -408,6 +411,10 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	struct dl_slot slot;
 	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
 	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * AUDIO_CHANNELS];
+	static uint32_t rx_frame_cnt;
+	static uint32_t rx_plc_cnt;     /* frames decoded via PLC (no real packet) */
+	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
+	static uint32_t rx_drop_cnt;    /* tx_msgq drop-oldest (decoder > DMA rate) */
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -423,11 +430,16 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		const uint8_t *lc3_data = (got_frame && slot.len > 0U) ? slot.data : NULL;
 		const int      lc3_len  = (got_frame && slot.len > 0U) ? (int)slot.len : 0;
 
+		if (lc3_data == NULL) {
+			rx_plc_cnt++;
+		}
+
 		/* lc3_decode(NULL, 0, ...) runs PLC — smooth concealment, no click. */
 		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
 				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
 		if (ret < 0) {
 			memset(mono_pcm, 0, sizeof(mono_pcm));
+			rx_dec_err_cnt++;
 		}
 
 		/* Mono downlink → stereo (L = R). */
@@ -442,6 +454,17 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
 			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
+			rx_drop_cnt++;
+		}
+
+		if ((rx_frame_cnt++ % 200U) == 0U) {
+			printk("[rx] frame=%u plc=%u err=%u drop=%u tx_q=%u locked=%d\n",
+			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_drop_cnt,
+			       k_msgq_num_used_get(&tx_msgq),
+			       clk_sync_is_locked() ? 1 : 0);
+			rx_plc_cnt     = 0;
+			rx_dec_err_cnt = 0;
+			rx_drop_cnt    = 0;
 		}
 	}
 }
@@ -456,7 +479,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
 	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
 	const int octets_per_frame = preset_active.qos.sdu;
-	static uint32_t tx_drop_cnt;
+	static uint32_t enc_frame_cnt;
+	static uint32_t enc_drop_cnt; /* lc3_tx_q overflow events */
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -479,11 +503,14 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 			(void)k_msgq_get(&lc3_tx_q, drop, K_NO_WAIT);
 			(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT);
-			if (atomic_get(&uplink_tx_active) != 0 &&
-			    (tx_drop_cnt++ % 100U) == 0U) {
-				printk("Uplink encoded queue full, dropping oldest (cnt=%u)\n",
-				       tx_drop_cnt);
-			}
+			enc_drop_cnt++;
+		}
+
+		if ((enc_frame_cnt++ % 200U) == 0U) {
+			printk("[tx] frame=%u enc_drop=%u ul_q=%u\n",
+			       enc_frame_cnt, enc_drop_cnt,
+			       k_msgq_num_used_get(&lc3_tx_q));
+			enc_drop_cnt = 0;
 		}
 	}
 }
@@ -565,6 +592,22 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return err;
 	}
 
+	/* Feed the uplink TX anchor to clk_sync from thread context (not from
+	 * iso_sent BT callback — bt_iso_chan_get_tx_sync issues a synchronous
+	 * HCI command and must not be called from a BT event callback). */
+	struct bt_iso_tx_info tx_info;
+	static uint32_t tx_sync_fail_cnt;
+
+	if (bt_iso_chan_get_tx_sync(chan, &tx_info) == 0) {
+		clk_sync_anchor_notify(tx_info.ts);
+	} else {
+		tx_sync_fail_cnt++;
+		if ((tx_sync_fail_cnt % 50U) == 1U) {
+			printk("[clk] bt_iso_chan_get_tx_sync failed (cnt=%u)\n",
+			       tx_sync_fail_cnt);
+		}
+	}
+
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
 	return 0;
@@ -601,7 +644,9 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
 		downlink_ring_put(buf->data, (uint16_t)buf->len);
 		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
-		clk_sync_anchor_notify(info->ts);
+		/* clk_sync is fed from iso_sent() uplink TX anchors instead —
+		 * that directly tracks the rate at which iso_tx consumes encoded
+		 * frames, eliminating enc_drop with lc3_tx_q depth=1. */
 	} else {
 		downlink_ring_put(NULL, 0U); /* loss → PLC */
 	}
@@ -854,8 +899,12 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 	big_actual_num_bis  = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
 	big_sdu_interval_us = biginfo->sdu_interval;
 	big_max_sdu         = biginfo->max_sdu;
-	printk("BIG: %u BIS(es), sdu_interval=%u us, max_sdu=%u B, syncing to %u\n",
-	       biginfo->num_bis, big_sdu_interval_us, big_max_sdu, big_actual_num_bis);
+	/* Only print on first detection — callback fires every ~200 ms while
+	 * the PA scanner is active and would spam the log once synced. */
+	if (grptlk_big == NULL) {
+		printk("BIG: %u BIS(es), sdu_interval=%u us, max_sdu=%u B, syncing to %u\n",
+		       biginfo->num_bis, big_sdu_interval_us, big_max_sdu, big_actual_num_bis);
+	}
 	k_sem_give(&sem_per_big_info);
 }
 
