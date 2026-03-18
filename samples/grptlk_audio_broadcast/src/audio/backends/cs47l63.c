@@ -186,8 +186,6 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	    (left_peak > MIC_PEAK_DETECT_THRESHOLD ||
 	     right_peak > MIC_PEAK_DETECT_THRESHOLD)) {
 		selected_mic_channel = (right_peak > left_peak) ? 1 : 0;
-		printk("MIC channel auto-selected: %s\n",
-		       selected_mic_channel == 0 ? "LEFT" : "RIGHT");
 	}
 
 	ch = mic_channel_pick(left_peak, right_peak);
@@ -202,9 +200,18 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
  * clicks caused by the broadcaster ACLK / receiver BLE clock drift. */
 static uint32_t tx_last_frame[AUDIO_I2S_WORDS_PER_BLOCK];
 
+/* Underrun counter — incremented by tx_buffer_fill() on every DMA miss.
+ * Read and atomically cleared by audio_underrun_count_reset(). */
+static atomic_t g_underrun_cnt = ATOMIC_INIT(0);
+
+uint32_t audio_underrun_count_reset(void)
+{
+	return (uint32_t)atomic_set(&g_underrun_cnt, 0);
+}
+
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	static uint32_t underrun_cnt;
+	static uint32_t underrun_log_cnt;
 
 	if (playback_q != NULL &&
 	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) == 0) {
@@ -214,9 +221,10 @@ static void tx_buffer_fill(uint32_t *tx_words)
 		/* Queue empty: replay the last frame instead of silence to
 		 * avoid audible clicks from the ACLK/BLE clock drift. */
 		memcpy(tx_words, tx_last_frame, AUDIO_I2S_BLOCK_BYTES);
-		if ((underrun_cnt++ % 200U) == 0U) {
+		atomic_inc(&g_underrun_cnt);
+		if ((underrun_log_cnt++ % 200U) == 0U) {
 			printk("Uplink RX playback: replaying last frame (cnt=%u)\n",
-			       underrun_cnt);
+			       underrun_log_cnt);
 		}
 	}
 }

@@ -588,9 +588,6 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 						stream_pcm[s] = (int16_t)((int32_t)stream_pcm[s] *
 									  limit / peak);
 					}
-					printk("[lim] frame=%u bis%d %s peak=%d->%d\n",
-					       dec_frame_cnt, i + 2, ret == 1 ? "plc" : "real",
-					       peak, limit);
 				}
 				if (peak > dbg_peak[i]) {
 					dbg_peak[i] = peak;
@@ -633,15 +630,13 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		uint32_t total_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0_total);
-		if (total_us > 8000U) {
-			printk("[dec] LATE frame=%u total=%u us\n", dec_frame_cnt, total_us);
-		}
 		if ((dec_frame_cnt++ % 100U) == 0U) {
 			printk("[dec] frame=%u total=%u us active=%d mixed_peak=%d tx_q=%u "
-			       "mix_q=%u clip=%u active_chg=%u",
+			       "mix_q=%u clip=%u active_chg=%u underrun=%u locked=%d",
 			       dec_frame_cnt, total_us, active_streams, (int)mixed_peak,
 			       k_msgq_num_used_get(&tx_msgq), k_msgq_num_used_get(&uplink_mix_q),
-			       dbg_clip_cnt, dbg_active_change_cnt);
+			       dbg_clip_cnt, dbg_active_change_cnt,
+			       audio_underrun_count_reset(), clk_sync_is_locked() ? 1 : 0);
 			for (int j = 0; j < NUM_RX_BIS; j++) {
 				printk(" ref%d=%d", j, (int)dbg_last_real_peak[j]);
 			}
@@ -736,10 +731,6 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 		tx_frame_cnt++;
 
 		if ((tx_frame_cnt % 200U) == 0U) {
-			printk("[tx] frame=%u seq=%u lc3_q=%u silence=%u\n",
-			       tx_frame_cnt, seq_num,
-			       k_msgq_num_used_get(&lc3_encoded_q),
-			       tx_silence_cnt);
 			tx_silence_cnt = 0;
 		}
 	}
@@ -834,15 +825,6 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 				}
 				relay_frame_cnt++;
 				if ((relay_frame_cnt % 200U) == 0U) {
-					uint8_t energy = 0;
-
-					for (uint16_t b = 0; b < buf->len; b++) {
-						energy |= buf->data[b];
-					}
-					printk("[relay] frame=%u drop=%u lc3_q=%u energy=%s\n",
-					       relay_frame_cnt, relay_drop_cnt,
-					       k_msgq_num_used_get(&lc3_encoded_q),
-					       energy ? "nonzero" : "ZERO");
 					relay_drop_cnt = 0;
 				}
 			}

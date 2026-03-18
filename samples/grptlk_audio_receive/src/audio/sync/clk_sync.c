@@ -216,6 +216,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		}
 
 		if (step != 0) {
+			bool was_locked = atomic_get(&g_locked) != 0;
 			uint16_t new_freq = (uint16_t)CLAMP((int32_t)freq_value + step,
 							    (int32_t)FREQ_MIN,
 							    (int32_t)FREQ_MAX);
@@ -223,6 +224,9 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 				freq_value = new_freq;
 				nrfx_clock_hfclkaudio_config_set(freq_value);
 			}
+			printk("[clk] freq=0x%04x step=%+d err=%+d us%s\n",
+			       freq_value, (int)step, (int)window_err,
+			       was_locked ? " [UNLOCK]" : "");
 			lock_count = 0;
 			atomic_set(&g_locked, 0);
 		} else {
@@ -230,7 +234,8 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 			if (lock_count < LOCK_COUNT) {
 				lock_count++;
 			}
-			if (lock_count >= LOCK_COUNT) {
+			if (lock_count == LOCK_COUNT && !atomic_get(&g_locked)) {
+				printk("[clk] LOCKED freq=0x%04x\n", freq_value);
 				atomic_set(&g_locked, 1);
 			}
 		}

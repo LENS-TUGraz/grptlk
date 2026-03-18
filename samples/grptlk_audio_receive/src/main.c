@@ -20,15 +20,15 @@
  *  BLE radio (every 5 ms BIG anchor)
  *    └─ iso_recv() [BT ISO callback]
  *         writes LC3 frame into downlink_ring  [lock-free, 3 slots, no mutex]
- *    └─ lc3_decoder thread  [prio 3, 6144 B stack]
+ *    └─ lc3_decoder thread  [prio 1, 6144 B stack]
  *         reads downlink_ring → lc3_decode() → mono→stereo upmix
- *         → k_msgq_put(tx_msgq)  [depth 2, 320 bytes/item]
+ *         → k_msgq_put(tx_msgq)  [depth 1, 320 bytes/item]
  *    └─ DMA ISR (i2s_block_complete, every 5 ms)
  *         k_msgq_get(tx_msgq, K_NO_WAIT) → I2S TX DMA → CS47L63 DAC → speaker
  *
  *  Packet loss: iso_recv() writes a zero-length slot into the ring.
  *  The decoder thread calls lc3_decode(NULL) which runs PLC — no click.
- *  Timeout guard: if the ring is empty for >6 ms the decoder also runs PLC.
+ *  Timeout guard: if the ring is empty for >5.5 ms the decoder also runs PLC.
  *
  * UPLINK  microphone → BIS2..5
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -50,11 +50,11 @@
  * ISR calls into K_MSGQ at high interrupt priority — safe, but adds latency
  * and jitter from the lock acquisition.
  *
- * The lock-free triple-slot ring (3 atomic slots, write_idx / read_idx) avoids
+ * The lock-free dual-slot ring (2 atomic slots, write_idx / read_idx) avoids
  * all locking:
- *   - Producer writes to slot[write_idx % 3], then increments write_idx.
- *   - Consumer sees write_idx > read_idx, reads slot[read_idx % 3], increments.
- *   - With 3 slots the producer is always one frame ahead without aliasing.
+ *   - Producer writes to slot[write_idx % 2], then increments write_idx.
+ *   - Consumer sees write_idx > read_idx, reads slot[read_idx % 2], increments.
+ *   - With 2 slots the producer is always one frame ahead without aliasing.
  *   - Only atomic operations — no spinlock, no context-switch, ISR-safe.
  *
  * tx_msgq (decoder → DMA ISR) stays a K_MSGQ because:
@@ -74,7 +74,7 @@
  *
  *  After:  iso_recv() → ring_put (atomic, no lock) → decoder thread wakes
  *          → ring_get → lc3_decode → k_msgq_put(tx_msgq) → DMA ISR
- *          Worst case buffering: 1 × 5 ms (ring depth 3, one slot latency)
+ *          Worst case buffering: 1 × 5 ms (ring depth 2, one slot latency)
  *          Scheduling jitter: unchanged (thread woken by semaphore)
  *
  * PTT (push-to-talk)
@@ -87,7 +87,7 @@
  * --------------
  * Name          Priority  Stack    Blocking on
  * clk_sync         1      1024 B   clk_sync_sem (every BIG anchor, 5 ms)
- * lc3_decoder      3      6144 B   downlink_ring sem (5 ms timeout → PLC)
+ * lc3_decoder      1      6144 B   downlink_ring sem (5.5 ms timeout → PLC)
  * lc3_encoder      2      4096 B   uplink_ring sem (forever)
  * iso_tx           2      1024 B   tx_sem (forever)
  */
@@ -142,7 +142,7 @@
 
 /* LC3 worker thread parameters. */
 #define DECODER_STACK_SIZE   6144
-#define DECODER_PRIORITY     3
+#define DECODER_PRIORITY     1
 #define ENCODER_STACK_SIZE   4096
 #define ENCODER_PRIORITY     2
 #define TX_THREAD_STACK_SIZE 1024
@@ -157,13 +157,13 @@
  * Lock-free triple-slot ring buffers
  * =========================================================================
  *
- * Each ring has RING_SLOTS=3 slots.  One slot is "being written" (producer),
- * one is "newest complete" (in transit), one is "being read" (consumer).
- * With 3 slots, producer and consumer never share a slot — no lock needed.
+ * Each ring has RING_SLOTS=2 slots.  One slot is "being written" (producer),
+ * one is "being read" (consumer).
+ * With 2 slots, producer and consumer never share a slot — no lock needed.
  *
  * Protocol:
  *   write_idx  — producer increments after writing each slot
- *   read_idx   — consumer reads slot[read_idx % 3] when write_idx > read_idx
+ *   read_idx   — consumer reads slot[read_idx % 2] when write_idx > read_idx
  *   Both are atomic_t so the increment is visible across ISR/thread boundary.
  *
  * downlink_ring: iso_recv() [BT callback] → lc3_decoder thread
@@ -178,7 +178,7 @@
  * after each write; the consumer takes it before each read.
  */
 
-#define RING_SLOTS 3
+#define RING_SLOTS 2
 
 /* --- Downlink ring (BLE → decoder thread) --------------------------------- */
 
@@ -254,7 +254,7 @@ static void uplink_ring_get(int16_t *out)
  * Still a K_MSGQ because the DMA ISR consumes it with K_NO_WAIT (no block),
  * and the silence-inject fallback in cs47l63.c is cleaner with a queue.
  * ========================================================================= */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
 
 /* =========================================================================
  * Encoded uplink queue: encoder thread → iso_tx thread
@@ -386,7 +386,7 @@ static struct bt_iso_big_sync_param big_sync_param = {
 	.bis_channels = bis,
 	.num_bis      = BIS_ISO_CHAN_COUNT,
 	.bis_bitfield = BIT_MASK(BIS_ISO_CHAN_COUNT),
-	.mse          = BT_ISO_SYNC_MSE_ANY,
+	.mse          = 1,
 	.sync_timeout = 100,
 };
 
@@ -416,9 +416,9 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		/* Block up to 6 ms waiting for the next BLE frame.
+		/* Block up to 5.5 ms waiting for the next BLE frame.
 		 * If nothing arrives (packet loss or anchor jitter) run PLC. */
-		bool got_frame = downlink_ring_get(&slot, K_MSEC(6));
+		bool got_frame = downlink_ring_get(&slot, K_USEC(5500));
 
 		const uint8_t *lc3_data = (got_frame && slot.len > 0U) ? slot.data : NULL;
 		const int      lc3_len  = (got_frame && slot.len > 0U) ? (int)slot.len : 0;
