@@ -256,7 +256,11 @@ static int ptt_lock_init(void)
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=8 ms, rtn=2.
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=5 ms, rtn=1.
+ *
+ * RTN=1 (one retransmit) reduces BIG transport_latency from 8 ms to 5 ms,
+ * saving 3 ms mouth-to-ear.  RTN=2 was conservative; at close range RTN=1
+ * gives equivalent reliability.
  *
  * The receiver reads the vendor codec identity from the BASE and the transport
  * sizing from BIGInfo, so there is no need for extra private codec-config
@@ -265,8 +269,8 @@ static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
 	preset_active.qos.sdu      = GRPTLK_CODEC_SDU_BYTES;
-	preset_active.qos.latency  = 8U;
-	preset_active.qos.rtn      = 2U;
+	preset_active.qos.latency  = 5U;
+	preset_active.qos.rtn      = 1U;
 	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
 	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
 	preset_active.codec_cfg.vid = GRPTLK_VENDOR_VENDOR_ID;
@@ -293,11 +297,11 @@ K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
 K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
 #endif
-/* depth=2 required in both modes:
- * - Mixing: iso_sent fires at a fixed BLE-clock offset before the I2S DMA ISR;
- *   depth=1 causes tx_thread to race the encoder and underrun ~7% of frames.
- * - Relay: BIS1 TX subevent fires before BIS2 RX — same one-frame cushion needed. */
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
+/* depth=1: clk_sync slaves HFCLKAUDIO to the BLE BIG anchor, so the I2S DMA
+ * and iso_sent callbacks stay phase-locked.  The earlier depth=2 cushion was
+ * needed when the clocks could drift; with clk_sync locked the encoder always
+ * produces a frame before iso_sent fires, making depth=1 safe. */
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 1, 4);
 
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 struct uplink_frame {

@@ -265,7 +265,7 @@ K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
  * During the ~10 s convergence window the drop-oldest policy discards the
  * stale frame silently; iso_tx falls back to silence on underrun.
  * ========================================================================= */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
+K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 1, 4);
 
 /* =========================================================================
  * Uplink TX semaphore
