@@ -42,4 +42,9 @@ int audio_start(void);
  * Clamped to the CS47L63 register range. */
 int audio_volume_adjust(int8_t step_db);
 
+/* Returns the number of DAC underruns (freeze-frame injections) since the last
+ * call and resets the counter to zero.  Call once per log window from the
+ * decoder thread. */
+uint32_t audio_underrun_count_reset(void);
+
 #endif /* GRPTLK_AUDIO_H_ */

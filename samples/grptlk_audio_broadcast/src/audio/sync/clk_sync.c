@@ -176,12 +176,15 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		ts_prev = ts_now;
 
 		/* Runaway guard: discard measurements caused by BLE packet loss
-		 * or multi-interval scheduling gaps. */
+		 * or multi-interval scheduling gaps.  Keep FREQ_VALUE and lock
+		 * state unchanged — the oscillator didn't jump, we just missed
+		 * reference edges.  Resetting lock_count here would cause
+		 * permanent locked=0 whenever BLE air loss occurs (one missed
+		 * frame → next inter-arrival = N×5000 µs → guard fires → lock
+		 * reset → never accumulates 20 consecutive clean windows). */
 		if (phase_err > RUNAWAY_THRESH_US || phase_err < -RUNAWAY_THRESH_US) {
 			accum       = 0;
 			frame_count = 0;
-			lock_count  = 0;
-			atomic_set(&g_locked, 0);
 			continue;
 		}
 

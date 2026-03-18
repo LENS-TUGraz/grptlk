@@ -253,19 +253,33 @@ static void uplink_ring_get(int16_t *out)
  *
  * Still a K_MSGQ because the DMA ISR consumes it with K_NO_WAIT (no block),
  * and the silence-inject fallback in cs47l63.c is cleaner with a queue.
+ *
+ * Depth=1: one frame latency.  clk_sync keeps the decoder phase-locked to
+ * the BIG anchor so back-to-back decode bursts are eliminated in steady
+ * state.  A single drop during BIG-resync startup is acceptable.
  * ========================================================================= */
 K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
 
 /* =========================================================================
  * Encoded uplink queue: encoder thread → iso_tx thread
  *
- * Depth=1: safe once clk_sync has locked HFCLKAUDIO to the BLE anchor.
- * After lock the encoder (DMA-clocked) and iso_tx (BIG-anchor-clocked) run
- * from the same effective oscillator (±5 µs), so one slot is sufficient.
- * During the ~10 s convergence window the drop-oldest policy discards the
- * stale frame silently; iso_tx falls back to silence on underrun.
+ * Depth=2: absorbs residual back-to-back drains from rare get_tx_sync
+ * stalls (see uplink_send_next()).  When tx_thread drains twice in quick
+ * succession: first drain gets the queued frame (valid audio), second drain
+ * finds the queue empty → TX underrun (silence), but the encoder can still
+ * write its next frame to the now-empty slot without a full-queue enc_drop.
+ * In steady state the queue depth oscillates between 0 and 1 — the second
+ * slot is only ever used as a transient buffer during HCI stall recovery.
  * ========================================================================= */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 1, 4);
+K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
+
+/* Flush stale pre-PTT frames from the uplink encoded queue.
+ * Called from the PTT ISR/work-handler on activation so the encoder starts
+ * from a clean state and phase-racing drops are eliminated. */
+void uplink_tx_flush(void)
+{
+	k_msgq_purge(&lc3_tx_q);
+}
 
 /* =========================================================================
  * Uplink TX semaphore
@@ -290,7 +304,7 @@ static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu      = 20U;
-	preset_active.qos.rtn      = 2U;
+	preset_active.qos.rtn      = 1U;
 	/* qos.interval/qos.sdu are updated from BIGInfo before BIG sync. The
 	 * broadcast codec identity is logged from the BASE in periodic
 	 * advertising. */
@@ -415,6 +429,9 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	static uint32_t rx_plc_cnt;     /* frames decoded via PLC (no real packet) */
 	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
 	static uint32_t rx_drop_cnt;    /* tx_msgq drop-oldest (decoder > DMA rate) */
+	/* Last real-frame peak: limiter reference, initialised open so the first
+	 * frame is never clipped regardless of its level. */
+	static int16_t dl_last_peak = INT16_MAX / 4;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -442,6 +459,40 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			rx_dec_err_cnt++;
 		}
 
+		/* Limiter: per-sample clip at 8× recent peak. 8× preserves natural
+		 * speech transients (plosives can be 4-6× RMS) while still clipping
+		 * pathological PLC over-synthesis spikes. Per-sample clipping avoids
+		 * the audible dip caused by frame-level scaling. */
+		if (ret >= 0) {
+			int16_t peak = 0;
+
+			for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
+				int16_t a = mono_pcm[s] < 0 ? -mono_pcm[s] : mono_pcm[s];
+
+				if (a > peak) {
+					peak = a;
+				}
+			}
+			if (dl_last_peak < 64) {
+				dl_last_peak = 64;
+			}
+			int16_t limit = (int16_t)(dl_last_peak * 8 > INT16_MAX
+						  ? INT16_MAX : dl_last_peak * 8);
+
+			if (ret != 1) {
+				dl_last_peak = peak;
+			}
+			if (peak > limit) {
+				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
+					if (mono_pcm[s] > limit) {
+						mono_pcm[s] = limit;
+					} else if (mono_pcm[s] < -limit) {
+						mono_pcm[s] = (int16_t)(-limit);
+					}
+				}
+			}
+		}
+
 		/* Mono downlink → stereo (L = R). */
 		for (size_t i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
 			stereo_buf[2 * i]     = mono_pcm[i];
@@ -458,9 +509,10 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		if ((rx_frame_cnt++ % 200U) == 0U) {
-			printk("[rx] frame=%u plc=%u err=%u drop=%u tx_q=%u locked=%d\n",
+			printk("[rx] frame=%u plc=%u err=%u drop=%u tx_q=%u underrun=%u locked=%d\n",
 			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_drop_cnt,
 			       k_msgq_num_used_get(&tx_msgq),
+			       audio_underrun_count_reset(),
 			       clk_sync_is_locked() ? 1 : 0);
 			rx_plc_cnt     = 0;
 			rx_dec_err_cnt = 0;
@@ -491,6 +543,14 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		/* Block until the DMA ISR puts a new mic frame into the ring. */
 		uplink_ring_get(mono_pcm);
+
+		/* Skip encode when not transmitting — avoids filling lc3_tx_q
+		 * with frames nobody will send, which would cause enc_drop spam
+		 * and waste ~640 µs of CPU per frame while PTT is inactive.
+		 * The ring slot is consumed above so the DMA ISR never stalls. */
+		if (atomic_get(&ptt_active) == 0) {
+			continue;
+		}
 
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1,
 				 octets_per_frame, encoded_buf);
@@ -592,21 +652,11 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return err;
 	}
 
-	/* Feed the uplink TX anchor to clk_sync from thread context (not from
-	 * iso_sent BT callback — bt_iso_chan_get_tx_sync issues a synchronous
-	 * HCI command and must not be called from a BT event callback). */
-	struct bt_iso_tx_info tx_info;
-	static uint32_t tx_sync_fail_cnt;
-
-	if (bt_iso_chan_get_tx_sync(chan, &tx_info) == 0) {
-		clk_sync_anchor_notify(tx_info.ts);
-	} else {
-		tx_sync_fail_cnt++;
-		if ((tx_sync_fail_cnt % 50U) == 1U) {
-			printk("[clk] bt_iso_chan_get_tx_sync failed (cnt=%u)\n",
-			       tx_sync_fail_cnt);
-		}
-	}
+	/* clk_sync anchor is fed from iso_recv() (BIS1 downlink info->ts) —
+	 * no HCI call needed here.  bt_iso_chan_get_tx_sync() was removed
+	 * because its blocking HCI round-trip (1–10 ms) caused tx_sem to
+	 * accumulate across BIG events → back-to-back uplink_send_next()
+	 * → TX underrun + enc_drop. */
 
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
@@ -619,7 +669,14 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	if (chan != bis[0] && atomic_get(&ptt_active) != 0) {
+	/* Re-arm tx_sem only for the channel that tx_thread just sent on.
+	 * iso_sent fires for every uplink BIS (BIS2..5) on each BIG event,
+	 * but the encoder produces exactly one frame per 5 ms interval.
+	 * Giving tx_sem for all 4 channels would wake tx_thread 4× and drain
+	 * lc3_tx_q 4× — causing 3 TX underruns and racing with the encoder
+	 * on the 4th wake (→ enc_drop).  Gating on active_uplink_bis ensures
+	 * exactly one sem give per BIG event. */
+	if (chan == bis[active_uplink_bis] && atomic_get(&ptt_active) != 0) {
 		k_sem_give(&tx_sem);
 	}
 }
@@ -644,11 +701,18 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
 		downlink_ring_put(buf->data, (uint16_t)buf->len);
 		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
-		/* clk_sync is fed from iso_sent() uplink TX anchors instead —
-		 * that directly tracks the rate at which iso_tx consumes encoded
-		 * frames, eliminating enc_drop with lc3_tx_q depth=1. */
 	} else {
 		downlink_ring_put(NULL, 0U); /* loss → PLC */
+	}
+
+	/* Feed BIG anchor to clk_sync on every BIS1 frame (valid or not).
+	 * info->ts carries the same BIG anchor as bt_iso_chan_get_tx_sync()
+	 * but is available here for free — no HCI round-trip needed.
+	 * ISR-safe: clk_sync_anchor_notify() uses only atomic_set + k_sem_give.
+	 * Feeding every 5 ms keeps the 20-frame accumulation window filling at
+	 * the same rate as the original design, locking in ~2 s. */
+	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
+		clk_sync_anchor_notify(info->ts);
 	}
 
 	if (iso_datapaths_setup) {

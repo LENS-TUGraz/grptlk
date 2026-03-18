@@ -256,11 +256,11 @@ static int ptt_lock_init(void)
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
-/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=5 ms, rtn=1.
+/* LC3Plus 5 ms @ 16 kHz: interval=5000 us, sdu=20 bytes, latency=10 ms, rtn=2.
  *
- * RTN=1 (one retransmit) reduces BIG transport_latency from 8 ms to 5 ms,
- * saving 3 ms mouth-to-ear.  RTN=2 was conservative; at close range RTN=1
- * gives equivalent reliability.
+ * RTN=2 (two retransmits) reduces streak_max from 3-4 to 0-1 in burst-loss
+ * conditions, keeping PLC below the audible threshold.  Cost: +5ms latency
+ * vs RTN=1.
  *
  * The receiver reads the vendor codec identity from the BASE and the transport
  * sizing from BIGInfo, so there is no need for extra private codec-config
@@ -269,8 +269,11 @@ static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
 	preset_active.qos.sdu      = GRPTLK_CODEC_SDU_BYTES;
-	preset_active.qos.latency  = 5U;
-	preset_active.qos.rtn      = 1U;
+	/* rtn=2: two retransmit opportunities per BIG event. Reduces streak_max from
+	 * 3-4 to 0-1 in burst-loss conditions, keeping PLC below the audible threshold.
+	 * latency=10ms = (rtn+1)*interval = 3*5ms, the required minimum for rtn=2. */
+	preset_active.qos.latency  = 10U;
+	preset_active.qos.rtn      = 2U;
 	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
 	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
 	preset_active.codec_cfg.vid = GRPTLK_VENDOR_VENDOR_ID;
@@ -294,14 +297,21 @@ static void override_preset_for_lc3plus_5ms(void)
 /* Queues */
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
+/* Depth=2: one frame of slack between the uplink decoder thread and the
+ * DMA ISR.  Prevents DAC underruns when Zephyr scheduling jitter delays
+ * the decoder by a few µs — most visibly on PLC frames where the NULL-input
+ * LC3 path takes slightly longer.  Cost: +5 ms broadcaster speaker latency
+ * (imperceptible in walkie-talkie use). */
+K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
 K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
 #endif
-/* depth=1: clk_sync slaves HFCLKAUDIO to the BLE BIG anchor, so the I2S DMA
- * and iso_sent callbacks stay phase-locked.  The earlier depth=2 cushion was
- * needed when the clocks could drift; with clk_sync locked the encoder always
- * produces a frame before iso_sent fires, making depth=1 safe. */
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 1, 4);
+/* depth=2: absorbs the race between iso_sent() waking tx_thread and the
+ * encoder depositing the next frame.  iso_sent() calls k_sem_give(&tx_sem)
+ * before bt_iso_chan_get_tx_sync() returns, so tx_thread can preempt and
+ * drain the queue while the encoder is still running.  depth=2 ensures
+ * tx_thread always finds a frame (the previous interval's), eliminating
+ * [tx] underrun during lock acquisition and BIG-resync transients. */
+K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
 
 #ifndef CONFIG_GRPTLK_RELAY_ONLY
 struct uplink_frame {
@@ -534,12 +544,10 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			if (got_frame) {
 				dbg_rx_cnt[i]++;
 				bis_ever_rx[i] = true;
-				/* After a long dropout the LC3 codec emits a re-sync burst on
-				 * the first real frame. Open the limiter so it passes through
-				 * unclipped — clipping the burst produces worse artifacts. */
-				if (dbg_plc_streak[i] > 10) {
-					dbg_last_real_peak[i] = PCM_INT16_MAX / 4;
-				}
+				/* Re-sync burst after long dropout is clipped by the limiter
+				 * below (ref = last real speech peak, limit = ref×4). Clipping
+				 * a re-sync burst is inaudible; passing it through unclipped
+				 * causes a loud pop (peak can be 20× normal speech level). */
 				dbg_plc_streak[i] = 0;
 			} else if (bis_ever_rx[i]) {
 				dbg_plc_cnt[i]++;
@@ -579,18 +587,25 @@ static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				if (ref < 64) {
 					ref = 64;
 				}
+				/* 8× limit: speech plosives (p/b/t) can be 4–6× RMS; 8× preserves
+				 * natural transients while still clipping pathological spikes. */
 				int16_t limit =
-					(ret == 1) ? PCM_INT16_MAX   /* PLC: no limit — LC3 concealment is already safe */
-						   : (int16_t)(ref * 4 > PCM_INT16_MAX ? PCM_INT16_MAX : ref * 4);
+					(int16_t)(ref * 8 > PCM_INT16_MAX ? PCM_INT16_MAX : ref * 8);
 				if (ret != 1) {
 					/* Track actual speech peak — not the clamped value — so
 					 * ref ratchets up to real signal level within one window. */
 					dbg_last_real_peak[i] = peak;
 				}
 				if (peak > limit) {
+					/* Per-sample clip: only spikes get clipped; normal-level
+					 * samples pass through. Frame-scaling attenuates the whole
+					 * frame creating an audible dip. */
 					for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-						stream_pcm[s] = (int16_t)((int32_t)stream_pcm[s] *
-									  limit / peak);
+						if (stream_pcm[s] > limit) {
+							stream_pcm[s] = limit;
+						} else if (stream_pcm[s] < -limit) {
+							stream_pcm[s] = (int16_t)(-limit);
+						}
 					}
 				}
 				if (peak > dbg_peak[i]) {

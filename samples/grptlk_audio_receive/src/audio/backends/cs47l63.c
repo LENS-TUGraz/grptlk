@@ -291,10 +291,10 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
  *   audio, which is audible as a click/knock.  Repeating the last frame is
  *   perceptually inaudible for a single 5 ms gap and avoids the discontinuity.
  *   The DMA must never stall — either path always writes a full block. */
+static uint32_t underrun_window_cnt; /* per-window counter, reset by audio_underrun_count_reset() */
+
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	static uint32_t underrun_cnt;
-
 	if (playback_q != NULL &&
 	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) == 0) {
 		/* Fresh frame — save as freeze-frame reference. */
@@ -304,9 +304,15 @@ static void tx_buffer_fill(uint32_t *tx_words)
 
 	/* Queue empty: repeat last valid frame to avoid hard zero-crossing. */
 	memcpy(tx_words, tx_last_valid_buf, AUDIO_I2S_BLOCK_BYTES);
-	if ((underrun_cnt++ % 200U) == 0U) {
-		printk("Speaker: freeze-frame injected (cnt=%u)\n", underrun_cnt);
-	}
+	underrun_window_cnt++;
+}
+
+uint32_t audio_underrun_count_reset(void)
+{
+	uint32_t n = underrun_window_cnt;
+
+	underrun_window_cnt = 0;
+	return n;
 }
 
 /* --- DMA completion callback (runs at interrupt level) --------------------
