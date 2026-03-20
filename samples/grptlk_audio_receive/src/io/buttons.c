@@ -13,9 +13,6 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 
-/* Defined in main.c — flushes stale pre-PTT frames from lc3_tx_q. */
-extern void uplink_tx_flush(void);
-
 /* Volume step in dB per button press. */
 #define VOLUME_STEP_DB 3
 
@@ -53,7 +50,6 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 
 	if (gpio_pin_get_dt(&ptt_btn) > 0) {
 		atomic_set(&ptt_active, 1);
-		uplink_tx_flush();  /* discard stale pre-PTT frames */
 		clk_sync_reset();   /* restart lock detection (freq preserved) */
 		printk("[PTT] pressed\n");
 		k_sem_give(uplink_tx_sem);
@@ -119,14 +115,12 @@ static void ptt_lock_work_handler(struct k_work *work)
 		atomic_set(&ptt_lock_active, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
 		atomic_set(&ptt_active, 0);
-		uplink_tx_flush();  /* discard stale encoded frames */
 		printk("[PTT-LOCK] disabled — PTT mode active\n");
 	} else {
 		/* Lock: latch TX on. */
 		atomic_set(&ptt_lock_active, 1);
 		gpio_pin_set_dt(&ptt_lock_led, 1);
 		atomic_set(&ptt_active, 1);
-		uplink_tx_flush();  /* discard stale pre-PTT frames */
 		clk_sync_reset();   /* restart lock detection (freq preserved) */
 		k_sem_give(uplink_tx_sem);
 		printk("[PTT-LOCK] enabled — always transmitting\n");

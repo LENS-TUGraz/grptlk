@@ -6,14 +6,12 @@
  *
  * Slaves the nRF5340 HFCLKAUDIO fractional PLL to the BLE BIG anchor
  * timestamps delivered by iso_recv().  A dedicated high-priority thread
- * (prio 1) wakes on each anchor, measures the inter-arrival interval error
- * against the expected 5000 µs, and trims FREQ_VALUE via
- * nrfx_clock_hfclkaudio_config_set() to eliminate clock drift between the
- * BLE radio crystal and the CS47L63 I2S BCLK.
+ * (prio 1) wakes on each anchor and uses the ring buffer level to detect
+ * clock drift, trimming FREQ_VALUE via nrfx_clock_hfclkaudio_config_set()
+ * to eliminate clock drift between the BLE radio crystal and the CS47L63 I2S BCLK.
  *
- * The PI controller drives the steady-state phase error below ±5 µs, which
- * is well within one sample period at 16 kHz (62.5 µs), preventing DMA
- * starvation or overflow glitches over arbitrarily long sessions.
+ * Phase D: Uses ring buffer level (decoder vs DMA rate) instead of I2S
+ * timestamp comparison for more reliable drift detection.
  */
 
 #include <stdint.h>
@@ -42,9 +40,13 @@ void clk_sync_anchor_notify(uint32_t ts_us);
 void clk_sync_reset(void);
 
 /*
- * Returns true when |phase_err| < 5 µs for 20 consecutive BIG intervals
- * (~100 ms).  Suitable for gating a "sync acquired" LED or log message.
+ * Returns true when ring level stays within ±2 blocks of target for
+ * LOCK_COUNT consecutive BIG intervals (~100 ms).  Suitable for gating
+ * a "sync acquired" LED or log message.
  */
 bool clk_sync_is_locked(void);
+
+/* clk_sync_i2s_notify() and clk_sync_drift_error_get() removed in Phase D —
+ * ring buffer level is used for drift detection instead. */
 
 #endif /* CLK_SYNC_H_ */

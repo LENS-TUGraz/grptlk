@@ -15,13 +15,14 @@
  *
  * DMA ISR responsibilities (cheap, ISR-safe)
  * ------------------------------------------
- * Uplink:   extract one mic channel from the 80-word stereo RX block → write
- *           mono PCM into the uplink ring (atomic slot index + memcpy).
- *           The encoder thread wakes via a semaphore and calls lc3_encode().
+ * Uplink:   extract one mic channel from the 16-word stereo RX block,
+ *           accumulate 5 × 1ms blocks into one 80-sample mono frame,
+ *           then call rx_cb() → uplink ring → encoder thread → lc3_encode().
  *
- * Downlink: drain the playback queue (K_MSGQ, K_NO_WAIT) for stereo PCM →
- *           write into the next I2S TX DMA buffer.  The decoder thread
- *           calls lc3_decode() and puts the result into the playback queue.
+ * Downlink: read one 1ms stereo block from the ring buffer (volatile index
+ *           check + memcpy) → write into the next I2S TX DMA buffer.
+ *           The decoder thread calls lc3_decode() and splits the 5ms frame
+ *           into 5 × 1ms blocks in the ring buffer.
  *
  * Clock note
  * ----------
@@ -29,11 +30,15 @@
  * from the nRF5340 HFCLKAUDIO (12.288 MHz fractional PLL).  This makes the
  * DMA tick deterministic: exactly 80 stereo samples @ 16 kHz every 5 ms.
  *
- * I2S transfer: 80 samples × 2 ch × 2 bytes = 320 bytes per 5 ms block.
+ * I2S transfer: 16 samples × 1 word (stereo packed) = 64 bytes per 1 ms block.
  * Double-buffering: buf_a is in flight while buf_b is being prepared, then swap.
  */
 
 #include "audio/audio.h"
+
+#ifndef CONFIG_GRPTLK_RELAY_ONLY
+#include "audio/sync/clk_sync.h"
+#endif
 
 #include <errno.h>
 #include <stdbool.h>
@@ -53,10 +58,10 @@
 
 BUILD_ASSERT(AUDIO_SAMPLE_RATE_HZ == AUDIO_I2S_SAMPLE_RATE_HZ,
 	     "audio and audio_i2s sample rate must match");
-BUILD_ASSERT(AUDIO_SAMPLES_PER_FRAME == AUDIO_I2S_SAMPLES_PER_BLOCK,
-	     "audio and audio_i2s frame size must match");
-BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
-	     "audio and audio_i2s block size must match");
+/* I2S block size (1ms = 16 samples) is now decoupled from the LC3 frame size
+ * (5ms = 80 samples).  The ring buffer bridges the two cadences. */
+BUILD_ASSERT(AUDIO_I2S_SAMPLES_PER_BLOCK == AUDIO_BLK_SAMPLES_MONO,
+	     "I2S block size must equal 1ms block size");
 
 /* Threshold (absolute sample value) above which a mic channel is considered
  * active for auto-selection. Keeps silent channels from being chosen.
@@ -70,8 +75,8 @@ BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
  * Must write into a lock-free ring — no blocking allowed. */
 static audio_rx_cb_t rx_cb;
 
-/* Stereo PCM frames produced by the decoder thread, consumed by the DMA ISR. */
-static struct k_msgq *playback_q;
+/* Ring buffer: stereo 1ms I2S blocks, produced by decoder thread, consumed by DMA ISR. */
+static struct audio_ring *ring;
 
 static bool is_initialized;
 static bool is_started;
@@ -85,7 +90,7 @@ static uint32_t i2s_tx_buf_a[AUDIO_I2S_WORDS_PER_BLOCK];
 static uint32_t i2s_tx_buf_b[AUDIO_I2S_WORDS_PER_BLOCK];
 
 /* Last successfully played stereo PCM block.
- * Used as freeze-frame on tx_msgq underrun instead of hard-zero silence.
+ * Used as freeze-frame on ring buffer underrun instead of hard-zero silence.
  * Written and read only from tx_buffer_fill() which runs in DMA ISR context
  * (single-threaded) — no locking needed.
  * Initialised to zero (BSS), so the very first underrun still produces silence. */
@@ -97,14 +102,27 @@ static cs47l63_t codec_driver;
  *  0 = left channel forced.   1 = right channel forced. */
 static int selected_mic_channel = -1;
 
+/* Debug counters (reset on audio_init). */
+static uint32_t i2s_rx_block_cnt;
+static uint32_t rx_cb_call_cnt;
+
 /* Work item to log mic channel selection outside of ISR context. */
 static struct k_work mic_ch_log_work;
+static struct k_work debug_log_work;
 
 static void mic_ch_log_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	printk("MIC channel auto-selected: %s\n",
-	       selected_mic_channel == 0 ? "LEFT" : "RIGHT");
+	printk("[MIC] channel auto-selected: %s (L=%d,R=%d at sel)\n",
+	       selected_mic_channel == 0 ? "LEFT" : "RIGHT",
+	       selected_mic_channel);
+}
+
+static void debug_log_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	printk("[I2S] rx_blocks=%u, rx_cb_calls=%u, mic_ch=%d\n",
+	       i2s_rx_block_cnt, rx_cb_call_cnt, selected_mic_channel);
 }
 
 /* --- Codec register helpers ----------------------------------------------- */
@@ -241,11 +259,16 @@ static void extract_selected_channel_to_mono(const uint32_t *rx_words, int16_t *
 	}
 }
 
-/* Called from the DMA ISR with one RX block (80 stereo words).
+/* --- Mic accumulator: 5 × 1ms blocks → 1 × 5ms frame for uplink ---------- */
+static int16_t mic_accum[AUDIO_SAMPLES_PER_FRAME]; /* 80 samples */
+static uint8_t mic_accum_count;                      /* 0..AUDIO_BLKS_PER_FRAME-1 */
+
+/* Called from the DMA ISR with one RX block (16 stereo words, 1ms).
  *
  * Auto-selects the louder mic channel on first speech, then extracts it to
- * mono and calls rx_cb().  rx_cb() writes into the uplink ring (lock-free,
- * atomic slot index + memcpy) — safe to call from ISR context.
+ * mono and accumulates into mic_accum[].  Every AUDIO_BLKS_PER_FRAME (5)
+ * blocks, calls rx_cb() with a full 80-sample mono frame — keeping the
+ * entire uplink chain (encoder, iso_tx) completely unchanged.
  *
  * Note: printk is NOT called here even for the channel-select message,
  * because printk from ISR context can trigger deferred logging which
@@ -253,9 +276,11 @@ static void extract_selected_channel_to_mono(const uint32_t *rx_words, int16_t *
  * is logged once from the encoder thread instead. */
 static void i2s_process_rx_block(const uint32_t *rx_words)
 {
-	int16_t mono_frame[AUDIO_SAMPLES_PER_FRAME];
+	int16_t mono_1ms[AUDIO_BLK_SAMPLES_MONO]; /* 16 samples */
 	int32_t left_peak;
 	int32_t right_peak;
+
+	i2s_rx_block_cnt++;
 
 	stereo_peak_analyze_words(rx_words, &left_peak, &right_peak);
 
@@ -273,37 +298,58 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 
 	uint8_t ch = (selected_mic_channel >= 0) ? (uint8_t)selected_mic_channel : 0U;
 
-	extract_selected_channel_to_mono(rx_words, mono_frame, ch);
+	extract_selected_channel_to_mono(rx_words, mono_1ms, ch);
 
-	if (rx_cb != NULL) {
-		rx_cb(mono_frame);
+	/* Accumulate 1ms blocks into a 5ms frame for the uplink encoder. */
+	memcpy(&mic_accum[mic_accum_count * AUDIO_BLK_SAMPLES_MONO],
+	       mono_1ms, AUDIO_BLK_SAMPLES_MONO * sizeof(int16_t));
+	mic_accum_count++;
+
+	if (mic_accum_count >= AUDIO_BLKS_PER_FRAME) {
+		mic_accum_count = 0;
+		rx_cb_call_cnt++;
+		if (rx_cb != NULL) {
+			rx_cb(mic_accum); /* 80-sample frame, same as before */
+		}
+		/* Periodic debug logging every 200 frames (1 second). */
+		if ((rx_cb_call_cnt % 200U) == 0U) {
+			k_work_submit(&debug_log_work);
+		}
 	}
 }
 
 /* --- Downlink: speaker playback (called from DMA ISR) --------------------- */
 
-/* Fill the next TX DMA buffer from the playback queue.
+/* Fill the next TX DMA buffer from the ring buffer.
  * On success: save a copy as the freeze-frame reference.
- * On underrun: repeat the last valid frame instead of injecting silence.
+ * On underrun: repeat the last valid block instead of injecting silence.
  *
  * Why freeze-frame instead of silence:
- *   Silence (hard zero) causes a 5 ms amplitude step from live audio → 0 → live
- *   audio, which is audible as a click/knock.  Repeating the last frame is
- *   perceptually inaudible for a single 5 ms gap and avoids the discontinuity.
+ *   Silence (hard zero) causes a 1 ms amplitude step from live audio → 0 → live
+ *   audio, which is audible as a click/knock.  Repeating the last block is
+ *   perceptually inaudible for a single 1 ms gap and avoids the discontinuity.
  *   The DMA must never stall — either path always writes a full block. */
 static uint32_t underrun_window_cnt; /* per-window counter, reset by audio_underrun_count_reset() */
 
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	if (playback_q != NULL &&
-	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) == 0) {
-		/* Fresh frame — save as freeze-frame reference. */
-		memcpy(tx_last_valid_buf, tx_words, AUDIO_I2S_BLOCK_BYTES);
-		return;
+	if (ring != NULL) {
+		uint16_t ci = *ring->cons_idx;
+		uint16_t pi = *ring->prod_idx;
+
+		if (ci != pi) {
+			memcpy(tx_words, ring->fifo[ci],
+			       AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+			memcpy(tx_last_valid_buf, ring->fifo[ci],
+			       AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+			*ring->cons_idx = (ci + 1U) % ring->num_blks;
+			return;
+		}
 	}
 
-	/* Queue empty: repeat last valid frame to avoid hard zero-crossing. */
-	memcpy(tx_words, tx_last_valid_buf, AUDIO_I2S_BLOCK_BYTES);
+	/* Ring empty: repeat last valid block to avoid hard zero-crossing. */
+	memcpy(tx_words, tx_last_valid_buf,
+	       AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
 	underrun_window_cnt++;
 }
 
@@ -317,21 +363,22 @@ uint32_t audio_underrun_count_reset(void)
 
 /* --- DMA completion callback (runs at interrupt level) --------------------
  *
- * Called by audio_i2s every 5 ms when one DMA block completes.
+ * Called by audio_i2s every 1 ms when one DMA block completes.
  *
  * rx_buf_released: the RX buffer the DMA just finished writing into.
  * tx_buf_released: the TX buffer the DMA just finished reading (ignored here,
  *                  because we always overwrite the next buffer before queuing).
  *
  * Sequence each call:
- *   1. i2s_process_rx_block(): extract mono mic frame → rx_cb() → uplink ring
- *   2. tx_buffer_fill():        drain playback_q → next I2S TX DMA buffer
- *   3. audio_i2s_set_next_buf(): re-arm DMA for the next 5 ms block
+ *   1. i2s_process_rx_block(): extract 16 mono samples, accumulate into 5ms frame
+ *   2. tx_buffer_fill():        read 1 block from ring buffer → I2S TX DMA
+ *   3. audio_i2s_set_next_buf(): re-arm DMA for the next 1 ms block
  *
- * ISR time budget: mic extract (~0.05 ms) + queue get (~0.01 ms) << 5 ms tick.
+ * ISR time budget: mic extract (~0.01 ms) + ring memcpy (~0.01 ms) << 1 ms tick.
  * LC3 encode/decode happen in threads with their own stacks — not here.
  */
-static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf_released)
+static void i2s_block_complete(uint32_t *rx_buf_released,
+			      const uint32_t *tx_buf_released)
 {
 	static uint32_t i2s_requeue_err_cnt;
 	static uint8_t  tx_buf_sel;
@@ -343,6 +390,9 @@ static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf
 	if (rx_buf_released != NULL) {
 		i2s_process_rx_block(rx_buf_released);
 	}
+
+	/* I2S timestamp drift measurement removed — use ring buffer level
+	 * in clk_sync module instead for more reliable drift detection. */
 
 	/* Alternate between tx_buf_a and tx_buf_b so one is always in flight. */
 	next_tx_buf = (tx_buf_sel == 0U) ? i2s_tx_buf_a : i2s_tx_buf_b;
@@ -391,13 +441,13 @@ int audio_volume_adjust(int8_t step_db)
 	return 0;
 }
 
-/* Initialise the codec and store the playback queue and mic callback.
+/* Initialise the codec and store the playback ring buffer and mic callback.
  * Must be called before audio_start(). */
-int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
+int audio_init(struct audio_ring *playback_ring, audio_rx_cb_t mono_rx_cb)
 {
 	int err;
 
-	if (tx_q == NULL || mono_rx_cb == NULL) {
+	if (playback_ring == NULL || mono_rx_cb == NULL) {
 		return -EINVAL;
 	}
 
@@ -405,11 +455,17 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		return 0;
 	}
 
-	playback_q           = tx_q;
+	ring                 = playback_ring;
 	rx_cb                = mono_rx_cb;
 	selected_mic_channel = -1;
+	mic_accum_count      = 0;
 
 	k_work_init(&mic_ch_log_work, mic_ch_log_work_handler);
+	k_work_init(&debug_log_work, debug_log_work_handler);
+
+	/* Reset debug counters. */
+	i2s_rx_block_cnt = 0;
+	rx_cb_call_cnt = 0;
 
 	err = codec_mic_path_prepare();
 	if (err) {
@@ -421,7 +477,7 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 }
 
 /* Start the I2S DMA engine and the FLL.  After this returns the
- * i2s_block_complete callback fires every 5 ms driving both audio paths. */
+ * i2s_block_complete callback fires every 1 ms driving both audio paths. */
 int audio_start(void)
 {
 	int err;
@@ -468,7 +524,7 @@ int audio_start(void)
 		return err;
 	}
 
-	printk("I2S RX/TX started (CS47L63, ACLK 12.288 MHz, 16 kHz 5 ms blocks)\n");
+	printk("I2S RX/TX started (CS47L63, ACLK 12.288 MHz, 16 kHz 1 ms blocks)\n");
 	is_started = true;
 	return 0;
 }

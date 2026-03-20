@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define AUDIO_I2S_SAMPLE_RATE_HZ      16000U
-#define AUDIO_I2S_FRAME_DURATION_MS   5U
+#define AUDIO_I2S_FRAME_DURATION_MS   1U
 #define AUDIO_I2S_CHANNELS            2U
 #define AUDIO_I2S_BITS_PER_SAMPLE     16U
 #define AUDIO_I2S_SAMPLES_PER_BLOCK \
@@ -22,6 +22,8 @@
 #define AUDIO_I2S_BLOCK_BYTES \
 	(AUDIO_I2S_SAMPLES_PER_BLOCK * AUDIO_I2S_CHANNELS * (AUDIO_I2S_BITS_PER_SAMPLE / 8U))
 
+/* Callback receives the RX and TX buffers released by DMA completion.
+ * Called from I2S interrupt context every 1ms. */
 typedef void (*audio_i2s_blk_cb_t)(uint32_t *rx_buf_released,
 				   const uint32_t *tx_buf_released);
 

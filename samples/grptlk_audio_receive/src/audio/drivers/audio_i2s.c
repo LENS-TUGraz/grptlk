@@ -60,6 +60,8 @@ static void i2s_comp_handler(nrfx_i2s_buffers_t const *released_bufs, uint32_t s
 {
 	if ((status == NRFX_I2S_STATUS_NEXT_BUFFERS_NEEDED) && released_bufs && blk_cb &&
 	    (released_bufs->p_rx_buffer || released_bufs->p_tx_buffer)) {
+		/* Timestamp capture removed in Phase D — ring buffer level
+		 * is used for drift detection instead. */
 		blk_cb(released_bufs->p_rx_buffer, released_bufs->p_tx_buffer);
 	}
 }

@@ -12,70 +12,46 @@
  * This file wires together the BLE BIG receiver, the LC3 codec threads, and
  * the audio backend (CS47L63 on nRF5340 Audio DK).
  *
- * Audio data flows — Phase 1 (lock-free rings, LC3 in threads)
- * -------------------------------------------------------------
+ * Audio data flows — Phase 2 (minimal latency uplink)
+ * ---------------------------------------------------
  *
- * DOWNLINK  BIS1 → speaker
- * ~~~~~~~~~~~~~~~~~~~~~~~~
+ * DOWNLINK  BIS1 → speaker  (1ms I2S ring buffer architecture)
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *  BLE radio (every 5 ms BIG anchor)
  *    └─ iso_recv() [BT ISO callback]
- *         writes LC3 frame into downlink_ring  [lock-free, 3 slots, no mutex]
+ *         writes LC3 frame into encoded_frame_q  [K_MSGQ, depth 4]
  *    └─ lc3_decoder thread  [prio 1, 6144 B stack]
- *         reads downlink_ring → lc3_decode() → mono→stereo upmix
- *         → k_msgq_put(tx_msgq)  [depth 1, 320 bytes/item]
- *    └─ DMA ISR (i2s_block_complete, every 5 ms)
- *         k_msgq_get(tx_msgq, K_NO_WAIT) → I2S TX DMA → CS47L63 DAC → speaker
+ *         reads encoded_frame_q → lc3_decode() → split 80 mono samples
+ *         into 5 × 16-sample stereo blocks → ring buffer  [12 × 1ms slots]
+ *    └─ DMA ISR (i2s_block_complete, every 1 ms)
+ *         reads 1 block from ring buffer → I2S TX DMA → CS47L63 DAC → speaker
  *
- *  Packet loss: iso_recv() writes a zero-length slot into the ring.
+ *  Packet loss: iso_recv() writes a zero-length frame into encoded_frame_q.
  *  The decoder thread calls lc3_decode(NULL) which runs PLC — no click.
- *  Timeout guard: if the ring is empty for >5.5 ms the decoder also runs PLC.
  *
- * UPLINK  microphone → BIS2..5
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * UPLINK  microphone → BIS2..5  (minimal latency architecture)
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *  CS47L63 PDM mic → I2S DMA RX (every 5 ms)
  *    └─ DMA ISR: i2s_process_rx_block() → audio_rx_mono_frame() [rx_cb]
- *         writes mono PCM into uplink_ring  [lock-free, 3 slots, no mutex]
+ *         copies mic PCM to mic_pcm_shared  [shared buffer, sem-synced]
  *    └─ lc3_encoder thread  [prio 2, 4096 B stack]
- *         reads uplink_ring → lc3_encode()
- *         → k_msgq_put(lc3_tx_q)  [depth 2, 20 bytes/item, drop-oldest]
+ *         waits for mic_frame_sem → lc3_encode()
+ *         → stores in encoded_shared → signals tx_sem
  *    └─ iso_tx thread  [prio 2, 1024 B stack]
- *         k_sem_take(tx_sem) ← armed by iso_sent() or kickstart in iso_recv()
- *         bt_iso_chan_send(uplink_bis, encoded_frame)
+ *         waits for tx_sem → bt_iso_chan_send(encoded_shared)
  *    └─ iso_sent() [BT ISO callback]
  *         re-arms tx_sem while ptt_active — self-sustaining send chain
  *
- * Why lock-free rings instead of K_MSGQ for mic and downlink
- * -----------------------------------------------------------
- * K_MSGQ uses an internal spinlock and copies data under that lock.  The DMA
- * ISR calls into K_MSGQ at high interrupt priority — safe, but adds latency
- * and jitter from the lock acquisition.
+ * Uplink latency: ~5-6ms (mic capture + encode + direct send)
+ * Previous architecture: ~25-30ms (3-slot uplink_ring + 2-slot lc3_tx_q)
  *
- * The lock-free dual-slot ring (2 atomic slots, write_idx / read_idx) avoids
- * all locking:
- *   - Producer writes to slot[write_idx % 2], then increments write_idx.
- *   - Consumer sees write_idx > read_idx, reads slot[read_idx % 2], increments.
- *   - With 2 slots the producer is always one frame ahead without aliasing.
- *   - Only atomic operations — no spinlock, no context-switch, ISR-safe.
+ * Downlink audio datapath (1ms ring buffer architecture)
+ * -------------------------------------------------------
+ * iso_recv() → encoded_frame_q (K_MSGQ depth 4) → decoder thread
+ * → lc3_decode() → 5 × 1ms stereo blocks → ring_fifo (12 slots)
+ * → DMA ISR (every 1ms) reads 1 block → I2S TX DMA → speaker
  *
- * tx_msgq (decoder → DMA ISR) stays a K_MSGQ because:
- *   - The DMA ISR uses K_NO_WAIT (never blocks), so latency is minimal.
- *   - The decoder thread uses K_NO_WAIT + drop-oldest, matching the old design.
- *   - Keeping it as K_MSGQ makes the silence-inject path in cs47l63.c simple.
- *
- * lc3_tx_q (encoder → iso_tx thread) stays a K_MSGQ because:
- *   - iso_tx blocks on tx_sem, not on the queue — it only queue-gets after
- *     the semaphore fires, so there is no ISR involvement at all.
- *
- * Latency improvement vs the original K_MSGQ design
- * --------------------------------------------------
- *  Before: iso_recv() → k_msgq_put(lc3_rx_q) → wake decoder thread
- *          → k_msgq_get → lc3_decode → k_msgq_put(tx_msgq) → DMA ISR
- *          Worst case buffering: 2 × 5 ms (queue depth) + scheduling jitter
- *
- *  After:  iso_recv() → ring_put (atomic, no lock) → decoder thread wakes
- *          → ring_get → lc3_decode → k_msgq_put(tx_msgq) → DMA ISR
- *          Worst case buffering: 1 × 5 ms (ring depth 2, one slot latency)
- *          Scheduling jitter: unchanged (thread woken by semaphore)
+ * Decode-to-speaker latency: 1–2ms (vs 5–10ms with old 5ms msgq path).
  *
  * PTT (push-to-talk)
  * ------------------
@@ -87,8 +63,8 @@
  * --------------
  * Name          Priority  Stack    Blocking on
  * clk_sync         1      1024 B   clk_sync_sem (every BIG anchor, 5 ms)
- * lc3_decoder      1      6144 B   downlink_ring sem (5.5 ms timeout → PLC)
- * lc3_encoder      2      4096 B   uplink_ring sem (forever)
+ * lc3_decoder      1      6144 B   encoded_frame_q (K_FOREVER)
+ * lc3_encoder      2      4096 B   mic_frame_sem (forever)
  * iso_tx           2      1024 B   tx_sem (forever)
  */
 
@@ -127,7 +103,6 @@
  * from BIGInfo (big_sdu_interval_us / big_max_sdu) and applied to preset_active.qos. */
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
-#define BLOCK_BYTES           AUDIO_BLOCK_BYTES
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
 #define PA_RETRY_COUNT      6
@@ -166,8 +141,8 @@
  *   read_idx   — consumer reads slot[read_idx % 2] when write_idx > read_idx
  *   Both are atomic_t so the increment is visible across ISR/thread boundary.
  *
- * downlink_ring: iso_recv() [BT callback] → lc3_decoder thread
- *   Slot holds one LC3-encoded frame (≤20 bytes) + its length.
+ * encoded_frame_q: iso_recv() [BT callback] → lc3_decoder thread
+ *   K_MSGQ of encoded LC3 frames (≤20 bytes each) + length.
  *   len=0 means packet loss → decoder calls lc3_decode(NULL) → PLC.
  *
  * uplink_ring: DMA ISR (i2s_process_rx_block) → lc3_encoder thread
@@ -178,108 +153,60 @@
  * after each write; the consumer takes it before each read.
  */
 
-#define RING_SLOTS 2
+/* --- Downlink encoded frame queue (BLE → decoder thread) ------------------ */
 
-/* --- Downlink ring (BLE → decoder thread) --------------------------------- */
-
-struct dl_slot {
-	uint16_t len;                      /* 0 = loss/PLC */
+struct encoded_frame {
+	uint16_t len;                        /* 0 = loss/PLC */
 	uint8_t  data[CONFIG_BT_ISO_TX_MTU];
 };
 
-static struct dl_slot  downlink_slots[RING_SLOTS];
-static atomic_t        downlink_write_idx = ATOMIC_INIT(0);
-static atomic_t        downlink_read_idx  = ATOMIC_INIT(0);
-static K_SEM_DEFINE(   downlink_sem, 0, RING_SLOTS);
+K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct encoded_frame), 1, 1);
 
-static void downlink_ring_put(const uint8_t *data, uint16_t len)
-{
-	atomic_val_t   idx  = atomic_get(&downlink_write_idx);
-	struct dl_slot *slot = &downlink_slots[idx % RING_SLOTS];
+/* --- Downlink playback ring buffer (decoder thread → DMA ISR) ------------- */
+/* Circular FIFO of 1ms stereo I2S blocks.
+ * Producer: decoder thread (5 blocks per frame).
+ * Consumer: I2S DMA ISR (1 block per 1ms). */
+static uint32_t ring_fifo[AUDIO_RING_NUM_BLKS][AUDIO_BLK_SAMPLES_MONO];
+volatile uint16_t ring_prod_idx;
+volatile uint16_t ring_cons_idx;
 
-	slot->len = len;
-	if (len > 0U && data != NULL) {
-		memcpy(slot->data, data, len);
-	}
-	atomic_set(&downlink_write_idx, idx + 1);
-	k_sem_give(&downlink_sem);
-}
+static struct audio_ring playback_ring = {
+	.fifo     = ring_fifo,
+	.prod_idx = &ring_prod_idx,
+	.cons_idx = &ring_cons_idx,
+	.num_blks = AUDIO_RING_NUM_BLKS,
+};
 
-/* Called from the decoder thread.  Blocks up to timeout waiting for a slot. */
-static bool downlink_ring_get(struct dl_slot *out, k_timeout_t timeout)
-{
-	if (k_sem_take(&downlink_sem, timeout) != 0) {
-		return false; /* timeout → caller runs PLC */
-	}
-	atomic_val_t ridx = atomic_get(&downlink_read_idx);
+#define RING_NEXT(i) (((i) + 1U) % AUDIO_RING_NUM_BLKS)
+#define RING_FILLED() /* single-producer/single-consumer safe */ \
+	((ring_prod_idx >= ring_cons_idx) \
+		? (ring_prod_idx - ring_cons_idx) \
+		: (AUDIO_RING_NUM_BLKS - ring_cons_idx + ring_prod_idx))
 
-	*out = downlink_slots[ridx % RING_SLOTS];
-	atomic_set(&downlink_read_idx, ridx + 1);
-	return true;
-}
+/* --- Uplink: minimal latency shared buffers ------------------------------ */
+/*
+ * DMA ISR (cs47l63.c) accumulates 5×1ms blocks into mic_accum[], then calls
+ * audio_rx_mono_frame() which copies to mic_pcm_shared and signals encoder.
+ * Encoder reads mic_pcm_shared, encodes to encoded_shared, signals TX thread.
+ * TX thread reads encoded_shared and sends via bt_iso_chan_send().
+ *
+ * No intermediate queues — latency = mic capture (5ms) + encode (~0.5ms) + send.
+ */
+static int16_t mic_pcm_shared[PCM_SAMPLES_PER_FRAME];
+static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 
-/* --- Uplink ring (DMA ISR → encoder thread) ------------------------------- */
-
-static int16_t  uplink_slots[RING_SLOTS][PCM_SAMPLES_PER_FRAME];
-static atomic_t uplink_write_idx = ATOMIC_INIT(0);
-static atomic_t uplink_read_idx  = ATOMIC_INIT(0);
-static K_SEM_DEFINE(uplink_sem, 0, RING_SLOTS);
-
-/* Called from DMA ISR — ISR-safe (atomic + memcpy only). */
-static void uplink_ring_put(const int16_t *mono_frame)
-{
-	atomic_val_t idx = atomic_get(&uplink_write_idx);
-
-	memcpy(uplink_slots[idx % RING_SLOTS], mono_frame,
-	       sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
-	atomic_set(&uplink_write_idx, idx + 1);
-	k_sem_give(&uplink_sem);
-}
-
-/* Called from the encoder thread — blocks forever waiting for mic data. */
-static void uplink_ring_get(int16_t *out)
-{
-	k_sem_take(&uplink_sem, K_FOREVER);
-
-	atomic_val_t ridx = atomic_get(&uplink_read_idx);
-
-	memcpy(out, uplink_slots[ridx % RING_SLOTS],
-	       sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
-	atomic_set(&uplink_read_idx, ridx + 1);
-}
+static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
+static size_t encoded_len;
+static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 
 /* =========================================================================
- * Decoded stereo PCM queue: decoder thread → DMA ISR
+ * Downlink playback: decoder thread → ring buffer → DMA ISR
  *
- * Still a K_MSGQ because the DMA ISR consumes it with K_NO_WAIT (no block),
- * and the silence-inject fallback in cs47l63.c is cleaner with a queue.
- *
- * Depth=1: one frame latency.  clk_sync keeps the decoder phase-locked to
- * the BIG anchor so back-to-back decode bursts are eliminated in steady
- * state.  A single drop during BIG-resync startup is acceptable.
+ * The ring buffer (ring_fifo / ring_prod_idx / ring_cons_idx) replaces the
+ * old tx_msgq.  The decoder writes 5 × 1ms blocks per LC3 frame; the DMA
+ * ISR consumes 1 block per 1ms.  This reduces decode-to-speaker latency
+ * from 5–10ms to 1–2ms.
  * ========================================================================= */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 1, 4);
-
-/* =========================================================================
- * Encoded uplink queue: encoder thread → iso_tx thread
- *
- * Depth=2: absorbs residual back-to-back drains from rare get_tx_sync
- * stalls (see uplink_send_next()).  When tx_thread drains twice in quick
- * succession: first drain gets the queued frame (valid audio), second drain
- * finds the queue empty → TX underrun (silence), but the encoder can still
- * write its next frame to the now-empty slot without a full-queue enc_drop.
- * In steady state the queue depth oscillates between 0 and 1 — the second
- * slot is only ever used as a transient buffer during HCI stall recovery.
- * ========================================================================= */
-K_MSGQ_DEFINE(lc3_tx_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
-
-/* Flush stale pre-PTT frames from the uplink encoded queue.
- * Called from the PTT ISR/work-handler on activation so the encoder starts
- * from a clean state and phase-racing drops are eliminated. */
-void uplink_tx_flush(void)
-{
-	k_msgq_purge(&lc3_tx_q);
-}
 
 /* =========================================================================
  * Uplink TX semaphore
@@ -408,30 +335,38 @@ static struct bt_iso_big_sync_param big_sync_param = {
 };
 
 /* =========================================================================
- * Downlink audio path: BIS1 → downlink_ring → lc3_decoder → tx_msgq → speaker
+ * Downlink audio path: BIS1 → encoded_frame_q → lc3_decoder → ring → speaker
  * ========================================================================= */
 
-/* Called from the DMA ISR every 5 ms with a captured mono frame.
- * Writes into the uplink ring (lock-free) — no blocking, ISR-safe. */
+/* Called from the DMA ISR every 5 ms (accumulated from 5 × 1ms blocks)
+ * with a captured mono frame.
+ * Copies to shared buffer and signals encoder — ISR-safe (memcpy only). */
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
-	uplink_ring_put(mono_frame);
+	static uint32_t rx_frame_cnt;
+
+	memcpy(mic_pcm_shared, mono_frame, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
+	k_sem_give(&mic_frame_sem);
+
+	if ((rx_frame_cnt++ % 200U) == 0U) {
+		/* Debug: log sample values to verify mic data */
+		int32_t sum = 0;
+		for (int i = 0; i < 8; i++) sum += mono_frame[i];
+		printk("[mic] frame=%u, samples[0-7].sum=%d\n", rx_frame_cnt, sum);
+	}
 }
 
-/* lc3_decoder thread: reads the downlink ring, decodes (or PLC on loss/timeout),
- * upmixes mono→stereo, and feeds tx_msgq for the I2S DMA. */
+/* lc3_decoder thread: reads encoded frames from the BLE callback, decodes
+ * (or PLC on loss), and splits into 5 × 1ms stereo blocks in the ring buffer
+ * for the I2S DMA ISR. */
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-	struct dl_slot slot;
+	struct encoded_frame frame;
 	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
-	int16_t stereo_buf[PCM_SAMPLES_PER_FRAME * AUDIO_CHANNELS];
 	static uint32_t rx_frame_cnt;
 	static uint32_t rx_plc_cnt;     /* frames decoded via PLC (no real packet) */
 	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
-	static uint32_t rx_drop_cnt;    /* tx_msgq drop-oldest (decoder > DMA rate) */
-	/* Last real-frame peak: limiter reference, initialised open so the first
-	 * frame is never clipped regardless of its level. */
-	static int16_t dl_last_peak = INT16_MAX / 4;
+	static uint32_t rx_overrun_cnt; /* ring overrun — blocks discarded */
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -440,12 +375,10 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		/* Block up to 5.5 ms waiting for the next BLE frame.
-		 * If nothing arrives (packet loss or anchor jitter) run PLC. */
-		bool got_frame = downlink_ring_get(&slot, K_USEC(5500));
+		k_msgq_get(&encoded_frame_q, &frame, K_FOREVER);
 
-		const uint8_t *lc3_data = (got_frame && slot.len > 0U) ? slot.data : NULL;
-		const int      lc3_len  = (got_frame && slot.len > 0U) ? (int)slot.len : 0;
+		const uint8_t *lc3_data = (frame.len > 0U) ? frame.data : NULL;
+		const int      lc3_len  = (frame.len > 0U) ? (int)frame.len : 0;
 
 		if (lc3_data == NULL) {
 			rx_plc_cnt++;
@@ -455,84 +388,54 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
 				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
 		if (ret < 0) {
-			memset(mono_pcm, 0, sizeof(mono_pcm));
 			rx_dec_err_cnt++;
+			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
 
-		/* Limiter: per-sample clip at 8× recent peak. 8× preserves natural
-		 * speech transients (plosives can be 4-6× RMS) while still clipping
-		 * pathological PLC over-synthesis spikes. Per-sample clipping avoids
-		 * the audible dip caused by frame-level scaling. */
-		if (ret >= 0) {
-			int16_t peak = 0;
 
-			for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-				int16_t a = mono_pcm[s] < 0 ? -mono_pcm[s] : mono_pcm[s];
-
-				if (a > peak) {
-					peak = a;
-				}
+		/* Split 80 mono samples → 5 × 16-sample blocks, pack stereo into ring. */
+		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
+			if (RING_FILLED() >= AUDIO_RING_NUM_BLKS - 1U) {
+				rx_overrun_cnt++;
+				break; /* overrun — discard remaining blocks */
 			}
-			if (dl_last_peak < 64) {
-				dl_last_peak = 64;
+
+			uint32_t *dst = ring_fifo[ring_prod_idx];
+
+			for (uint8_t s = 0; s < AUDIO_BLK_SAMPLES_MONO; s++) {
+				int16_t sample = mono_pcm[blk * AUDIO_BLK_SAMPLES_MONO + s];
+
+				dst[s] = ((uint32_t)(uint16_t)sample << 16) |
+					 (uint16_t)sample;
 			}
-			int16_t limit = (int16_t)(dl_last_peak * 8 > INT16_MAX
-						  ? INT16_MAX : dl_last_peak * 8);
 
-			if (ret != 1) {
-				dl_last_peak = peak;
-			}
-			if (peak > limit) {
-				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-					if (mono_pcm[s] > limit) {
-						mono_pcm[s] = limit;
-					} else if (mono_pcm[s] < -limit) {
-						mono_pcm[s] = (int16_t)(-limit);
-					}
-				}
-			}
-		}
-
-		/* Mono downlink → stereo (L = R). */
-		for (size_t i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-			stereo_buf[2 * i]     = mono_pcm[i];
-			stereo_buf[2 * i + 1] = mono_pcm[i];
-		}
-
-		/* Drop-oldest policy: always give the DMA the freshest frame. */
-		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-			uint32_t dropped[PCM_SAMPLES_PER_FRAME];
-
-			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
-			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
-			rx_drop_cnt++;
+			ring_prod_idx = RING_NEXT(ring_prod_idx);
 		}
 
 		if ((rx_frame_cnt++ % 200U) == 0U) {
-			printk("[rx] frame=%u plc=%u err=%u drop=%u tx_q=%u underrun=%u locked=%d\n",
-			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_drop_cnt,
-			       k_msgq_num_used_get(&tx_msgq),
+			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u locked=%d\n",
+			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_overrun_cnt,
+			       (uint32_t)RING_FILLED(),
 			       audio_underrun_count_reset(),
 			       clk_sync_is_locked() ? 1 : 0);
 			rx_plc_cnt     = 0;
 			rx_dec_err_cnt = 0;
-			rx_drop_cnt    = 0;
+			rx_overrun_cnt = 0;
 		}
 	}
 }
 
 /* =========================================================================
- * Uplink audio path: mic → uplink_ring → lc3_encoder → lc3_tx_q → BIS2..5
+ * Uplink audio path: mic → encoder → direct send (minimal latency)
  * ========================================================================= */
 
-/* lc3_encoder thread: reads the uplink ring, encodes, feeds lc3_tx_q. */
+/* lc3_encoder thread: waits for mic frames, encodes, signals TX thread. */
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
+	int16_t local_pcm[PCM_SAMPLES_PER_FRAME];
 	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
 	const int octets_per_frame = preset_active.qos.sdu;
 	static uint32_t enc_frame_cnt;
-	static uint32_t enc_drop_cnt; /* lc3_tx_q overflow events */
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -541,36 +444,42 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		/* Block until the DMA ISR puts a new mic frame into the ring. */
-		uplink_ring_get(mono_pcm);
+		/* Block until the DMA ISR signals a new mic frame is ready. */
+		k_sem_take(&mic_frame_sem, K_FOREVER);
 
-		/* Skip encode when not transmitting — avoids filling lc3_tx_q
-		 * with frames nobody will send, which would cause enc_drop spam
-		 * and waste ~640 µs of CPU per frame while PTT is inactive.
-		 * The ring slot is consumed above so the DMA ISR never stalls. */
+		/* Copy to local buffer (quick, ISR won't overwrite for 5ms). */
+		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
+
+		/* Debug: log mic activity and checksum of PCM data */
+		static uint32_t enc_dbg_cnt;
+		int32_t pcm_sum = 0;
+		for (int i = 0; i < 8; i++) pcm_sum += local_pcm[i];
+		if ((enc_dbg_cnt++ % 100U) == 0U) {
+			printk("[enc] frame=%u, ptt=%d, pcm[0-7].sum=%d\n",
+			       enc_dbg_cnt, atomic_get(&ptt_active), pcm_sum);
+		}
+
+		/* Skip encode when not transmitting — saves CPU when PTT is off. */
 		if (atomic_get(&ptt_active) == 0) {
 			continue;
 		}
 
-		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_pcm, 1,
+		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1,
 				 octets_per_frame, encoded_buf);
 		if (ret < 0) {
+			printk("[enc] lc3_encode error: %d\n", ret);
 			continue;
 		}
 
-		if (k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT) != 0) {
-			uint8_t drop[CONFIG_BT_ISO_TX_MTU];
-
-			(void)k_msgq_get(&lc3_tx_q, drop, K_NO_WAIT);
-			(void)k_msgq_put(&lc3_tx_q, encoded_buf, K_NO_WAIT);
-			enc_drop_cnt++;
-		}
+		/* Store encoded frame in shared buffer and signal TX thread. */
+		memcpy(encoded_shared, encoded_buf, octets_per_frame);
+		encoded_len = octets_per_frame;
+		atomic_set(&encoded_data_ready, 1);
+		printk("[enc] encoded %d bytes, ptt=%d\n", octets_per_frame, atomic_get(&ptt_active));
+		k_sem_give(&tx_sem);
 
 		if ((enc_frame_cnt++ % 200U) == 0U) {
-			printk("[tx] frame=%u enc_drop=%u ul_q=%u\n",
-			       enc_frame_cnt, enc_drop_cnt,
-			       k_msgq_num_used_get(&lc3_tx_q));
-			enc_drop_cnt = 0;
+			printk("[tx] frame=%u\n", enc_frame_cnt);
 		}
 	}
 }
@@ -609,6 +518,7 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 		struct bt_iso_chan *ul_chan;
 
 		k_sem_take(&tx_sem, K_FOREVER);
+		printk("[tx_thread] woke up, ptt=%d, enc_len=%u\n", atomic_get(&ptt_active), encoded_len);
 		ul_chan = iso_select_uplink_chan();
 		if (ul_chan != NULL) {
 			(void)uplink_send_next(ul_chan);
@@ -619,8 +529,14 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 static int uplink_send_next(struct bt_iso_chan *chan)
 {
 	struct net_buf *buf;
-	uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
 	int err;
+
+	/* Don't send if encoder hasn't produced data yet. */
+	if (encoded_len == 0) {
+		printk("[send] skipped: enc_len=0, data_ready=%d\n",
+		       atomic_get(&encoded_data_ready));
+		return -ENODATA;
+	}
 
 	buf = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
 	if (!buf) {
@@ -632,18 +548,17 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return -ENOMEM;
 	}
 
-	if (k_msgq_get(&lc3_tx_q, enc_data, K_NO_WAIT) != 0) {
-		static uint32_t tx_underrun_cnt;
-
-		if (atomic_get(&uplink_tx_active) != 0 && (tx_underrun_cnt++ % 100U) == 0U) {
-			printk("Uplink TX underrun — sending silence (cnt=%u)\n",
-			       tx_underrun_cnt);
-		}
-		memset(enc_data, 0, sizeof(enc_data));
+	/* Check PTT at send time — gate transmission. */
+	if (atomic_get(&ptt_active) == 0) {
+		net_buf_unref(buf);
+		return 0;
 	}
 
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	net_buf_add_mem(buf, enc_data, sizeof(enc_data));
+	net_buf_add_mem(buf, encoded_shared, encoded_len);
+
+	/* Clear encoded_data_ready flag after consuming data. */
+	atomic_set(&encoded_data_ready, 0);
 
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0) {
@@ -652,12 +567,7 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return err;
 	}
 
-	/* clk_sync anchor is fed from iso_recv() (BIS1 downlink info->ts) —
-	 * no HCI call needed here.  bt_iso_chan_get_tx_sync() was removed
-	 * because its blocking HCI round-trip (1–10 ms) caused tx_sem to
-	 * accumulate across BIG events → back-to-back uplink_send_next()
-	 * → TX underrun + enc_drop. */
-
+	printk("[send] sent %u bytes on chan %p, seq=%u\n", encoded_len, chan, seq_num);
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
 	return 0;
@@ -669,22 +579,22 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	/* Re-arm tx_sem only for the channel that tx_thread just sent on.
-	 * iso_sent fires for every uplink BIS (BIS2..5) on each BIG event,
-	 * but the encoder produces exactly one frame per 5 ms interval.
-	 * Giving tx_sem for all 4 channels would wake tx_thread 4× and drain
-	 * lc3_tx_q 4× — causing 3 TX underruns and racing with the encoder
-	 * on the 4th wake (→ enc_drop).  Gating on active_uplink_bis ensures
-	 * exactly one sem give per BIG event. */
-	if (chan == bis[active_uplink_bis] && atomic_get(&ptt_active) != 0) {
+	/* Re-arm tx_sem for next frame while PTT is active AND encoder has data.
+	 * Only the active uplink BIS signals tx_sem to avoid multiple wakes.
+	 *
+	 * Fix: Only re-arm when encoded_data_ready is set to prevent sending
+	 * 0-byte packets in a tight loop when encoder hasn't produced data yet. */
+	if (chan == bis[active_uplink_bis] &&
+	    atomic_get(&ptt_active) != 0 &&
+	    atomic_get(&encoded_data_ready) != 0) {
 		k_sem_give(&tx_sem);
 	}
 }
 
 /* iso_recv: receives BIG SDUs on BIS1 (downlink only).
  *
- * Valid frames → downlink_ring for the decoder thread.
- * Lost/invalid frames → zero-length slot → decoder runs PLC.
+ * Valid frames → encoded_frame_q for the decoder thread.
+ * Lost/invalid frames → zero-length frame → decoder runs PLC.
  *
  * Uplink kickstart: on the very first confirmed reception, prime tx_sem once
  * from within this callback.  The nRF5340 controller requires the first
@@ -697,12 +607,18 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		return;
 	}
 
-	if ((buf != NULL) && (buf->len <= CONFIG_BT_ISO_TX_MTU) &&
-	    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
-		downlink_ring_put(buf->data, (uint16_t)buf->len);
-		k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
-	} else {
-		downlink_ring_put(NULL, 0U); /* loss → PLC */
+	{
+		struct encoded_frame ef;
+
+		if ((buf != NULL) && (buf->len <= CONFIG_BT_ISO_TX_MTU) &&
+		    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
+			ef.len = (uint16_t)buf->len;
+			memcpy(ef.data, buf->data, buf->len);
+			k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
+		} else {
+			ef.len = 0U; /* loss → PLC */
+		}
+		k_msgq_put(&encoded_frame_q, &ef, K_NO_WAIT);
 	}
 
 	/* Feed BIG anchor to clk_sync on every BIS1 frame (valid or not).
@@ -1059,17 +975,14 @@ static int setup_iso_datapaths(void)
 
 	seq_num = 0U;
 	atomic_set(&uplink_tx_active, 0);
-	k_msgq_purge(&lc3_tx_q);
 
-	/* Reset ring indices so stale frames from a previous BIG sync don't
-	 * play out.  The semaphore counts are reset by draining them. */
-	atomic_set(&downlink_write_idx, 0);
-	atomic_set(&downlink_read_idx,  0);
-	while (k_sem_take(&downlink_sem, K_NO_WAIT) == 0) {
-	}
-	atomic_set(&uplink_write_idx, 0);
-	atomic_set(&uplink_read_idx,  0);
-	while (k_sem_take(&uplink_sem, K_NO_WAIT) == 0) {
+	/* Reset ring indices and queues so stale frames from a previous BIG sync
+	 * don't play out. */
+	k_msgq_purge(&encoded_frame_q);
+	ring_prod_idx = 0;
+	ring_cons_idx = 0;
+	/* Drain any pending mic frame semaphore. */
+	while (k_sem_take(&mic_frame_sem, K_NO_WAIT) == 0) {
 	}
 
 	iso_datapaths_setup = true;
@@ -1182,7 +1095,7 @@ int main(void)
 	bis_channels_init();
 
 	/* --- Audio backend (CS47L63 codec + I2S DMA) ------------------------ */
-	err = audio_init(&tx_msgq, audio_rx_mono_frame);
+	err = audio_init(&playback_ring, audio_rx_mono_frame);
 	if (err) {
 		printk("audio_init failed: %d\n", err);
 		return err;
@@ -1281,16 +1194,15 @@ int main(void)
 		preset_active.qos.interval = big_sdu_interval_us;
 		preset_active.qos.sdu      = big_max_sdu;
 
-		/* Update I2S DMA block size to match the frame duration from BIGInfo.
-		 * words_per_block = sample_rate_hz * frame_duration_ms / 1000
-		 * (sample rate is always 16 kHz; only frame duration may change). */
-		audio_i2s_set_block_size((AUDIO_SAMPLE_RATE_HZ * (big_sdu_interval_us / 1000U))
-					 / 1000U);
+		/* I2S DMA block size is fixed at 1ms (16 words @ 16 kHz) regardless
+		 * of the LC3 frame duration.  The ring buffer bridges the cadences. */
+		audio_i2s_set_block_size(AUDIO_BLK_SAMPLES_MONO);
 
 		/* Re-initialise LC3 codec instances with the discovered frame duration.
 		 * lc3_setup_decoder/encoder are fast pointer-setup calls; the worker
 		 * threads are already running but will not consume stale data because
-		 * the BIG is not yet synced — downlink_ring and uplink_ring are empty. */
+		 * the BIG is not yet synced — encoded_frame_q is empty and mic_frame_sem
+		 * is not signaled. */
 		lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
 						0, &lc3_decoder_mem);
 		if (lc3_decoder == NULL) {
