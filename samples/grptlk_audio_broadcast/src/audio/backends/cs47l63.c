@@ -18,15 +18,15 @@
 
 BUILD_ASSERT(AUDIO_SAMPLE_RATE_HZ == AUDIO_I2S_SAMPLE_RATE_HZ,
 	     "audio and audio_i2s sample rate must match");
-BUILD_ASSERT(AUDIO_SAMPLES_PER_FRAME == AUDIO_I2S_SAMPLES_PER_BLOCK,
-	     "audio and audio_i2s frame size must match");
+BUILD_ASSERT(AUDIO_SAMPLES_PER_FRAME == AUDIO_I2S_SAMPLES_PER_FRAME,
+	     "audio and audio_i2s LC3 frame size must match");
 BUILD_ASSERT(AUDIO_BLOCK_BYTES == AUDIO_I2S_BLOCK_BYTES,
 	     "audio and audio_i2s block size must match");
 
 #define MIC_PEAK_DETECT_THRESHOLD 64
 
 static audio_rx_cb_t rx_cb;
-static struct k_msgq *playback_q;
+static struct audio_ring *ring;
 static bool is_initialized;
 static bool is_started;
 
@@ -38,6 +38,10 @@ static uint32_t i2s_tx_buf_b[AUDIO_I2S_WORDS_PER_BLOCK];
 
 static cs47l63_t codec_driver;
 static int selected_mic_channel = -1; /* -1=auto, 0=left, 1=right */
+
+/* Mic accumulator: AUDIO_I2S_BLKS_PER_FRAME × 1 ms blocks → 1 × 5 ms LC3 frame */
+static int16_t mic_accum[AUDIO_I2S_SAMPLES_PER_FRAME];
+static uint8_t mic_accum_blk; /* 0 .. AUDIO_I2S_BLKS_PER_FRAME-1 */
 
 static int codec_reg_conf_write(const uint32_t config[][2], size_t num_of_regs)
 {
@@ -175,7 +179,7 @@ static void extract_selected_channel_to_mono(const uint32_t *rx_words, int16_t *
 
 static void i2s_process_rx_block(const uint32_t *rx_words)
 {
-	int16_t mono_frame[AUDIO_SAMPLES_PER_FRAME];
+	int16_t *dst = &mic_accum[mic_accum_blk * AUDIO_I2S_SAMPLES_PER_BLOCK];
 	int32_t left_peak;
 	int32_t right_peak;
 	uint8_t ch;
@@ -186,19 +190,20 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	    (left_peak > MIC_PEAK_DETECT_THRESHOLD ||
 	     right_peak > MIC_PEAK_DETECT_THRESHOLD)) {
 		selected_mic_channel = (right_peak > left_peak) ? 1 : 0;
+		printk("[mic] auto-selected channel %d (L_peak=%d R_peak=%d)\n",
+		       selected_mic_channel, (int)left_peak, (int)right_peak);
 	}
 
 	ch = mic_channel_pick(left_peak, right_peak);
-	extract_selected_channel_to_mono(rx_words, mono_frame, ch);
+	extract_selected_channel_to_mono(rx_words, dst, ch);
 
-	if (rx_cb != NULL) {
-		rx_cb(mono_frame);
+	if (++mic_accum_blk >= AUDIO_I2S_BLKS_PER_FRAME) {
+		mic_accum_blk = 0;
+		if (rx_cb != NULL) {
+			rx_cb(mic_accum); /* fires every 5th call = every 5 ms */
+		}
 	}
 }
-
-/* Last successfully decoded frame, replayed on underrun to avoid silence
- * clicks caused by the broadcaster ACLK / receiver BLE clock drift. */
-static uint32_t tx_last_frame[AUDIO_I2S_WORDS_PER_BLOCK];
 
 /* Underrun counter — incremented by tx_buffer_fill() on every DMA miss.
  * Read and atomically cleared by audio_underrun_count_reset(). */
@@ -209,23 +214,61 @@ uint32_t audio_underrun_count_reset(void)
 	return (uint32_t)atomic_set(&g_underrun_cnt, 0);
 }
 
+/* Served counter — incremented by tx_buffer_fill() each time a real block is
+ * read from the ring (not an underrun zero-fill).
+ * Read and atomically cleared by audio_served_count_reset(). */
+static atomic_t g_served_cnt = ATOMIC_INIT(0);
+
+uint32_t audio_served_count_reset(void)
+{
+	return (uint32_t)atomic_set(&g_served_cnt, 0);
+}
+
+/* Consecutive underrun tracking — written only from the DMA ISR context so
+ * g_consec_underrun needs no atomics.  g_max_consec_underrun is the
+ * per-window peak, read from the stats thread via audio_max_consec_underrun_reset(). */
+static uint32_t g_consec_underrun;
+static atomic_t g_max_consec_underrun = ATOMIC_INIT(0);
+
+uint32_t audio_max_consec_underrun_reset(void)
+{
+	return (uint32_t)atomic_set(&g_max_consec_underrun, 0);
+}
+
 static void tx_buffer_fill(uint32_t *tx_words)
 {
-	static uint32_t underrun_log_cnt;
+	if (ring != NULL) {
+		uint16_t ci = *ring->cons_idx;
+		uint16_t pi = *ring->prod_idx;
 
-	if (playback_q != NULL &&
-	    k_msgq_get(playback_q, tx_words, K_NO_WAIT) == 0) {
-		/* Got a real frame — save it for potential replay. */
-		memcpy(tx_last_frame, tx_words, AUDIO_I2S_BLOCK_BYTES);
-	} else {
-		/* Queue empty: replay the last frame instead of silence to
-		 * avoid audible clicks from the ACLK/BLE clock drift. */
-		memcpy(tx_words, tx_last_frame, AUDIO_I2S_BLOCK_BYTES);
-		atomic_inc(&g_underrun_cnt);
-		if ((underrun_log_cnt++ % 200U) == 0U) {
-			printk("Uplink RX playback: replaying last frame (cnt=%u)\n",
-			       underrun_log_cnt);
+		if (ci != pi) {
+			/* Ring has data — log if we're recovering from a gap. */
+			if (g_consec_underrun > 0U) {
+				printk("[ring] gap_end: %u ms silence (fill now %u/%u)\n",
+				       g_consec_underrun,
+				       (uint16_t)((pi - ci + ring->num_blks) % ring->num_blks),
+				       ring->num_blks);
+				g_consec_underrun = 0U;
+			}
+			memcpy(tx_words, ring->fifo[ci],
+			       AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+			memset(ring->fifo[ci], 0,
+			       AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+			*ring->cons_idx = (ci + 1U) % ring->num_blks;
+			atomic_inc(&g_served_cnt);
+			return;
 		}
+	}
+
+	/* Ring empty: output zeros (silence). */
+	memset(tx_words, 0, AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+	atomic_inc(&g_underrun_cnt);
+
+	g_consec_underrun++;
+	uint32_t cur_max = (uint32_t)atomic_get(&g_max_consec_underrun);
+
+	if (g_consec_underrun > cur_max) {
+		atomic_set(&g_max_consec_underrun, (atomic_val_t)g_consec_underrun);
 	}
 }
 
@@ -248,8 +291,10 @@ static void i2s_block_complete(uint32_t *rx_buf_released, const uint32_t *tx_buf
 
 	err = audio_i2s_set_next_buf(rx_buf_released, next_tx_buf);
 	if (err != 0) {
-		if ((i2s_requeue_err_cnt++ % 50U) == 0U) {
-			printk("audio_i2s_set_next_buf failed: %d (cnt=%u)\n",
+		/* Log every occurrence for the first 5, then every 50. */
+		i2s_requeue_err_cnt++;
+		if (i2s_requeue_err_cnt <= 5U || (i2s_requeue_err_cnt % 50U) == 0U) {
+			printk("[i2s] REQUEUE FAIL: err=%d cnt=%u — DMA may glitch!\n",
 			       err, i2s_requeue_err_cnt);
 		}
 	}
@@ -284,11 +329,11 @@ int audio_volume_adjust(int8_t step_db)
 	return 0;
 }
 
-int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
+int audio_init(struct audio_ring *playback_ring, audio_rx_cb_t mono_rx_cb)
 {
 	int err;
 
-	if (tx_q == NULL || mono_rx_cb == NULL) {
+	if (playback_ring == NULL || mono_rx_cb == NULL) {
 		return -EINVAL;
 	}
 
@@ -296,7 +341,7 @@ int audio_init(struct k_msgq *tx_q, audio_rx_cb_t mono_rx_cb)
 		return 0;
 	}
 
-	playback_q = tx_q;
+	ring  = playback_ring;
 	rx_cb = mono_rx_cb;
 	selected_mic_channel = -1;
 
@@ -338,19 +383,8 @@ int audio_start(void)
 	memset(i2s_tx_buf_a, 0, sizeof(i2s_tx_buf_a));
 	memset(i2s_tx_buf_b, 0, sizeof(i2s_tx_buf_b));
 
-	/* Pre-fill the playback queue with silence so tx_buffer_fill() always
-	 * finds a frame ready, even before the uplink decoder produces its first
-	 * real frame.  Without this the nrfx I2S ISR fires before the decoder
-	 * thread has run, finds tx_msgq empty, and injects a silence burst that
-	 * the codec reproduces as a click or crackle.  Two frames (20 ms) is
-	 * enough to absorb one full decoder wake-up cycle. */
-	if (playback_q != NULL) {
-		static const uint8_t silence[AUDIO_I2S_BLOCK_BYTES];
-
-		for (int i = 0; i < 2; i++) {
-			(void)k_msgq_put(playback_q, silence, K_NO_WAIT);
-		}
-	}
+	/* ring_fifo is zero-initialised (static storage); no pre-fill needed.
+	 * tx_buffer_fill() outputs zeros on underrun. */
 
 	err = audio_i2s_start(i2s_rx_buf_a, i2s_tx_buf_a);
 	if (err) {

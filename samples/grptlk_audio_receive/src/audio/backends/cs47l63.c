@@ -36,9 +36,6 @@
 
 #include "audio/audio.h"
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-#include "audio/sync/clk_sync.h"
-#endif
 
 #include <errno.h>
 #include <stdbool.h>

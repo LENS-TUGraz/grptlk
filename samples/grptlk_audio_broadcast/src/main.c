@@ -6,9 +6,8 @@
 #include <nrfx_clock.h>
 #endif
 #include "audio/audio.h"
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
+#include "audio/drivers/audio_i2s.h"
 #include "audio/sync/clk_sync.h"
-#endif
 #include "io/led.h"
 #include <stdint.h>
 #include <zephyr/device.h>
@@ -21,14 +20,9 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
-BUILD_ASSERT(!IS_ENABLED(CONFIG_GRPTLK_RELAY_ONLY) ||
-	     CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT == 2,
-	     "GRPTLK_RELAY_ONLY requires BT_BAP_BROADCAST_SRC_STREAM_COUNT=2 "
-	     "(exactly one uplink BIS)");
 
 #define VOLUME_STEP_DB 3
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -243,7 +237,7 @@ static int ptt_lock_init(void)
 	return 0;
 #endif
 }
-#endif /* CONFIG_GRPTLK_RELAY_ONLY */
+
 
 /* BAP preset base: kept as-is per project requirement.
  * Runtime QoS fields are overridden below for LC3Plus 5 ms operation. */
@@ -283,66 +277,36 @@ static void override_preset_for_lc3plus_5ms(void)
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
 #define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
 #define BLOCK_BYTES           AUDIO_BLOCK_BYTES
-/* Maximum absolute value of a signed 16-bit PCM sample (2^15 − 1 = 32767). */
-#define PCM_INT16_MAX         INT16_MAX
-/* Consecutive PLC frames after which a stream is muted in the mix.
- * Covers brief radio dropouts (PLC concealment) without adding sustained
- * comfort noise from a device that has gone silent or disconnected. */
-#define PLC_MUTE_FRAMES       40
-
 /* BIS layout: bis[0] = TX (BIS1), bis[1..N] = RX uplink */
 #define NUM_RX_BIS        (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
 #define NUM_PRIME_PACKETS 2
 
-/* Queues */
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-K_MSGQ_DEFINE(pcm_msgq, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
-/* Depth=2: one frame of slack between the uplink decoder thread and the
- * DMA ISR.  Prevents DAC underruns when Zephyr scheduling jitter delays
- * the decoder by a few µs — most visibly on PLC frames where the NULL-input
- * LC3 path takes slightly longer.  Cost: +5 ms broadcaster speaker latency
- * (imperceptible in walkie-talkie use). */
-K_MSGQ_DEFINE(tx_msgq, BLOCK_BYTES, 2, 4);
-K_MSGQ_DEFINE(uplink_mix_q, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME, 1, 4);
-#endif
-/* depth=2: absorbs the race between iso_sent() waking tx_thread and the
- * encoder depositing the next frame.  iso_sent() calls k_sem_give(&tx_sem)
- * before bt_iso_chan_get_tx_sync() returns, so tx_thread can preempt and
- * drain the queue while the encoder is still running.  depth=2 ensures
- * tx_thread always finds a frame (the previous interval's), eliminating
- * [tx] underrun during lock acquisition and BIG-resync transients. */
-K_MSGQ_DEFINE(lc3_encoded_q, CONFIG_BT_ISO_TX_MTU, 2, 4);
+/* Speaker playback ring buffer — kept for audio_init() but never written by
+ * iso_recv, so the DMA output path produces silence. */
+static uint32_t ring_fifo[AUDIO_RING_NUM_BLKS][AUDIO_BLK_SAMPLES_MONO];
+static volatile uint16_t ring_prod_idx;
+static volatile uint16_t ring_cons_idx;
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-struct uplink_frame {
-	uint16_t len;
-	uint8_t data[CONFIG_BT_ISO_TX_MTU];
-	uint8_t _pad[2]; /* align struct size to 4-byte K_MSGQ boundary */
+static struct audio_ring playback_ring = {
+	.fifo     = ring_fifo,
+	.prod_idx = &ring_prod_idx,
+	.cons_idx = &ring_cons_idx,
+	.num_blks = AUDIO_RING_NUM_BLKS,
 };
-struct k_msgq uplink_rx_q[NUM_RX_BIS];
-char __aligned(4) uplink_rx_q_buffer[NUM_RX_BIS][1 * sizeof(struct uplink_frame)];
 
-/* Decoder wakeup: first arriving BIS packet each interval gives the semaphore
- * immediately (zero drift, locked to BT anchor). The watchdog timer fires only
- * if the entire interval is lost — ensuring the decoder still runs PLC. */
-K_SEM_DEFINE(uplink_rx_sem, 0, 1);
-static struct k_timer uplink_watchdog_timer;
-static atomic_t uplink_interval_fired = ATOMIC_INIT(0);
+/* Mic → encoder: shared buffer + semaphore (no queue latency). */
+static int16_t mic_pcm_shared[PCM_SAMPLES_PER_FRAME];
+static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 
-static void uplink_watchdog_expiry(struct k_timer *timer)
-{
-	ARG_UNUSED(timer);
-	atomic_set(&uplink_interval_fired, 0);
-	k_sem_give(&uplink_rx_sem);
-}
+/* Encoder → TX thread: shared buffer + atomic flag (no queue latency).
+ * iso_sent() drives tx_sem unconditionally to keep the BIG stream alive.
+ * The TX thread reads the freshest encoded frame or sends silence. */
+static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
+static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 
 /* LC3 */
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
-static lc3_decoder_t lc3_decoders[NUM_RX_BIS];
-static lc3_decoder_mem_16k_t lc3_decoder_mems[NUM_RX_BIS];
-static int16_t send_pcm_data[PCM_SAMPLES_PER_FRAME];
-#endif
 
 /* BAP */
 static struct bt_bap_broadcast_source *broadcast_source __maybe_unused;
@@ -359,9 +323,6 @@ static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 static struct bt_iso_chan bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
 static uint16_t seq_num __maybe_unused;
-/* Set to true when a real uplink frame is received on bis[i+1].
- * Cleared on disconnect so PLC from a gone sender is not mixed in. */
-static bool bis_ever_rx[NUM_RX_BIS] __maybe_unused;
 
 static struct bt_iso_big_create_param big_create_param __maybe_unused = {
 	.num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
@@ -381,85 +342,48 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 };
 
 /* Threads */
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-#define ENCODER_STACK_SIZE   4096
-#define ENCODER_PRIORITY     2
-#define DECODER_PRIORITY     3
-#endif
-#define TX_THREAD_STACK_SIZE 1024
-#define TX_THREAD_PRIORITY   2
-
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
+#define ENCODER_STACK_SIZE    4096
+#define ENCODER_PRIORITY      2
+#define TX_THREAD_STACK_SIZE  1024
+#define TX_THREAD_PRIORITY    2
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
-K_THREAD_STACK_DEFINE(uplink_dec_stack, 6144);
-#endif
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 static struct k_thread encoder_thread_data __maybe_unused;
-static struct k_thread uplink_dec_thread_data __maybe_unused;
-#endif
 static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
-	if (k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT) != 0) {
-		int16_t dropped[PCM_SAMPLES_PER_FRAME];
-		(void)k_msgq_get(&pcm_msgq, dropped, K_NO_WAIT);
-		(void)k_msgq_put(&pcm_msgq, mono_frame, K_NO_WAIT);
-	}
-
-	if (atomic_cas(&uplink_interval_fired, 0, 1)) {
-		k_sem_give(&uplink_rx_sem);
-	}
+	memcpy(mic_pcm_shared, mono_frame, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
+	k_sem_give(&mic_frame_sem);
 }
 
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
 	int ret;
-	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
+	int16_t local_pcm[PCM_SAMPLES_PER_FRAME];
 	static uint32_t enc_frame_cnt;
 	int octets_per_frame = preset_active.qos.sdu;
-	/* Last uplink frame — replayed when uplink_mix_q is empty so the encoder
-	 * always mixes a smooth transition instead of a sudden silence step. */
-	static int16_t last_uplink_mono[PCM_SAMPLES_PER_FRAME];
-	static bool has_uplink;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
 
 	while (1) {
-		ret = k_msgq_get(&pcm_msgq, send_pcm_data, K_FOREVER);
-		if (ret != 0) {
-			continue;
-		}
+		k_sem_take(&mic_frame_sem, K_FOREVER);
+		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
 		/* PTT gate: broadcast silence when button is not held. */
 		if (atomic_get(&ptt_active) == 0) {
-			memset(send_pcm_data, 0, sizeof(send_pcm_data));
-		}
-
-		int16_t uplink_mono[PCM_SAMPLES_PER_FRAME];
-		if (k_msgq_get(&uplink_mix_q, uplink_mono, K_NO_WAIT) == 0) {
-			memcpy(last_uplink_mono, uplink_mono, sizeof(last_uplink_mono));
-			has_uplink = true;
-		}
-		if (has_uplink) {
-			for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-				int32_t s =
-					(int32_t)send_pcm_data[i] + (int32_t)last_uplink_mono[i];
-				if (s > PCM_INT16_MAX) {
-					s = PCM_INT16_MAX;
-				} else if (s < -32768) {
-					s = -32768;
-				}
-				send_pcm_data[i] = (int16_t)s;
-			}
+			memset(local_pcm, 0, sizeof(local_pcm));
 		}
 
 		uint32_t t0 = k_cycle_get_32();
-		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, send_pcm_data, 1,
-				 octets_per_frame, encoded_buf);
+
+		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1,
+				 octets_per_frame, encoded_shared);
 		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 
 		if (ret == -1) {
@@ -467,246 +391,15 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
+		atomic_set(&encoded_data_ready, 1);
+
 		if ((enc_frame_cnt++ % 100U) == 0U) {
-			printk("[enc] frame=%u encode=%u us pcm_q=%u lc3_q=%u\n", enc_frame_cnt,
-			       enc_us, k_msgq_num_used_get(&pcm_msgq),
-			       k_msgq_num_used_get(&lc3_encoded_q));
-		}
-
-		if (k_msgq_put(&lc3_encoded_q, encoded_buf, K_NO_WAIT) != 0) {
-			uint8_t dropped[CONFIG_BT_ISO_TX_MTU];
-			(void)k_msgq_get(&lc3_encoded_q, dropped, K_NO_WAIT);
-			(void)k_msgq_put(&lc3_encoded_q, encoded_buf, K_NO_WAIT);
+			printk("[enc] frame=%u encode=%u us\n", enc_frame_cnt, enc_us);
 		}
 	}
 }
 
-static void uplink_decoder_thread_func(void *arg1, void *arg2, void *arg3)
-{
-	static uint32_t dec_frame_cnt;
-	/* Per-BIS debug counters, reset on printk interval. */
-	static uint32_t dbg_rx_cnt[NUM_RX_BIS];
-	static uint32_t dbg_plc_cnt[NUM_RX_BIS];
-	static uint32_t dbg_dec_err[NUM_RX_BIS];
-	static int16_t dbg_peak[NUM_RX_BIS];
-	/* Consecutive PLC run length per BIS (not reset on printk — tracks streaks). */
-	static uint32_t dbg_plc_streak[NUM_RX_BIS];
-	static uint32_t dbg_plc_streak_max[NUM_RX_BIS];
-	/* Peak of the last real decoded frame per BIS — used to detect PLC spikes.
-	 * Initialised to PCM_INT16_MAX/4 so the limiter opens fully on the first
-	 * frame (limit = PCM_INT16_MAX) and avoids cold-start clamping. */
-	static int16_t dbg_last_real_peak[NUM_RX_BIS] = {
-		[0 ... NUM_RX_BIS - 1] = PCM_INT16_MAX / 4
-	};
-	/* Clip events: how many frames had mixed_pcm saturate at ±PCM_INT16_MAX. */
-	static uint32_t dbg_clip_cnt;
-	/* active_streams value last interval — detect sudden changes. */
-	static int dbg_last_active;
-	static uint32_t dbg_active_change_cnt;
-
-	while (1) {
-		k_sem_take(&uplink_rx_sem, K_FOREVER);
-		/* Allow the next interval's first packet to re-trigger the wakeup. */
-		atomic_set(&uplink_interval_fired, 0);
-
-		uint32_t t0_total = k_cycle_get_32();
-		/* Shared deadline for all BIS stream waits. Sequential BIG guarantees
-		 * every stream's last RTN arrives within the interval, so 90% of the
-		 * interval is sufficient. A fixed per-stream timeout would stack and
-		 * exceed the interval budget with NUM_RX_BIS > 1. */
-		uint32_t deadline_cyc = t0_total +
-			k_us_to_cyc_ceil32(preset_active.qos.interval * 9 / 10);
-		uint32_t dec_us[NUM_RX_BIS];
-		int32_t mixed_pcm[PCM_SAMPLES_PER_FRAME] = {0};
-		int active_streams = 0;
-
-		for (int i = 0; i < NUM_RX_BIS; i++) {
-			/* Skip BIS slots with no device connected — saves the full deadline
-			 * wait and the lc3_decode call, keeping total decode time within
-			 * the interval budget. The queue check ensures a connecting device
-			 * is picked up on the very first frame it sends. */
-			if (!bis_ever_rx[i] && k_msgq_num_used_get(&uplink_rx_q[i]) == 0) {
-				dec_us[i] = 0;
-				continue;
-			}
-
-			struct uplink_frame frame;
-			int16_t stream_pcm[PCM_SAMPLES_PER_FRAME];
-
-			uint32_t t0 = k_cycle_get_32();
-			uint32_t remaining_us = (t0 < deadline_cyc)
-				? k_cyc_to_us_floor32(deadline_cyc - t0) : 0U;
-			bool got_frame = (k_msgq_get(&uplink_rx_q[i], &frame,
-						     remaining_us ? K_USEC(remaining_us)
-								  : K_NO_WAIT) == 0 &&
-					  frame.len > 0);
-
-			if (got_frame) {
-				dbg_rx_cnt[i]++;
-				bis_ever_rx[i] = true;
-				/* Re-sync burst after long dropout is clipped by the limiter
-				 * below (ref = last real speech peak, limit = ref×4). Clipping
-				 * a re-sync burst is inaudible; passing it through unclipped
-				 * causes a loud pop (peak can be 20× normal speech level). */
-				dbg_plc_streak[i] = 0;
-			} else if (bis_ever_rx[i]) {
-				dbg_plc_cnt[i]++;
-				dbg_plc_streak[i]++;
-				if (dbg_plc_streak[i] > dbg_plc_streak_max[i]) {
-					dbg_plc_streak_max[i] = dbg_plc_streak[i];
-				}
-			} else {
-				dbg_plc_cnt[i]++;
-				dbg_plc_streak[i]++;
-			}
-
-			const uint8_t *lc3_data = got_frame ? frame.data : NULL;
-			int lc3_len = got_frame ? (int)frame.len : 0;
-			int ret = lc3_decode(lc3_decoders[i], lc3_data, lc3_len, LC3_PCM_FORMAT_S16,
-					     stream_pcm, 1);
-
-			if (ret < 0) {
-				dbg_dec_err[i]++;
-			}
-
-			if (ret >= 0 && bis_ever_rx[i] &&
-			    dbg_plc_streak[i] <= PLC_MUTE_FRAMES) {
-				int16_t peak = 0;
-				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-					int16_t a =
-						stream_pcm[s] < 0 ? -stream_pcm[s] : stream_pcm[s];
-					if (a > peak) {
-						peak = a;
-					}
-				}
-				/* Limit any frame (real or PLC) that spikes more than 4x the
-				 * recent level — catches both LC3 PLC over-synthesis and the
-				 * codec re-sync burst that occurs when the radio link recovers
-				 * after extended packet loss (streak_max > ~10 frames). */
-				int16_t ref = dbg_last_real_peak[i];
-				if (ref < 64) {
-					ref = 64;
-				}
-				/* 8× limit: speech plosives (p/b/t) can be 4–6× RMS; 8× preserves
-				 * natural transients while still clipping pathological spikes. */
-				int16_t limit =
-					(int16_t)(ref * 8 > PCM_INT16_MAX ? PCM_INT16_MAX : ref * 8);
-				if (ret != 1) {
-					/* Track actual speech peak — not the clamped value — so
-					 * ref ratchets up to real signal level within one window. */
-					dbg_last_real_peak[i] = peak;
-				}
-				if (peak > limit) {
-					/* Per-sample clip: only spikes get clipped; normal-level
-					 * samples pass through. Frame-scaling attenuates the whole
-					 * frame creating an audible dip. */
-					for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-						if (stream_pcm[s] > limit) {
-							stream_pcm[s] = limit;
-						} else if (stream_pcm[s] < -limit) {
-							stream_pcm[s] = (int16_t)(-limit);
-						}
-					}
-				}
-				if (peak > dbg_peak[i]) {
-					dbg_peak[i] = peak;
-				}
-				active_streams++;
-				for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-					mixed_pcm[s] += stream_pcm[s];
-				}
-			}
-			dec_us[i] = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
-		}
-
-		/* Detect sudden active_streams change (causes amplitude step = click). */
-		if (active_streams != dbg_last_active) {
-			dbg_active_change_cnt++;
-			dbg_last_active = active_streams;
-		}
-
-		/* Normalise by number of active streams to prevent clipping. */
-		if (active_streams > 1) {
-			for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-				mixed_pcm[s] /= active_streams;
-			}
-		}
-
-		/* Detect pre-output clipping (after normalisation) and record mixed peak. */
-		bool clipped = false;
-		int32_t mixed_peak = 0;
-		for (int s = 0; s < PCM_SAMPLES_PER_FRAME; s++) {
-			int32_t a = mixed_pcm[s] < 0 ? -mixed_pcm[s] : mixed_pcm[s];
-			if (a > mixed_peak) {
-				mixed_peak = a;
-			}
-			if (mixed_pcm[s] > PCM_INT16_MAX || mixed_pcm[s] < -32768) {
-				clipped = true;
-			}
-		}
-		if (clipped) {
-			dbg_clip_cnt++;
-		}
-
-		uint32_t total_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0_total);
-		if ((dec_frame_cnt++ % 100U) == 0U) {
-			printk("[dec] frame=%u total=%u us active=%d mixed_peak=%d tx_q=%u "
-			       "mix_q=%u clip=%u active_chg=%u underrun=%u locked=%d",
-			       dec_frame_cnt, total_us, active_streams, (int)mixed_peak,
-			       k_msgq_num_used_get(&tx_msgq), k_msgq_num_used_get(&uplink_mix_q),
-			       dbg_clip_cnt, dbg_active_change_cnt,
-			       audio_underrun_count_reset(), clk_sync_is_locked() ? 1 : 0);
-			for (int j = 0; j < NUM_RX_BIS; j++) {
-				printk(" ref%d=%d", j, (int)dbg_last_real_peak[j]);
-			}
-			printk("\n");
-			dbg_clip_cnt = 0;
-			dbg_active_change_cnt = 0;
-			for (int i = 0; i < NUM_RX_BIS; i++) {
-				printk("  bis%d: rx=%u plc=%u err=%u peak=%d streak_max=%u (%u "
-				       "us)\n",
-				       i + 2, dbg_rx_cnt[i], dbg_plc_cnt[i], dbg_dec_err[i],
-				       dbg_peak[i], dbg_plc_streak_max[i], dec_us[i]);
-				dbg_rx_cnt[i] = 0;
-				dbg_plc_cnt[i] = 0;
-				dbg_dec_err[i] = 0;
-				dbg_peak[i] = 0;
-				dbg_plc_streak_max[i] = 0;
-			}
-		}
-
-		/* Pack as I2S words: left sample in bits [31:16], right in bits [15:0].
-		 * NRF_I2S_ALIGN_LEFT expects this layout (see i2s_word_unpack).
-		 * Packing here (rather than storing int16_t[] and casting to uint32_t[])
-		 * avoids a channel-swap caused by little-endian byte ordering. */
-		uint32_t stereo_buf[PCM_SAMPLES_PER_FRAME];
-		int16_t mono_mix[PCM_SAMPLES_PER_FRAME];
-		for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
-			int32_t s = mixed_pcm[i];
-			if (s > PCM_INT16_MAX) {
-				s = PCM_INT16_MAX;
-			} else if (s < -32768) {
-				s = -32768;
-			}
-			int16_t sample = (int16_t)s;
-			/* Mono: same sample on both channels. */
-			stereo_buf[i] = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
-			mono_mix[i] = sample;
-		}
-		if (k_msgq_put(&uplink_mix_q, mono_mix, K_NO_WAIT) != 0) {
-			int16_t dropped[PCM_SAMPLES_PER_FRAME];
-			(void)k_msgq_get(&uplink_mix_q, dropped, K_NO_WAIT);
-			(void)k_msgq_put(&uplink_mix_q, mono_mix, K_NO_WAIT);
-		}
-
-		if (k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT) != 0) {
-			uint32_t dropped[PCM_SAMPLES_PER_FRAME];
-			(void)k_msgq_get(&tx_msgq, dropped, K_NO_WAIT);
-			(void)k_msgq_put(&tx_msgq, stereo_buf, K_NO_WAIT);
-		}
-	}
-}
-#endif
+/* -------------------------------------------------------------------------- */
 
 static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -714,7 +407,11 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	struct net_buf *buf;
 	uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
 	static uint32_t tx_frame_cnt;
-	static uint32_t tx_silence_cnt;
+	static uint32_t tx_underrun_cnt;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
 
 	while (true) {
 		k_sem_take(&tx_sem, K_FOREVER);
@@ -727,14 +424,17 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 
 		net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 
-		bool got_frame = (k_msgq_get(&lc3_encoded_q, enc_data, K_NO_WAIT) == 0);
-
-		if (!got_frame) {
+		/* Atomically consume encoded_data_ready: if it was 1, send the
+		 * freshest encoded frame; otherwise send silence to keep the BIG
+		 * stream alive while the encoder catches up. */
+		if (atomic_set(&encoded_data_ready, 0) != 0) {
+			memcpy(enc_data, encoded_shared, sizeof(enc_data));
+		} else {
 			memset(enc_data, 0, sizeof(enc_data));
-			tx_silence_cnt++;
-			if ((tx_silence_cnt % 10U) == 1U) {
+			tx_underrun_cnt++;
+			if ((tx_underrun_cnt % 10U) == 1U) {
 				printk("[tx] underrun — sending silence (cnt=%u)\n",
-				       tx_silence_cnt);
+				       tx_underrun_cnt);
 			}
 		}
 		net_buf_add_mem(buf, enc_data, sizeof(enc_data));
@@ -747,13 +447,13 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 		}
 
 		seq_num++;
-		tx_frame_cnt++;
-
-		if ((tx_frame_cnt % 200U) == 0U) {
-			tx_silence_cnt = 0;
+		if ((++tx_frame_cnt % 200U) == 0U) {
+			tx_underrun_cnt = 0;
 		}
 	}
 }
+
+/* -------------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------- */
 
@@ -767,22 +467,12 @@ static void iso_connected(struct bt_iso_chan *chan)
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 {
 	printk("ISO Channel %p disconnected with reason 0x%02x\n", chan, reason);
-	for (int i = 0; i < NUM_RX_BIS; i++) {
-		if (chan == bis[i + 1]) {
-			bis_ever_rx[i] = false;
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-			k_msgq_purge(&uplink_rx_q[i]);
-#endif
-			break;
-		}
-	}
 }
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	if (chan == bis[0]) {
 		k_sem_give(&tx_sem);
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 		/* Feed the TX anchor timestamp to the HFCLKAUDIO integrator.
 		 * bt_iso_chan_get_tx_sync() is the only source of a hardware
 		 * BT controller timestamp on the broadcaster — iso_sent() itself
@@ -799,58 +489,59 @@ static void iso_sent(struct bt_iso_chan *chan)
 				       tx_sync_fail_cnt);
 			}
 		}
-#endif
 	}
 }
 
-static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
-		     struct net_buf *buf)
+/* Helper to get 0-based index for uplink BIS (bis[1] -> 0, bis[2] -> 1, etc.) */
+static int get_uplink_bis_index(struct bt_iso_chan *chan)
 {
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-	struct uplink_frame frame;
-
-	if (buf && buf->len > 0 && buf->len <= CONFIG_BT_ISO_TX_MTU &&
-	    (info->flags & BT_ISO_FLAGS_VALID)) {
-		frame.len = buf->len;
-		memcpy(frame.data, buf->data, buf->len);
-	} else {
-		frame.len = 0;
-	}
-#endif
-
-	/* bis[0] is TX-only; uplink channels are bis[1..N] → uplink_rx_q[0..N-1] */
-	for (int i = 0; i < NUM_RX_BIS; i++) {
-		if (chan == bis[i + 1]) {
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-			if (k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT) != 0) {
-				struct uplink_frame dropped;
-				(void)k_msgq_get(&uplink_rx_q[i], &dropped, K_NO_WAIT);
-				(void)k_msgq_put(&uplink_rx_q[i], &frame, K_NO_WAIT);
-			}
-#else
-			if (i == 0 && buf && buf->len > 0 && buf->len <= CONFIG_BT_ISO_TX_MTU &&
-			    (info->flags & BT_ISO_FLAGS_VALID)) {
-				static uint32_t relay_frame_cnt;
-				static uint32_t relay_drop_cnt;
-				uint8_t relay_buf[CONFIG_BT_ISO_TX_MTU] = {0};
-
-				memcpy(relay_buf, buf->data, buf->len);
-				if (k_msgq_put(&lc3_encoded_q, relay_buf, K_NO_WAIT) != 0) {
-					uint8_t dropped[CONFIG_BT_ISO_TX_MTU];
-
-					(void)k_msgq_get(&lc3_encoded_q, dropped, K_NO_WAIT);
-					(void)k_msgq_put(&lc3_encoded_q, relay_buf, K_NO_WAIT);
-					relay_drop_cnt++;
-				}
-				relay_frame_cnt++;
-				if ((relay_frame_cnt % 200U) == 0U) {
-					relay_drop_cnt = 0;
-				}
-			}
-#endif
-			break;
+	for (int i = 1; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+		if (chan == bis[i]) {
+			return i - 1;  /* Convert to 0-based array index */
 		}
 	}
+	return -1;  /* Not an uplink BIS (bis[0] is TX only) */
+}
+
+static void iso_recv(struct bt_iso_chan *chan,
+		     const struct bt_iso_recv_info *info,
+		     struct net_buf *buf)
+{
+	int bis_idx = get_uplink_bis_index(chan);
+
+	if (bis_idx < 0) {
+		return; /* Not an uplink BIS (bis[0] is TX only) */
+	}
+
+	/* Per-interval instrumentation: validate exactly NUM_RX_BIS callbacks per 5ms event.
+	 * BIS2 (bis_idx=0) is always the first uplink BIS — use it as the interval boundary. */
+	static uint32_t interval_call_count;
+	static uint32_t interval_num;
+	static uint8_t  status_mask; /* bit N set = BIS(N+2) had a valid payload this interval */
+	static uint32_t last_seq;
+
+	if (bis_idx == 0) {
+		/* Dump previous interval summary when a new seq_num arrives on BIS2 */
+		if (interval_call_count > 0 && info->seq_num != last_seq) {
+			printk("@%u %u/%u %u%u%u%u%s\n",
+			       interval_num, interval_call_count, NUM_RX_BIS,
+			       (status_mask >> 0) & 1, (status_mask >> 1) & 1,
+			       (status_mask >> 2) & 1, (status_mask >> 3) & 1,
+			       interval_call_count != NUM_RX_BIS ? " MISMATCH" : "");
+			interval_call_count = 0;
+			status_mask = 0;
+			interval_num++;
+		}
+		last_seq = info->seq_num;
+	}
+
+	interval_call_count++;
+	if (!(info->flags & BT_ISO_FLAGS_ERROR) && buf->len > 0) {
+		status_mask |= BIT(bis_idx);
+	}
+
+	// printk("[RX] BIS%d seq=%u flags=0x%02x len=%u\n",
+	//        bis_idx + 2, info->seq_num, info->flags, buf->len);
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -1006,11 +697,9 @@ static int setup_iso_datapaths(void)
 {
 	int err;
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	/* Reset the HFCLKAUDIO integrator on every BIG (re-)creation so it
 	 * starts fresh rather than applying a stale correction. */
 	clk_sync_reset();
-#endif
 
 	for (uint8_t i = 0U; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
 		printk("Setting data path chan %u...\n", i);
@@ -1071,17 +760,10 @@ int main(void)
 		(void)led_set_broadcast_running(false);
 	}
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
 	(void)ptt_init();
 	(void)ptt_lock_init();
-#endif
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-	for (int i = 0; i < NUM_RX_BIS; i++) {
-		k_msgq_init(&uplink_rx_q[i], uplink_rx_q_buffer[i], sizeof(struct uplink_frame), 1);
-	}
-
-	err = audio_init(&tx_msgq, audio_rx_mono_frame);
+	err = audio_init(&playback_ring, audio_rx_mono_frame);
 	if (err) {
 		printk("audio_init failed: %d\n", err);
 		return err;
@@ -1104,24 +786,9 @@ int main(void)
 		return -EIO;
 	}
 
-	for (int i = 0; i < NUM_RX_BIS; i++) {
-		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
-						    &lc3_decoder_mems[i]);
-		if (lc3_decoders[i] == NULL) {
-			printk("Failed to setup LC3 decoder %d\n", i);
-			return -EIO;
-		}
-	}
-
 	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),
 			encoder_thread_func, NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
-
-	k_thread_create(&uplink_dec_thread_data, uplink_dec_stack,
-			K_THREAD_STACK_SIZEOF(uplink_dec_stack), uplink_decoder_thread_func, NULL,
-			NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
-	k_thread_name_set(&uplink_dec_thread_data, "uplink_dec");
-#endif
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -1165,12 +832,8 @@ int main(void)
 			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "iso_tx");
 
-#ifndef CONFIG_GRPTLK_RELAY_ONLY
-	k_timer_init(&uplink_watchdog_timer, uplink_watchdog_expiry, NULL);
-	k_timer_start(&uplink_watchdog_timer, K_USEC(preset_active.qos.interval), K_NO_WAIT);
-#endif
-
 	prime_and_start_iso_transmission();
+
 	led_err = led_set_broadcast_running(true);
 	if (led_err) {
 		printk("led_set_broadcast_running failed: %d\n", led_err);

@@ -16,16 +16,6 @@ config BT_BAP_BROADCAST_SRC_STREAM_COUNT
 	  Must be 2 to enable relay-only mode (exactly one uplink BIS).
 	  Increase to support more simultaneous uplink speakers.
 
-config GRPTLK_RELAY_ONLY
-	bool "Relay-only mode (no local audio codec)"
-	default n
-	depends on BT_BAP_BROADCAST_SRC_STREAM_COUNT = 2
-	help
-	  When enabled, audio decoding, mixing, and the local microphone are
-	  disabled. The first RX BIS is relayed directly to the TX BIS without
-	  decoding or re-encoding locally.
-	  Only valid when BT_BAP_BROADCAST_SRC_STREAM_COUNT=2 (one uplink BIS).
-	  Set via boards/nrf5340dk_nrf5340_cpuapp.conf for relay-only platforms.
 
 comment "------------------------------------------------"
 
