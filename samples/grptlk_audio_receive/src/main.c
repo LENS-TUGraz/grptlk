@@ -36,11 +36,13 @@
  *         copies mic PCM to mic_pcm_shared  [shared buffer, sem-synced]
  *    └─ lc3_encoder thread  [prio 2, 4096 B stack]
  *         waits for mic_frame_sem → lc3_encode()
- *         → stores in encoded_shared → signals tx_sem
+ *         → stores in encoded_shared → sets encoded_data_ready
  *    └─ iso_tx thread  [prio 2, 1024 B stack]
- *         waits for tx_sem → bt_iso_chan_send(encoded_shared)
+ *         polls encoded_data_ready → bt_iso_chan_send(encoded_shared)
  *    └─ iso_sent() [BT ISO callback]
- *         re-arms tx_sem while ptt_active — self-sustaining send chain
+ *         debug GPIO only (TX complete indicator)
+ *    └─ PTT button [ISR]
+ *         kicks tx_sem to prime TX on first press
  *
  * Uplink latency: ~5-6ms (mic capture + encode + direct send)
  * Previous architecture: ~25-30ms (3-slot uplink_ring + 2-slot lc3_tx_q)
@@ -56,8 +58,8 @@
  * PTT (push-to-talk)
  * ------------------
  * ptt_active (io/buttons.c) gates the uplink chain:
- *   0 = iso_sent() does not re-arm tx_sem → chain starves → no uplink TX
- *   1 = iso_sent() re-arms tx_sem → chain self-sustains
+ *   0 = uplink chain starves (no TX)
+ *   1 = encoder drives TX via encoded_data_ready flag
  *
  * Thread summary
  * --------------
@@ -65,7 +67,7 @@
  * clk_sync         1      1024 B   clk_sync_sem (every BIG anchor, 5 ms)
  * lc3_decoder      1      6144 B   encoded_frame_q (K_FOREVER)
  * lc3_encoder      2      4096 B   mic_frame_sem (forever)
- * iso_tx           2      1024 B   tx_sem (forever)
+ * iso_tx           2      1024 B   polls encoded_data_ready + tx_sem (PTT kickstart)
  */
 
 #include <errno.h>
@@ -90,6 +92,7 @@
 #include "io/buttons.h"
 #include "io/led.h"
 #include "lc3.h"
+#include <zephyr/drivers/gpio.h>
 
 /* =========================================================================
  * Constants and configuration
@@ -129,6 +132,35 @@
 			 BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_WINDOW)
 
 /* =========================================================================
+ * Debug GPIO pins for logic analyzer
+ * =========================================================================
+ * D2 (P0.31) = debug_iso_recv - iso_recv() callback (downlink BIS1)
+ * D3 (P1.0)  = debug_lc3_dec - decoder thread processing
+ * D4 (P1.1)  = debug_lc3_enc - encoder thread processing
+ * P1.14      = debug_iso_sent - iso_sent() callback (uplink TX)
+ */
+static const struct gpio_dt_spec debug_iso_sent = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
+	.pin = 31,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_iso_recv = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 0,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_lc3_dec = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 1,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_lc3_enc = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 14,
+	.dt_flags = 0
+};
+
+/* =========================================================================
  * Lock-free triple-slot ring buffers
  * =========================================================================
  *
@@ -160,7 +192,7 @@ struct encoded_frame {
 	uint8_t  data[CONFIG_BT_ISO_TX_MTU];
 };
 
-K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct encoded_frame), 1, 1);
+K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct encoded_frame), 2, 1);
 
 /* --- Downlink playback ring buffer (decoder thread → DMA ISR) ------------- */
 /* Circular FIFO of 1ms stereo I2S blocks.
@@ -198,6 +230,7 @@ static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
 static size_t encoded_len;
 static atomic_t encoded_data_ready = ATOMIC_INIT(0);
+static atomic_t tx_in_progress = ATOMIC_INIT(0);
 
 /* =========================================================================
  * Downlink playback: decoder thread → ring buffer → DMA ISR
@@ -211,8 +244,7 @@ static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 /* =========================================================================
  * Uplink TX semaphore
  * ========================================================================= */
-#define NUM_PRIME_PACKETS 2
-K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
+K_SEM_DEFINE(tx_sem, 0, 1);
 
 /* =========================================================================
  * LC3 codec state
@@ -241,6 +273,9 @@ static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
+
+/* Decoder → encoder synchronization */
+static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
 
 /* =========================================================================
  * BLE ISO / BIG state
@@ -307,7 +342,7 @@ static void bis1_activity_timeout_handler(struct k_timer *timer)
  * ISO channel objects
  * ========================================================================= */
 
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * NUM_PRIME_PACKETS,
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * 1,
 			  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
@@ -318,7 +353,7 @@ static uint16_t               seq_num;
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
 	.sdu = CONFIG_BT_ISO_TX_MTU,
-	.rtn = 1,
+	.rtn = 2,
 	.phy = BT_GAP_LE_PHY_2M,
 };
 static struct bt_iso_chan_qos bis_iso_qos = {
@@ -377,6 +412,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		k_msgq_get(&encoded_frame_q, &frame, K_FOREVER);
 
+		gpio_pin_set_dt(&debug_lc3_dec, 1);
+
 		const uint8_t *lc3_data = (frame.len > 0U) ? frame.data : NULL;
 		const int      lc3_len  = (frame.len > 0U) ? (int)frame.len : 0;
 
@@ -392,6 +429,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
 
+		gpio_pin_set_dt(&debug_lc3_dec, 0);
 
 		/* Split 80 mono samples → 5 × 16-sample blocks, pack stereo into ring. */
 		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
@@ -412,12 +450,14 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			ring_prod_idx = RING_NEXT(ring_prod_idx);
 		}
 
+		/* Signal encoder that it can now proceed */
+		k_sem_give(&decoder_proceed_sem);
+
 		if ((rx_frame_cnt++ % 200U) == 0U) {
-			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u locked=%d\n",
+			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u\n",
 			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_overrun_cnt,
 			       (uint32_t)RING_FILLED(),
-			       audio_underrun_count_reset(),
-			       clk_sync_is_locked() ? 1 : 0);
+			       audio_underrun_count_reset());
 			rx_plc_cnt     = 0;
 			rx_dec_err_cnt = 0;
 			rx_overrun_cnt = 0;
@@ -444,8 +484,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	while (1) {
 		int ret;
 
-		/* Block until the DMA ISR signals a new mic frame is ready. */
-		k_sem_take(&mic_frame_sem, K_FOREVER);
+		/* Wait for decoder to complete (drives encoder timing) */
+		k_sem_take(&decoder_proceed_sem, K_FOREVER);
 
 		/* Copy to local buffer (quick, ISR won't overwrite for 5ms). */
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
@@ -464,19 +504,26 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
+		gpio_pin_set_dt(&debug_lc3_enc, 1);
+
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1,
 				 octets_per_frame, encoded_buf);
 		if (ret < 0) {
 			printk("[enc] lc3_encode error: %d\n", ret);
+			gpio_pin_set_dt(&debug_lc3_enc, 0);
 			continue;
 		}
 
 		/* Store encoded frame in shared buffer and signal TX thread. */
 		memcpy(encoded_shared, encoded_buf, octets_per_frame);
 		encoded_len = octets_per_frame;
+
+		gpio_pin_set_dt(&debug_lc3_enc, 0);
+		
 		atomic_set(&encoded_data_ready, 1);
-		printk("[enc] encoded %d bytes, ptt=%d\n", octets_per_frame, atomic_get(&ptt_active));
-		k_sem_give(&tx_sem);
+
+		/* Signal TX thread that encoded data is ready.
+		 * TX thread polls on this atomic flag for lowest latency. */
 
 		if ((enc_frame_cnt++ % 200U) == 0U) {
 			printk("[tx] frame=%u\n", enc_frame_cnt);
@@ -517,8 +564,23 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	while (true) {
 		struct bt_iso_chan *ul_chan;
 
-		k_sem_take(&tx_sem, K_FOREVER);
-		printk("[tx_thread] woke up, ptt=%d, enc_len=%u\n", atomic_get(&ptt_active), encoded_len);
+		/* Wait for encoder to produce data or PTT button press.
+		 * Use short timeout to check both conditions efficiently. */
+		while (atomic_get(&encoded_data_ready) == 0) {
+			/* Check for PTT kickstart non-blocking */
+			if (k_sem_take(&tx_sem, K_NO_WAIT) == 0) {
+				break;
+			}
+			/* Wait a bit before checking again to avoid busy polling */
+			k_sleep(K_USEC(100));
+		}
+
+		/* Wait for previous TX to complete before sending next packet.
+		 * This prevents buffer exhaustion and ensures proper sequencing. */
+		while (atomic_get(&tx_in_progress) != 0) {
+			k_sleep(K_USEC(100));
+		}
+
 		ul_chan = iso_select_uplink_chan();
 		if (ul_chan != NULL) {
 			(void)uplink_send_next(ul_chan);
@@ -557,8 +619,12 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 	net_buf_add_mem(buf, encoded_shared, encoded_len);
 
-	/* Clear encoded_data_ready flag after consuming data. */
+	/* Clear encoded_data_ready and set tx_in_progress before sending.
+	 * This ensures proper sequencing:
+	 * - encoded_data_ready = 0 allows encoder to produce next frame
+	 * - tx_in_progress = 1 blocks TX thread until iso_sent fires */
 	atomic_set(&encoded_data_ready, 0);
+	atomic_set(&tx_in_progress, 1);
 
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0) {
@@ -567,7 +633,7 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return err;
 	}
 
-	printk("[send] sent %u bytes on chan %p, seq=%u\n", encoded_len, chan, seq_num);
+	// printk("[send] sent %u bytes on chan %p, seq=%u\n", encoded_len, chan, seq_num);
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
 	return 0;
@@ -579,16 +645,16 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	/* Re-arm tx_sem for next frame while PTT is active AND encoder has data.
-	 * Only the active uplink BIS signals tx_sem to avoid multiple wakes.
-	 *
-	 * Fix: Only re-arm when encoded_data_ready is set to prevent sending
-	 * 0-byte packets in a tight loop when encoder hasn't produced data yet. */
-	if (chan == bis[active_uplink_bis] &&
-	    atomic_get(&ptt_active) != 0 &&
-	    atomic_get(&encoded_data_ready) != 0) {
-		k_sem_give(&tx_sem);
+	gpio_pin_set_dt(&debug_iso_sent, 1);
+
+	/* Clear tx_in_progress for the active uplink BIS only.
+	 * This signals the TX thread that the previous transmission is complete
+	 * and allows the next packet to be sent. */
+	if (chan == bis[active_uplink_bis]) {
+		atomic_set(&tx_in_progress, 0);
 	}
+
+	gpio_pin_set_dt(&debug_iso_sent, 0);
 }
 
 /* iso_recv: receives BIG SDUs on BIS1 (downlink only).
@@ -607,6 +673,8 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		return;
 	}
 
+	gpio_pin_set_dt(&debug_iso_recv, 1);
+
 	{
 		struct encoded_frame ef;
 
@@ -621,22 +689,26 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		k_msgq_put(&encoded_frame_q, &ef, K_NO_WAIT);
 	}
 
+	gpio_pin_set_dt(&debug_iso_recv, 0);
+
 	/* Feed BIG anchor to clk_sync on every BIS1 frame (valid or not).
+	 * DISABLED: Receiver doesn't need clk_sync because decoder and encoder
+	 * are independent clock domains (no mixing like broadcaster). clk_sync
+	 * was causing periodic underruns by fighting the natural I2S→encoder flow.
+	 *
 	 * info->ts carries the same BIG anchor as bt_iso_chan_get_tx_sync()
 	 * but is available here for free — no HCI round-trip needed.
 	 * ISR-safe: clk_sync_anchor_notify() uses only atomic_set + k_sem_give.
 	 * Feeding every 5 ms keeps the 20-frame accumulation window filling at
 	 * the same rate as the original design, locking in ~2 s. */
+#if 0
 	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
 		clk_sync_anchor_notify(info->ts);
 	}
+#endif
 
-	if (iso_datapaths_setup) {
-		iso_datapaths_setup = false;
-		if (atomic_get(&ptt_active) != 0) {
-			k_sem_give(&tx_sem);
-		}
-	}
+	/* Removed tx_sem priming from here - encoder now primes TX after first encode */
+	iso_datapaths_setup = false;
 }
 
 static void iso_connected(struct bt_iso_chan *chan)
@@ -971,7 +1043,7 @@ static int setup_iso_datapaths(void)
 		printk("Data path set chan %u.\n", i);
 	}
 
-	clk_sync_reset();
+	/* clk_sync_reset() - DISABLED: Receiver doesn't use clk_sync */
 
 	seq_num = 0U;
 	atomic_set(&uplink_tx_active, 0);
@@ -1032,6 +1104,9 @@ static int lc3_workers_start(void)
 			ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
 
+	/* Initialize decoder_proceed_sem as unavailable (encoder runs after decoder) */
+	k_sem_init(&decoder_proceed_sem, 0, 1);
+
 	k_thread_create(&tx_thread_data, tx_thread_stack,
 			K_THREAD_STACK_SIZEOF(tx_thread_stack),
 			tx_thread, NULL, NULL, NULL,
@@ -1087,6 +1162,43 @@ int main(void)
 		return err;
 	}
 
+	/* --- Debug GPIO outputs for logic analyzer ------------------------- */
+	if (!device_is_ready(debug_iso_recv.port)) {
+		printk("Debug ISO recv GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_iso_recv, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug ISO recv GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_lc3_dec.port)) {
+		printk("Debug LC3 decode GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_lc3_dec, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug LC3 decode GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_lc3_enc.port)) {
+		printk("Debug LC3 encode GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_lc3_enc, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug LC3 encode GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_iso_sent.port)) {
+		printk("Debug ISO sent GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_iso_sent, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug ISO sent GPIO configure failed: %d\n", err);
+		}
+	}
+
 	/* --- BIS1 inactivity watchdog --------------------------------------- */
 	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
 	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
@@ -1108,7 +1220,7 @@ int main(void)
 	}
 
 	/* --- Clock sync thread (BLE anchor → HFCLKAUDIO PI controller) ----- */
-	clk_sync_init();
+	/* clk_sync_init() - DISABLED: Receiver doesn't use clk_sync */
 
 	/* --- LC3 codec threads (decoder, encoder, iso_tx) ------------------ */
 	err = lc3_workers_start();

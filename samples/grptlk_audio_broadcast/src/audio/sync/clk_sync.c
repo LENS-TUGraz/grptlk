@@ -151,9 +151,14 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 	int      lock_count    = 0;
 	uint32_t ts_prev       = 0;
 	bool     have_baseline = false;
+	uint32_t wake_cnt      = 0;
 
 	while (1) {
 		k_sem_take(&clk_sync_sem, K_FOREVER);
+
+		if ((wake_cnt++ % 100) == 0) {
+			printk("[clk] thread alive, wake=%u\n", wake_cnt);
+		}
 
 		if (atomic_cas(&g_reset, 1, 0)) {
 			reset_internal(&accum, &frame_count, &lock_count, &ts_prev);
@@ -164,6 +169,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		uint32_t ts_now = (uint32_t)atomic_get(&g_ts_us);
 
 		if (!have_baseline) {
+			printk("[clk] baseline: ts_now=%u prev=%u\n", ts_now, ts_prev);
 			ts_prev       = ts_now;
 			have_baseline = true;
 			continue;
@@ -175,6 +181,13 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		int32_t phase_err   = interval_us - BIG_INTERVAL_US;
 		ts_prev = ts_now;
 
+		/* Debug: log interval errors every 100 frames */
+		static uint32_t dbg_cnt;
+		if ((dbg_cnt++ % 100) == 0) {
+			printk("[clk] interval=%d us phase_err=%d us accum=%d\n",
+			       interval_us, phase_err, accum);
+		}
+
 		/* Runaway guard: discard measurements caused by BLE packet loss
 		 * or multi-interval scheduling gaps.  Keep FREQ_VALUE and lock
 		 * state unchanged — the oscillator didn't jump, we just missed
@@ -183,6 +196,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		 * frame → next inter-arrival = N×5000 µs → guard fires → lock
 		 * reset → never accumulates 20 consecutive clean windows). */
 		if (phase_err > RUNAWAY_THRESH_US || phase_err < -RUNAWAY_THRESH_US) {
+			printk("[clk] RUNAWAY: phase_err=%d us (resetting accum)\n", phase_err);
 			accum       = 0;
 			frame_count = 0;
 			continue;
@@ -198,6 +212,8 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		/* --- End of filter window: decide correction -------------------- */
 		int32_t window_err = accum;
 
+		printk("[clk] WINDOW: err=%d us (frame_count=%d)\n", window_err, frame_count);
+
 		accum       = 0;
 		frame_count = 0;
 
@@ -212,6 +228,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 		}
 
 		if (step != 0) {
+			uint16_t old_freq = freq_value;
 			uint16_t new_freq = (uint16_t)CLAMP((int32_t)freq_value + step,
 							    (int32_t)FREQ_MIN,
 							    (int32_t)FREQ_MAX);
@@ -221,8 +238,9 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 				freq_value = new_freq;
 				nrfx_clock_hfclkaudio_config_set(freq_value);
 			}
-			printk("[clk] freq=0x%04x step=%+d err=%+d us%s\n",
-			       freq_value, (int)step, (int)window_err,
+			uint16_t actual_freq = nrfx_clock_hfclkaudio_config_get();
+			printk("[clk] FREQ: 0x%04x -> 0x%04x (wrote 0x%04x) step=%+d err=%+d us%s\n",
+			       old_freq, actual_freq, freq_value, (int)step, (int)window_err,
 			       was_locked ? " [UNLOCK]" : "");
 			lock_count = 0;
 			atomic_set(&g_locked, 0);

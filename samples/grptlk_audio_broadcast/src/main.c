@@ -30,6 +30,35 @@ static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gp
 static struct gpio_callback vol_dn_cb_data;
 static struct gpio_callback vol_up_cb_data;
 
+/* =========================================================================
+ * Debug GPIO pins for logic analyzer
+ * =========================================================================
+ * D2 (P0.31) = debug_iso_recv - iso_recv() callback (downlink BIS1)
+ * D3 (P1.0)  = debug_lc3_dec - decoder thread processing
+ * D4 (P1.1)  = debug_lc3_enc - encoder thread processing
+ * P1.14      = debug_iso_sent - iso_sent() callback (uplink TX)
+ */
+static const struct gpio_dt_spec debug_iso_sent = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
+	.pin = 31,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_iso_recv = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 0,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_lc3_dec = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 1,
+	.dt_flags = 0
+};
+static const struct gpio_dt_spec debug_lc3_enc = {
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
+	.pin = 14,
+	.dt_flags = 0
+};
+
 /* Deferred volume work: ISRs cannot call SPI directly. */
 static struct k_work vol_work;
 static atomic_t vol_pending_step = ATOMIC_INIT(0);
@@ -279,7 +308,7 @@ static void override_preset_for_lc3plus_5ms(void)
 #define BLOCK_BYTES           AUDIO_BLOCK_BYTES
 /* BIS layout: bis[0] = TX (BIS1), bis[1..N] = RX uplink */
 #define NUM_RX_BIS        (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
-#define NUM_PRIME_PACKETS 2
+#define NUM_PRIME_PACKETS 1
 
 /* Speaker playback ring buffer — kept for audio_init() but never written by
  * iso_recv, so the DMA output path produces silence. */
@@ -304,9 +333,34 @@ static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
 static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 
+/* Mixed uplink audio from decoder → encoder */
+static int16_t mixed_uplink_pcm[PCM_SAMPLES_PER_FRAME];
+static atomic_t uplink_audio_ready = ATOMIC_INIT(0);
+
 /* LC3 */
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
+static lc3_decoder_t lc3_decoders[NUM_RX_BIS];
+static lc3_decoder_mem_16k_t lc3_decoder_mem[NUM_RX_BIS];
+
+/* TX ready flag: ignore iso_recv until TX path has sent NUM_PRIME_PACKETS+1 packets */
+static atomic_t iso_tx_ready = ATOMIC_INIT(0);
+#define ISO_TX_READY_THRESHOLD (NUM_PRIME_PACKETS + 1)  /* 3 packets */
+
+/* Uplink RX decoder */
+#define NUM_RX_BIS (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
+
+struct rx_bis_frame {
+	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+	bool received;
+	bool valid;
+	uint32_t seq_num;
+};
+
+static struct rx_bis_frame rx_frames[NUM_RX_BIS];
+static atomic_t rx_bis_received_count = ATOMIC_INIT(0);
+static K_SEM_DEFINE(decoder_sem, 0, 1);  /* Signals decoder: all BIS received */
+static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
 
 /* BAP */
 static struct bt_bap_broadcast_source *broadcast_source __maybe_unused;
@@ -344,12 +398,16 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 /* Threads */
 #define ENCODER_STACK_SIZE    4096
 #define ENCODER_PRIORITY      2
+#define DECODER_STACK_SIZE    4096
+#define DECODER_PRIORITY      3  /* Higher than encoder (runs first) */
 #define TX_THREAD_STACK_SIZE  1024
 #define TX_THREAD_PRIORITY    2
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
+K_THREAD_STACK_DEFINE(decoder_stack, DECODER_STACK_SIZE);
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
 
 static struct k_thread encoder_thread_data __maybe_unused;
+static struct k_thread decoder_thread_data __maybe_unused;
 static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
@@ -366,18 +424,40 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	int16_t local_pcm[PCM_SAMPLES_PER_FRAME];
 	static uint32_t enc_frame_cnt;
 	int octets_per_frame = preset_active.qos.sdu;
+	static bool first_frame = true;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
 	while (1) {
-		k_sem_take(&mic_frame_sem, K_FOREVER);
+		/* Wait for decoder to complete (drives encoder timing) */
+		k_sem_take(&decoder_proceed_sem, K_FOREVER);
+
+		gpio_pin_set_dt(&debug_lc3_enc, 1);
+
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
 		/* PTT gate: broadcast silence when button is not held. */
 		if (atomic_get(&ptt_active) == 0) {
 			memset(local_pcm, 0, sizeof(local_pcm));
+		}
+
+		/* Mix microphone with uplink audio if available */
+		if (atomic_set(&uplink_audio_ready, 0) != 0) {
+			/* 50% mic + 50% uplink with overflow protection */
+			for (int i = 0; i < PCM_SAMPLES_PER_FRAME; i++) {
+				int32_t mixed = (local_pcm[i] / 2) + (mixed_uplink_pcm[i] / 2);
+
+				/* Clamp to int16 range */
+				if (mixed > INT16_MAX) {
+					mixed = INT16_MAX;
+				} else if (mixed < INT16_MIN) {
+					mixed = INT16_MIN;
+				}
+
+				local_pcm[i] = (int16_t)mixed;
+			}
 		}
 
 		uint32_t t0 = k_cycle_get_32();
@@ -388,13 +468,129 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		if (ret == -1) {
 			printk("LC3 encode failed\n");
+			gpio_pin_set_dt(&debug_lc3_enc, 0);
 			continue;
 		}
 
 		atomic_set(&encoded_data_ready, 1);
 
+		gpio_pin_set_dt(&debug_lc3_enc, 0);
+
+		/* Only first frame: trigger TX to prime the pump.
+		 * After that, iso_sent() drives TX. */
+		if (first_frame) {
+			k_sem_give(&tx_sem);
+			first_frame = false;
+		}
+
 		if ((enc_frame_cnt++ % 100U) == 0U) {
 			printk("[enc] frame=%u encode=%u us\n", enc_frame_cnt, enc_us);
+		}
+	}
+}
+
+static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
+{
+	int ret;
+	int16_t decoded_pcm[NUM_RX_BIS][PCM_SAMPLES_PER_FRAME];
+	static uint32_t dec_frame_cnt;
+
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (1) {
+		/* Wait for all BIS packets to arrive */
+		k_sem_take(&decoder_sem, K_FOREVER);
+
+		gpio_pin_set_dt(&debug_lc3_dec, 1);
+
+		/* First pass: check if ANY BIS has valid data */
+		bool any_valid = false;
+		for (int i = 0; i < NUM_RX_BIS; i++) {
+			struct rx_bis_frame *frame = &rx_frames[i];
+			if (frame->valid) {
+				any_valid = true;
+				break;
+			}
+		}
+
+		/* If no uplink active, skip this frame entirely */
+		if (!any_valid) {
+			gpio_pin_set_dt(&debug_lc3_dec, 0);
+			/* Don't signal encoder (no uplink audio to mix) */
+			if ((dec_frame_cnt++ % 100U) == 0U) {
+				printk("[dec] frame=%u (no uplink)\n", dec_frame_cnt);
+			}
+			continue;  /* Skip to next frame */
+		}
+
+		/* Decode each VALID received BIS */
+		bool bis_valid[NUM_RX_BIS] = {false};  /* Track which BISes had valid data */
+		for (int i = 0; i < NUM_RX_BIS; i++) {
+
+			struct rx_bis_frame *frame = &rx_frames[i];
+
+			if (!frame->valid) {
+				/* No valid packet for this BIS - skip */
+				frame->received = false;
+				continue;
+			}
+
+			ret = lc3_decode(lc3_decoders[i], frame->data, sizeof(frame->data),
+					 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
+
+			bis_valid[i] = (ret == 0);  /* Mark as valid if decode succeeded */
+			frame->received = false;  /* Reset for next interval */
+		}
+
+		/* Mix all valid decoded BISes and play to speaker */
+		/* One LC3 frame (80 samples) = 5 ring blocks (16 samples each) */
+		for (int blk = 0; blk < AUDIO_I2S_BLKS_PER_FRAME; blk++) {
+			uint16_t pi = ring_prod_idx;
+			uint32_t *ring_blk = playback_ring.fifo[pi];
+
+			/* Mix all valid decoded BISes for this block */
+			for (int j = 0; j < AUDIO_I2S_SAMPLES_PER_BLOCK; j++) {
+				int32_t mixed_sample = 0;
+
+				/* Sum only valid BISes for this sample */
+				for (int i = 0; i < NUM_RX_BIS; i++) {
+					if (bis_valid[i]) {
+						mixed_sample += decoded_pcm[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
+					}
+				}
+
+				/* Clip to int16 range to prevent overflow */
+				if (mixed_sample > INT16_MAX) {
+					mixed_sample = INT16_MAX;
+				} else if (mixed_sample < INT16_MIN) {
+					mixed_sample = INT16_MIN;
+				}
+
+				/* Convert to int16 and duplicate to both L/R channels */
+				int16_t sample = (int16_t)mixed_sample;
+				ring_blk[j] = ((uint32_t)((uint16_t)sample) |
+					       ((uint32_t)((uint16_t)sample) << 16));
+
+				/* Store mixed uplink sample for encoder */
+				mixed_uplink_pcm[blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j] = sample;
+			}
+
+			/* Advance producer index */
+			ring_prod_idx = (pi + 1U) % playback_ring.num_blks;
+		}
+
+		/* Signal encoder that uplink audio is ready */
+		atomic_set(&uplink_audio_ready, 1);
+
+		gpio_pin_set_dt(&debug_lc3_dec, 0);
+
+		/* Signal encoder that it can now proceed */
+		k_sem_give(&decoder_proceed_sem);
+
+		if ((dec_frame_cnt++ % 100U) == 0U) {
+			printk("[dec] frame=%u\n", dec_frame_cnt);
 		}
 	}
 }
@@ -424,18 +620,15 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 
 		net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 
-		/* Atomically consume encoded_data_ready: if it was 1, send the
-		 * freshest encoded frame; otherwise send silence to keep the BIG
-		 * stream alive while the encoder catches up. */
+		/* Since encoder now triggers TX, encoded_data_ready should always be set.
+		 * The atomic check is kept for safety in case of timing anomalies. */
 		if (atomic_set(&encoded_data_ready, 0) != 0) {
 			memcpy(enc_data, encoded_shared, sizeof(enc_data));
 		} else {
+			/* This should never happen with encoder-driven timing */
 			memset(enc_data, 0, sizeof(enc_data));
 			tx_underrun_cnt++;
-			if ((tx_underrun_cnt % 10U) == 1U) {
-				printk("[tx] underrun — sending silence (cnt=%u)\n",
-				       tx_underrun_cnt);
-			}
+			printk("[tx] WARNING: Unexpected underrun (cnt=%u)\n", tx_underrun_cnt);
 		}
 		net_buf_add_mem(buf, enc_data, sizeof(enc_data));
 
@@ -472,7 +665,20 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	if (chan == bis[0]) {
-		k_sem_give(&tx_sem);
+		// gpio_pin_set_dt(&debug_iso_sent, 1);
+
+		k_sem_give(&tx_sem);  /* RESTORED: Drive TX timing */
+
+		// gpio_pin_set_dt(&debug_iso_sent, 0);
+
+		/* Mark TX as ready after NUM_PRIME_PACKETS+1 packets sent.
+		 * This signals iso_recv that the TX path is stable. */
+		static uint32_t tx_sent_count;
+		if (atomic_get(&iso_tx_ready) == 0 &&
+		    ++tx_sent_count >= ISO_TX_READY_THRESHOLD) {
+			atomic_set(&iso_tx_ready, 1);
+		}
+
 		/* Feed the TX anchor timestamp to the HFCLKAUDIO integrator.
 		 * bt_iso_chan_get_tx_sync() is the only source of a hardware
 		 * BT controller timestamp on the broadcaster — iso_sent() itself
@@ -489,6 +695,8 @@ static void iso_sent(struct bt_iso_chan *chan)
 				       tx_sync_fail_cnt);
 			}
 		}
+
+		gpio_pin_set_dt(&debug_iso_sent, 0);
 	}
 }
 
@@ -513,35 +721,39 @@ static void iso_recv(struct bt_iso_chan *chan,
 		return; /* Not an uplink BIS (bis[0] is TX only) */
 	}
 
-	/* Per-interval instrumentation: validate exactly NUM_RX_BIS callbacks per 5ms event.
-	 * BIS2 (bis_idx=0) is always the first uplink BIS — use it as the interval boundary. */
-	static uint32_t interval_call_count;
-	static uint32_t interval_num;
-	static uint8_t  status_mask; /* bit N set = BIS(N+2) had a valid payload this interval */
-	static uint32_t last_seq;
-
-	if (bis_idx == 0) {
-		/* Dump previous interval summary when a new seq_num arrives on BIS2 */
-		if (interval_call_count > 0 && info->seq_num != last_seq) {
-			printk("@%u %u/%u %u%u%u%u%s\n",
-			       interval_num, interval_call_count, NUM_RX_BIS,
-			       (status_mask >> 0) & 1, (status_mask >> 1) & 1,
-			       (status_mask >> 2) & 1, (status_mask >> 3) & 1,
-			       interval_call_count != NUM_RX_BIS ? " MISMATCH" : "");
-			interval_call_count = 0;
-			status_mask = 0;
-			interval_num++;
-		}
-		last_seq = info->seq_num;
+	/* Ignore until TX path stable */
+	if (atomic_get(&iso_tx_ready) == 0) {
+		return;
 	}
 
-	interval_call_count++;
-	if (!(info->flags & BT_ISO_FLAGS_ERROR) && buf->len > 0) {
-		status_mask |= BIT(bis_idx);
+	gpio_pin_set_dt(&debug_iso_recv, 1);
+
+	/* Only process VALID packets */
+	bool valid = (buf != NULL && buf->len > 0 && !(info->flags & BT_ISO_FLAGS_ERROR));
+
+	struct rx_bis_frame *frame = &rx_frames[bis_idx];
+	frame->received = true;
+	frame->valid = valid;
+	frame->seq_num = info->seq_num;
+
+	if (valid) {
+		memcpy(frame->data, buf->data, MIN(buf->len, sizeof(frame->data)));
+	} 
+	
+	if (chan == bis[1] && !valid) {
+		gpio_pin_set_dt(&debug_iso_sent, 1);
 	}
 
-	// printk("[RX] BIS%d seq=%u flags=0x%02x len=%u\n",
-	//        bis_idx + 2, info->seq_num, info->flags, buf->len);
+	/* Check if all BIS received this interval */
+	uint32_t count = atomic_inc(&rx_bis_received_count);
+	if (count + 1 >= NUM_RX_BIS) {
+		atomic_set(&rx_bis_received_count, 0);
+		k_sem_give(&decoder_sem);  /* Trigger decoder */
+	}
+
+	gpio_pin_set_dt(&debug_iso_sent, 0);
+
+	gpio_pin_set_dt(&debug_iso_recv, 0);
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -763,6 +975,43 @@ int main(void)
 	(void)ptt_init();
 	(void)ptt_lock_init();
 
+	/* --- Debug GPIO outputs for logic analyzer ------------------------- */
+	if (!device_is_ready(debug_iso_recv.port)) {
+		printk("Debug ISO recv GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_iso_recv, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug ISO recv GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_lc3_dec.port)) {
+		printk("Debug LC3 decode GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_lc3_dec, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug LC3 decode GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_lc3_enc.port)) {
+		printk("Debug LC3 encode GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_lc3_enc, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug LC3 encode GPIO configure failed: %d\n", err);
+		}
+	}
+
+	if (!device_is_ready(debug_iso_sent.port)) {
+		printk("Debug ISO sent GPIO not ready\n");
+	} else {
+		err = gpio_pin_configure_dt(&debug_iso_sent, GPIO_OUTPUT_LOW);
+		if (err) {
+			printk("Debug ISO sent GPIO configure failed: %d\n", err);
+		}
+	}
+
 	err = audio_init(&playback_ring, audio_rx_mono_frame);
 	if (err) {
 		printk("audio_init failed: %d\n", err);
@@ -786,9 +1035,29 @@ int main(void)
 		return -EIO;
 	}
 
+	/* Setup LC3 decoders for each uplink BIS */
+	for (int i = 0; i < NUM_RX_BIS; i++) {
+		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval,
+						   SAMPLE_RATE_HZ, 0,
+						   &lc3_decoder_mem[i]);
+		if (lc3_decoders[i] == NULL) {
+			printk("Failed to setup LC3 decoder %d\n", i);
+			return -EIO;
+		}
+	}
+
+	k_thread_create(&decoder_thread_data, decoder_stack,
+			K_THREAD_STACK_SIZEOF(decoder_stack),
+			decoder_thread_func, NULL, NULL, NULL,
+			DECODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_name_set(&decoder_thread_data, "lc3_decoder");
+
 	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),
 			encoder_thread_func, NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
+
+	/* Initialize decoder_proceed_sem as unavailable (encoder runs after decoder) */
+	k_sem_init(&decoder_proceed_sem, 0, 1);
 
 	err = bt_enable(NULL);
 	if (err) {

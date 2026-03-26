@@ -78,7 +78,6 @@ int audio_i2s_init(void)
 	}
 
 	nrfx_clock_hfclkaudio_config_set(HFCLKAUDIO_12_288_MHZ);
-	NRF_CLOCK->EVENTS_HFCLKAUDIOSTARTED = 0;
 	NRF_CLOCK->TASKS_HFCLKAUDIOSTART = 1;
 
 	/* Wait for ACLK to start */

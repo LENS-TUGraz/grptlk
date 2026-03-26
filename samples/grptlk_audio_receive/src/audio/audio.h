@@ -18,7 +18,7 @@
 #define AUDIO_BLK_PERIOD_US      1000U
 #define AUDIO_BLK_SAMPLES_MONO   (AUDIO_SAMPLE_RATE_HZ / 1000U)  /* 16 */
 #define AUDIO_BLKS_PER_FRAME     (AUDIO_FRAME_DURATION_MS)        /* 5  */
-#define AUDIO_RING_NUM_BLKS      7U  /* ~7ms buffer */
+#define AUDIO_RING_NUM_BLKS      8U  /* ~8ms buffer - reduced for lower latency */
 
 BUILD_ASSERT(AUDIO_BLK_SAMPLES_MONO * AUDIO_BLKS_PER_FRAME == AUDIO_SAMPLES_PER_FRAME,
 	     "1ms block count × block size must equal frame size");
