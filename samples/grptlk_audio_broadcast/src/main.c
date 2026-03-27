@@ -683,11 +683,11 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	if (chan == bis[0]) {
-		// gpio_pin_set_dt(&debug_iso_sent, 1);
+		gpio_pin_set_dt(&debug_iso_sent, 1);
 
 		k_sem_give(&tx_sem);  /* RESTORED: Drive TX timing */
 
-		// gpio_pin_set_dt(&debug_iso_sent, 0);
+		gpio_pin_set_dt(&debug_iso_sent, 0);
 
 		/* Mark TX as ready after NUM_PRIME_PACKETS+1 packets sent.
 		 * This signals iso_recv that the TX path is stable. */
@@ -715,8 +715,6 @@ static void iso_sent(struct bt_iso_chan *chan)
 			}
 #endif
 		}
-
-		gpio_pin_set_dt(&debug_iso_sent, 0);
 	}
 }
 
@@ -759,10 +757,6 @@ static void iso_recv(struct bt_iso_chan *chan,
 	if (valid) {
 		memcpy(frame->data, buf->data, MIN(buf->len, sizeof(frame->data)));
 	} 
-	
-	if (chan == bis[1] && !valid) {
-		gpio_pin_set_dt(&debug_iso_sent, 1);
-	}
 
 	/* Check if all BIS received this interval */
 	uint32_t count = atomic_inc(&rx_bis_received_count);
@@ -770,8 +764,6 @@ static void iso_recv(struct bt_iso_chan *chan,
 		atomic_set(&rx_bis_received_count, 0);
 		k_sem_give(&decoder_sem);  /* Trigger decoder */
 	}
-
-	gpio_pin_set_dt(&debug_iso_sent, 0);
 
 	gpio_pin_set_dt(&debug_iso_recv, 0);
 }
