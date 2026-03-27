@@ -505,6 +505,9 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		gpio_pin_set_dt(&debug_lc3_dec, 1);
 
+		/* Clear uplink ready flag at start of each decoder cycle */
+		atomic_set(&uplink_audio_ready, 0);
+
 		/* First pass: check if ANY BIS has valid data */
 		bool any_valid = false;
 		for (int i = 0; i < NUM_RX_BIS; i++) {
@@ -515,14 +518,15 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		/* If no uplink active, skip this frame entirely */
+		/* If no uplink active, still signal encoder for mic-only transmission */
 		if (!any_valid) {
-			gpio_pin_set_dt(&debug_lc3_dec, 0);
-			/* Don't signal encoder (no uplink audio to mix) */
+			/* No uplink audio this interval - uplink_audio_ready already cleared */
 			if ((dec_frame_cnt++ % 100U) == 0U) {
-				printk("[mix] frame=%u bis= valid=0\n", dec_frame_cnt);
+				printk("[mix] frame=%u bis= valid=0 (mic only)\n", dec_frame_cnt);
 			}
-			continue;  /* Skip to next frame */
+			/* Fall through to signal encoder for mic-only transmission */
+			gpio_pin_set_dt(&debug_lc3_dec, 0);
+			goto signal_encoder;
 		}
 
 		/* Decode each VALID received BIS */
@@ -601,6 +605,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		gpio_pin_set_dt(&debug_lc3_dec, 0);
 
+signal_encoder:
 		/* Signal encoder that it can now proceed */
 		k_sem_give(&decoder_proceed_sem);
 
