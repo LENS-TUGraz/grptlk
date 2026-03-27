@@ -520,7 +520,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			gpio_pin_set_dt(&debug_lc3_dec, 0);
 			/* Don't signal encoder (no uplink audio to mix) */
 			if ((dec_frame_cnt++ % 100U) == 0U) {
-				printk("[dec] frame=%u (no uplink)\n", dec_frame_cnt);
+				printk("[mix] frame=%u bis= valid=0\n", dec_frame_cnt);
 			}
 			continue;  /* Skip to next frame */
 		}
@@ -542,7 +542,22 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 			bis_valid[i] = (ret == 0);  /* Mark as valid if decode succeeded */
 			frame->received = false;  /* Reset for next interval */
+			frame->valid = false;  /* Clear valid flag to prevent stale data */
 		}
+
+		/* Log which BISes were mixed this frame */
+		int valid_count = 0;
+		printk("[mix] frame=%u bis=", dec_frame_cnt);
+		for (int i = 0; i < NUM_RX_BIS; i++) {
+			if (bis_valid[i]) {
+				if (valid_count > 0) {
+					printk(",");
+				}
+				printk("%d", i);
+				valid_count++;
+			}
+		}
+		printk(" valid=%d\n", valid_count);
 
 		/* Mix all valid decoded BISes and play to speaker */
 		/* One LC3 frame (80 samples) = 5 ring blocks (16 samples each) */
@@ -589,9 +604,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Signal encoder that it can now proceed */
 		k_sem_give(&decoder_proceed_sem);
 
-		if ((dec_frame_cnt++ % 100U) == 0U) {
-			printk("[dec] frame=%u\n", dec_frame_cnt);
-		}
+		dec_frame_cnt++;
 	}
 }
 
@@ -690,10 +703,12 @@ static void iso_sent(struct bt_iso_chan *chan)
 			clk_sync_anchor_notify(tx_info.ts);
 		} else {
 			tx_sync_fail_cnt++;
+#if 0
 			if ((tx_sync_fail_cnt % 50U) == 1U) {
 				printk("[clk] bt_iso_chan_get_tx_sync failed (cnt=%u)\n",
 				       tx_sync_fail_cnt);
 			}
+#endif
 		}
 
 		gpio_pin_set_dt(&debug_iso_sent, 0);
