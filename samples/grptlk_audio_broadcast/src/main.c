@@ -362,6 +362,17 @@ static atomic_t rx_bis_received_count = ATOMIC_INIT(0);
 static K_SEM_DEFINE(decoder_sem, 0, 1);  /* Signals decoder: all BIS received */
 static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
 
+/* PRR (Packet Reception Rate) tracking for uplink BISes */
+#define PRR_WINDOW_SIZE 100  /* 100 frames = 500ms @ 5ms/frame, matches print interval */
+
+struct bis_prr_tracker {
+	uint8_t window[PRR_WINDOW_SIZE];  /* 1 = valid, 0 = invalid/missing */
+	uint8_t window_idx;               /* Current position in circular buffer */
+	uint8_t window_filled;            /* Whether window is fully populated */
+};
+
+static struct bis_prr_tracker prr_trackers[NUM_RX_BIS];
+
 /* BAP */
 static struct bt_bap_broadcast_source *broadcast_source __maybe_unused;
 static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
@@ -509,27 +520,6 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Clear uplink ready flag at start of each decoder cycle */
 		atomic_set(&uplink_audio_ready, 0);
 
-		/* First pass: check if ANY BIS has valid data */
-		bool any_valid = false;
-		for (int i = 0; i < NUM_RX_BIS; i++) {
-			struct rx_bis_frame *frame = &rx_frames[i];
-			if (frame->valid) {
-				any_valid = true;
-				break;
-			}
-		}
-
-		/* If no uplink active, still signal encoder for mic-only transmission */
-		if (!any_valid) {
-			/* No uplink audio this interval - uplink_audio_ready already cleared */
-			if ((dec_frame_cnt++ % 100U) == 0U) {
-				printk("[mix] frame=%u bis= valid=0 (mic only)\n", dec_frame_cnt);
-			}
-			/* Fall through to signal encoder for mic-only transmission */
-			gpio_pin_set_dt(&debug_lc3_dec, 0);
-			goto signal_encoder;
-		}
-
 		/* Decode each BIS - NULL buffer triggers LC3 PLC for lost packets */
 		bool bis_valid[NUM_RX_BIS] = {false};  /* Track which BISes had valid data */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
@@ -551,19 +541,44 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			frame->valid = false;  /* Clear valid flag to prevent stale data */
 		}
 
+		/* Calculate and print PRR for each BIS (every 100 frames) */
+		if ((dec_frame_cnt % 100U) == 0U) {
+			printk("[prr] frame=%u", dec_frame_cnt);
+			for (int i = 0; i < NUM_RX_BIS; i++) {
+				struct bis_prr_tracker *tracker = &prr_trackers[i];
+				uint8_t valid_count = 0;
+				uint8_t window_size = tracker->window_filled ? PRR_WINDOW_SIZE : tracker->window_idx;
+
+				for (int j = 0; j < window_size; j++) {
+					valid_count += tracker->window[j];
+				}
+
+				uint8_t prr = (valid_count * 100) / window_size;
+				printk(" bis%u: %u%%", i, prr);
+			}
+			printk("\n");
+		}
+
 		/* Log which BISes were mixed this frame */
 		int valid_count = 0;
-		printk("[mix] frame=%u bis=", dec_frame_cnt);
+//		printk("[mix] frame=%u bis=", dec_frame_cnt);
+//		for (int i = 0; i < NUM_RX_BIS; i++) {
+//			if (bis_valid[i]) {
+//				if (valid_count > 0) {
+//					printk(",");
+//				}
+//				printk("%d", i);
+//				valid_count++;
+//			}
+//		}
+//		printk(" valid=%d\n", valid_count);
+
+		/* Count valid BISes for mixing (count from bis_valid array) */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 			if (bis_valid[i]) {
-				if (valid_count > 0) {
-					printk(",");
-				}
-				printk("%d", i);
 				valid_count++;
 			}
 		}
-		printk(" valid=%d\n", valid_count);
 
 		/* Mix all valid decoded BISes and play to speaker */
 		/* One LC3 frame (80 samples) = 5 ring blocks (16 samples each) */
@@ -755,6 +770,14 @@ static void iso_recv(struct bt_iso_chan *chan,
 	frame->received = true;
 	frame->valid = valid;
 	frame->seq_num = info->seq_num;
+
+	/* Update PRR tracking for this BIS */
+	struct bis_prr_tracker *tracker = &prr_trackers[bis_idx];
+	tracker->window[tracker->window_idx] = valid ? 1 : 0;
+	tracker->window_idx = (tracker->window_idx + 1) % PRR_WINDOW_SIZE;
+	if (tracker->window_idx == 0) {
+		tracker->window_filled = 1;
+	}
 
 	if (valid) {
 		memcpy(frame->data, buf->data, MIN(buf->len, sizeof(frame->data)));
