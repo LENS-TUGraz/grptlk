@@ -55,6 +55,10 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 		k_sem_give(uplink_tx_sem);
 	} else {
 		atomic_set(&ptt_active, 0);
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+		extern void ptt_session_bis_reset(void);
+		ptt_session_bis_reset();
+#endif
 		printk("[PTT] released\n");
 	}
 }
@@ -115,6 +119,10 @@ static void ptt_lock_work_handler(struct k_work *work)
 		atomic_set(&ptt_lock_active, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
 		atomic_set(&ptt_active, 0);
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+		extern void ptt_session_bis_reset(void);
+		ptt_session_bis_reset();
+#endif
 		printk("[PTT-LOCK] disabled — PTT mode active\n");
 	} else {
 		/* Lock: latch TX on. */

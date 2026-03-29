@@ -284,6 +284,10 @@ static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
 
 static uint8_t  big_actual_num_bis  = BIS_ISO_CHAN_COUNT;
 static uint8_t  active_uplink_bis   = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+/* Cached BIS for current PTT session. 0xFF = not selected yet. */
+static uint8_t ptt_session_bis = 0xFFU;
+#endif
 /* Populated in biginfo_cb; used to configure LC3 and I2S after BIG info arrives. */
 static uint32_t big_sdu_interval_us = 5000U;  /* frame duration µs — default 5 ms */
 static uint16_t big_max_sdu         = 20U;    /* octets per frame  — default 20 B  */
@@ -551,7 +555,31 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 static struct bt_iso_chan *iso_select_uplink_chan(void)
 {
-#if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+	extern atomic_t ptt_active;  /* From io/buttons.c */
+
+	/* Check if we need to select a new BIS for this PTT session */
+	if (atomic_get(&ptt_active) && ptt_session_bis == 0xFFU) {
+		uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
+
+		if (num_uplink == 0U) {
+			return NULL;
+		}
+		/* Select random BIS for this session */
+		ptt_session_bis = (uint8_t)(sys_rand32_get() % num_uplink) + 1U;
+		printk("[Uplink] Selected BIS%d for PTT session\n", ptt_session_bis + 1);
+	}
+
+	if (ptt_session_bis != 0xFFU) {
+		active_uplink_bis = ptt_session_bis;
+		return bis[active_uplink_bis];
+	}
+
+	/* PTT not active, no valid BIS */
+	active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+	return bis[active_uplink_bis];
+
+#elif defined(CONFIG_GRPTLK_UPLINK_RANDOM)
 	uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
 
 	if (num_uplink == 0U) {
@@ -567,6 +595,14 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 	return bis[active_uplink_bis];
 #endif
 }
+
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+/* Reset the cached PTT session BIS. Called from buttons.c when PTT is released. */
+void ptt_session_bis_reset(void)
+{
+	ptt_session_bis = 0xFFU;
+}
+#endif
 
 static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef);
 

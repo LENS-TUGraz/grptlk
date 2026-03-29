@@ -48,6 +48,15 @@ config GRPTLK_UPLINK_RANDOM
 	  The broadcaster must use a single shared LC3 decoder for all uplink
 	  BISes to handle the stream correctly.
 
+config GRPTLK_UPLINK_RANDOM_PER_PTT
+	bool "Randomly select uplink BIS once per PTT session"
+	default n
+	depends on !GRPTLK_UPLINK_RANDOM
+	help
+	  When enabled, the receiver picks a random uplink BIS (BIS2..BISn) when
+	  PTT is pressed and uses that same BIS for the entire PTT session.
+	  A new random BIS is selected each time PTT is released and pressed again.
+
 endif # GRPTLK
 
 source "Kconfig.zephyr"
