@@ -530,22 +530,23 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			goto signal_encoder;
 		}
 
-		/* Decode each VALID received BIS */
+		/* Decode each BIS - NULL buffer triggers LC3 PLC for lost packets */
 		bool bis_valid[NUM_RX_BIS] = {false};  /* Track which BISes had valid data */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 
 			struct rx_bis_frame *frame = &rx_frames[i];
 
 			if (!frame->valid) {
-				/* No valid packet for this BIS - skip */
-				frame->received = false;
-				continue;
+				/* Packet lost - trigger LC3 PLC with NULL buffer */
+				ret = lc3_decode(lc3_decoders[i], NULL, 0,
+						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
+			} else {
+				/* Valid packet - normal decode */
+				ret = lc3_decode(lc3_decoders[i], frame->data, sizeof(frame->data),
+						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
 			}
 
-			ret = lc3_decode(lc3_decoders[i], frame->data, sizeof(frame->data),
-					 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
-
-			bis_valid[i] = (ret == 0);  /* Mark as valid if decode succeeded */
+			bis_valid[i] = (ret == 0);  /* PLC-concealed frames return success */
 			frame->received = false;  /* Reset for next interval */
 			frame->valid = false;  /* Clear valid flag to prevent stale data */
 		}
