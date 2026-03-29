@@ -1,137 +1,171 @@
 /*
- * clk_sync.c — BLE BIG anchor → HFCLKAUDIO integral clock synchroniser
+ * clk_sync.c — BLE BIG anchor → HFCLKAUDIO drift compensation
  *
- * How it works (Phase D: Ring Buffer Level Drift Detection)
- * ---------------------------------------------------------
- * The nRF5340 HFCLKAUDIO fractional PLL is driven from the 32 MHz crystal
- * that is shared with the BLE radio.  Despite sharing the same source, the
- * HFCLKAUDIO divide ratio is set independently and drifts relative to the
- * BLE BIG anchor once the codec is running.
+ * 4-state machine:  INIT → CALIB → OFFSET → LOCKED
  *
- * This module eliminates that drift by monitoring the ring buffer level:
- *   1. Ring filling up → decoder faster than DMA → HFCLKAUDIO too slow
- *   2. Ring draining → decoder slower than DMA → HFCLKAUDIO too fast
+ * Error signal: audio ring buffer fill level.
+ *   ring > RING_TARGET_LEVEL → I2S consuming too slowly → HFCLKAUDIO slow
+ *                            → increase APLL freq
+ *   ring < RING_TARGET_LEVEL → I2S consuming too fast  → HFCLKAUDIO fast
+ *                            → decrease APLL freq
  *
- * The ring buffer level is a reliable proxy for drift because it directly
- * measures the production vs consumption rate mismatch over time.
+ * err_us = (RING_TARGET_LEVEL − ring_level) × RING_SCALE_US
+ *   ring=7 (too full):  err_us = (4−7)×10 = −30 → APLL_FREQ_ADJ(−15) = +45 → freq up ✓
+ *   ring=1 (too empty): err_us = (4−1)×10 = +30 → APLL_FREQ_ADJ(+15) = −45 → freq down ✓
  *
- * This approach is more robust than comparing I2S timestamps (which come
- * from a different clock domain) and works correctly even with HCI jitter.
+ * CALIB: Accumulate ring levels over 20 packets (~100 ms at 5 ms BIS interval).
+ * Compute avg_ring_err = avg_ring − RING_TARGET_LEVEL, then set center_freq
+ * to compensate for observed steady-state offset.
  *
  * FREQ_VALUE encoding (nRF5340 PS §5.4.2):
  *   FREQ_VALUE = round(65536 × ((12 × f_out / 32 MHz) − 4))
- *   At f_out = 12.288 MHz → FREQ_VALUE = 0x9BA6
- *   Step size ≈ 32e6 / (12 × 65536) ≈ 40.7 Hz per LSB
+ *   Center: 12.288 MHz → 0x9BA6   Step ≈ 40.7 Hz per LSB
  *
- * Lock detection:
- *   Declared "locked" when ring level stays within ±2 blocks of target
- *   for LOCK_COUNT consecutive windows (~2 s).
- *
- * Thread safety:
- *   g_ts_us   — written by anchor_notify (any context), read by thread only.
- *               atomic_t ensures visibility without a mutex.
- *   g_reset   — set by clk_sync_reset (any context), cleared by thread.
- *               atomic_t ensures coherency.
- *   Ring indices are read from main.c; volatile ensures visibility.
+ * APLL_FREQ_ADJ formula (from nrf5340_audio, uses ns to reduce rounding):
+ *   APLL_FREQ_ADJ(t_us) = -(t_us * 1000) / 331
  */
 
 #include "clk_sync.h"
-#include "audio/audio.h"
 
 #include <zephyr/kernel.h>
 #include <nrfx_clock.h>
 
 /* -------------------------------------------------------------------------
- * Tuning constants
+ * APLL frequency constants
+ * Values from nrf5340_audio/src/modules/audio_i2s.h
  * ------------------------------------------------------------------------- */
+#define APLL_FREQ_CENTER 0x9BA6u  /* 12.288 MHz — nominal for 48 kHz codec  */
+#define APLL_FREQ_MIN    0x8FD8u  /* 12.165 MHz                              */
+#define APLL_FREQ_MAX    0xA774u  /* 12.411 MHz                              */
 
-/* Number of BIG frames to average before making a FREQ_VALUE decision.
- * 20 frames = 100 ms window.  HCI jitter averages to ~0 over this window;
- * real 20 ppm drift accumulates to ~2 µs — enough to trigger a correction. */
-#define FILTER_FRAMES 20
-
-/* Maximum FREQ_VALUE correction per filter window: ±1 step = ±40.7 Hz.
- * Limits the rate of frequency change to prevent audible transients. */
-#define MAX_STEP_PER_WINDOW 1
-
-/* Accumulated error threshold (µs over FILTER_FRAMES) to trigger a step.
- * The BLE ticker runs at 32.768 kHz (1 tick = 30.5 µs).  A 5 ms BIG interval
- * is 163.84 ticks, which rounds to 163 or 164 — producing ±25 µs quantisation
- * noise in every anchor timestamp.  This noise is ~250× larger than the real
- * 20 ppm crystal drift (0.1 µs/frame).  Setting the threshold above the noise
- * ceiling (40 µs) means the PLL ignores ticker artefacts entirely and only
- * corrects genuine multi-tick accumulated bias. */
-#define CORRECTION_THRESH_US 40
-
-/* Windup limit on the accumulated error (µs).
- * Caps to ±500 µs to handle startup or large one-off jitter events. */
-#define MAX_ACCUM_US 500
-
-/* HFCLKAUDIO FREQ_VALUE register limits (nRF5340 PS §5.4.2).
- * Full range is 0x0000–0xFFFF but the datasheet mandates:
- *   f_out ∈ [10.666, 13.333] MHz  → FREQ_VALUE ∈ [0x8000, 0xBFFF]
- * Using a narrower window (±~1.6 MHz around 12.288 MHz) for safety. */
-#define FREQ_NOMINAL 0x9BA6u  /* 12.288 MHz */
-#define FREQ_MIN     0x8000u
-#define FREQ_MAX     0xBFFFu
-
-/* Lock: single-window accumulated error must be below this (µs).
- * Must be < CORRECTION_THRESH_US (40) for hysteresis.  35 µs is just inside
- * the 32kHz ticker noise ceiling (~37 µs max), so a freq sitting at the
- * quantisation boundary with |window_err| ≤ 35 µs counts as locked. */
-#define LOCK_THRESH_US 35
-
-/* Number of consecutive filter windows within threshold before "locked". */
-#define LOCK_COUNT 20
-
-/* Runaway guard: discard inter-arrival measurement if |phase_err| exceeds
- * this (µs).  Triggered by BLE packet loss or multi-frame scheduling gaps. */
-#define RUNAWAY_THRESH_US 500
-
-/* BIG downlink interval in µs (LC3Plus 5 ms). */
-#define BIG_INTERVAL_US 5000
+/* Convert µs timing error to FREQ_VALUE delta.
+ * Ported from nrf5340_audio audio_datapath.c — uses ns internally. */
+#define APLL_FREQ_ADJ(t) (-(((int32_t)(t)) * 1000) / 331)
 
 /* -------------------------------------------------------------------------
- * Shared state (written from any context, read by sync thread)
+ * Drift compensation constants
+ * Ported from nrf5340_audio audio_datapath.c
  * ------------------------------------------------------------------------- */
+#define DRIFT_ERR_THRESH_LOCK        16  /* µs: enter LOCKED if |err| < 16   */
+#define DRIFT_ERR_THRESH_UNLOCK      32  /* µs: exit  LOCKED if |err| > 32   */
+#define DRIFT_REGULATOR_DIV_FACTOR    2  /* proportional gain divisor        */
 
-static atomic_t g_ts_us  = ATOMIC_INIT(0); /* latest BIS1 anchor timestamp */
-static atomic_t g_reset  = ATOMIC_INIT(1); /* 1 = thread should re-initialise */
-static atomic_t g_locked = ATOMIC_INIT(0); /* 1 = PI has converged */
-
-static K_SEM_DEFINE(clk_sync_sem, 0, 1); /* depth=1: one pending notification max */
-
-/* Ring buffer indices from main.c — used for drift detection via ring level. */
-extern volatile uint16_t ring_prod_idx;
-extern volatile uint16_t ring_cons_idx;
-
-#define RING_LEVEL() ((ring_prod_idx >= ring_cons_idx) ? \
-    (ring_prod_idx - ring_cons_idx) : \
-    (AUDIO_RING_NUM_BLKS - ring_cons_idx + ring_prod_idx))
-
-/* Target ring level: 4 blocks (4ms buffer). Ring staying at this level
- * indicates decoder and DMA are perfectly matched. */
-#define RING_TARGET_LEVEL 4
+/* Ring buffer target level and scale factor for error signal. */
+#define RING_TARGET_LEVEL  4   /* half of AUDIO_RING_NUM_BLKS = 8         */
+#define RING_SCALE_US     10   /* µs per block of deviation from target   */
+/* Number of packets in CALIB window (5 ms BIS interval × 20 = 100 ms). */
+#define CALIB_PACKET_COUNT 20
 
 /* -------------------------------------------------------------------------
- * Sync thread
+ * Uplink FIFO (shared with main.c via clk_sync_get_uplink_q)
  * ------------------------------------------------------------------------- */
+#define UPLINK_Q_DEPTH 4
 
+struct encoded_frame {
+	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+	size_t  len;
+};
+
+K_MSGQ_DEFINE(uplink_q, sizeof(struct encoded_frame), UPLINK_Q_DEPTH, 4);
+
+/* -------------------------------------------------------------------------
+ * Shared state — written from iso_recv ISR context, read by sync thread
+ * ------------------------------------------------------------------------- */
+static struct {
+	atomic_t sdu_ref_us;
+	atomic_t ring_level;
+	atomic_t new_data;        /* 1 after each rx_notify, cleared by thread */
+} g_rx = {
+	.sdu_ref_us  = ATOMIC_INIT(0),
+	.ring_level  = ATOMIC_INIT(0),
+	.new_data    = ATOMIC_INIT(0),
+};
+
+static atomic_t g_reset  = ATOMIC_INIT(1);
+static atomic_t g_locked = ATOMIC_INIT(0);
+static atomic_t g_state  = ATOMIC_INIT(DRIFT_STATE_INIT);
+
+static K_SEM_DEFINE(clk_sync_sem, 0, 1);
+
+/* Current FREQ_VALUE — preserved across resets so re-sync uses the last
+ * converged value rather than always starting cold from nominal. */
+static uint16_t g_freq_value = APLL_FREQ_CENTER;
+
+/* -------------------------------------------------------------------------
+ * Thread
+ * ------------------------------------------------------------------------- */
 #define CLK_SYNC_STACK_SIZE 1024
-#define CLK_SYNC_PRIORITY   1 /* above lc3_encoder (2) and lc3_decoder (3) */
+#define CLK_SYNC_PRIORITY   1
 
 K_THREAD_STACK_DEFINE(clk_sync_stack, CLK_SYNC_STACK_SIZE);
 static struct k_thread clk_sync_thread_data;
 
-static void reset_internal(int *lock_count, uint32_t *ts_prev)
+struct drift_state_data {
+	enum clk_sync_drift_state state;
+	uint32_t center_freq;
+
+	/* CALIB: ring level accumulator over CALIB_PACKET_COUNT packets */
+	int32_t  calib_ring_sum;
+	uint32_t calib_ring_count;
+};
+
+/* Apply FREQ_VALUE to hardware, clamped to valid range. */
+static void hfclkaudio_set(uint32_t freq_value)
 {
-	*lock_count  = 0;
-	*ts_prev     = 0;
-	atomic_set(&g_locked, 0);
-	/* freq_value intentionally NOT reset — the converged value is the best
-	 * estimate of the crystal offset and should be preserved across BIG
-	 * re-syncs.  Snapping back to FREQ_NOMINAL causes an 81 Hz instantaneous
-	 * step on the live I2S BCLK which is audible as a click/knock. */
+	uint16_t clamped = (uint16_t)CLAMP((int32_t)freq_value,
+					   (int32_t)APLL_FREQ_MIN,
+					   (int32_t)APLL_FREQ_MAX);
+
+	if (clamped != g_freq_value) {
+		g_freq_value = clamped;
+		nrfx_clock_hfclkaudio_config_set(g_freq_value);
+	}
+}
+
+/*
+ * Compute per-packet error in µs from ring buffer level.
+ * Positive err_us → freq should decrease (HFCLKAUDIO too fast).
+ * Negative err_us → freq should increase (HFCLKAUDIO too slow).
+ */
+static int32_t err_us_from_ring(uint32_t ring_level)
+{
+	return ((int32_t)RING_TARGET_LEVEL - (int32_t)ring_level) * RING_SCALE_US;
+}
+
+static void drift_state_transition(struct drift_state_data *dc,
+				   enum clk_sync_drift_state new_state)
+{
+	dc->state = new_state;
+	atomic_set(&g_state, (atomic_val_t)new_state);
+
+	switch (new_state) {
+	case DRIFT_STATE_INIT:
+		atomic_set(&g_locked, 0);
+		break;
+
+	case DRIFT_STATE_CALIB:
+		dc->calib_ring_sum   = 0;
+		dc->calib_ring_count = 0;
+		printk("[drift] CALIB\n");
+		break;
+
+	case DRIFT_STATE_OFFSET:
+		printk("[drift] OFFSET center=0x%04x\n", dc->center_freq);
+		break;
+
+	case DRIFT_STATE_LOCKED:
+		atomic_set(&g_locked, 1);
+		printk("[drift] LOCKED freq=0x%04x\n", g_freq_value);
+		break;
+	}
+}
+
+static void reset_internal(struct drift_state_data *dc)
+{
+	dc->center_freq = APLL_FREQ_CENTER;
+	drift_state_transition(dc, DRIFT_STATE_INIT);
+	/* freq_value intentionally NOT reset — the last converged value is the
+	 * best estimate of crystal offset and avoids audible clicks on re-sync. */
 }
 
 static void clk_sync_thread_fn(void *a, void *b, void *c)
@@ -140,81 +174,118 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
 
-	/* Initialise from the hardware register so a firmware restart picks up
-	 * the last converged value rather than always starting from nominal. */
-	uint16_t freq_value = nrfx_clock_hfclkaudio_config_get();
+	struct drift_state_data dc = {
+		.state       = DRIFT_STATE_INIT,
+		.center_freq = APLL_FREQ_CENTER,
+	};
 
-	if (freq_value == 0U) {
-		freq_value = FREQ_NOMINAL; /* hardware not yet started */
+	/* Warm-start: read the hardware register so firmware restart picks up
+	 * the last converged value rather than cold-starting from nominal. */
+	g_freq_value = nrfx_clock_hfclkaudio_config_get();
+	if (g_freq_value == 0U) {
+		g_freq_value = APLL_FREQ_CENTER;
 	}
 
-	int      lock_count    = 0;
-	uint32_t ts_prev       = 0;
-	bool     have_baseline = false;
-
 	while (1) {
-		/* Block until iso_recv() delivers a new anchor timestamp. */
+		/* Block until iso_recv() delivers a notification (or reset). */
 		k_sem_take(&clk_sync_sem, K_FOREVER);
 
-		/* Handle reset request (re-sync / BIG loss). */
+		/* Handle BIG re-sync / loss. */
 		if (atomic_cas(&g_reset, 1, 0)) {
-			reset_internal(&lock_count, &ts_prev);
-			have_baseline = false;
+			reset_internal(&dc);
 			continue;
 		}
 
-		uint32_t ts_now = (uint32_t)atomic_get(&g_ts_us);
-
-		/* First arrival after reset: latch baseline, don't compute error yet. */
-		if (!have_baseline) {
-			ts_prev       = ts_now;
-			have_baseline = true;
+		/* Consume notification; drop spurious wakes. */
+		if (!atomic_cas(&g_rx.new_data, 1, 0)) {
 			continue;
 		}
 
-		/* Use ring buffer level as drift indicator.
-		 * ring_level > RING_TARGET_LEVEL → decoder ahead → HFCLKAUDIO too slow
-		 * ring_level < RING_TARGET_LEVEL → decoder behind → HFCLKAUDIO too fast */
-		uint32_t ring_level = RING_LEVEL();
-		int32_t  ring_error = (int32_t)ring_level - (int32_t)RING_TARGET_LEVEL;
+		uint32_t ring_level = (uint32_t)atomic_get(&g_rx.ring_level);
 
-		/* Apply correction only if ring error is outside hysteresis band.
-		 * Small hysteresis (±2 blocks) prevents constant jitter around target. */
-		int32_t step = 0;
+		switch (dc.state) {
 
-		if (ring_error > 2) {
-			step = MAX_STEP_PER_WINDOW;  /* speed up HFCLKAUDIO */
-		} else if (ring_error < -2) {
-			step = -MAX_STEP_PER_WINDOW; /* slow down HFCLKAUDIO */
+		case DRIFT_STATE_INIT:
+			/* First valid packet after reset → start calibration window. */
+			drift_state_transition(&dc, DRIFT_STATE_CALIB);
+			break;
+
+		case DRIFT_STATE_CALIB: {
+			/*
+			 * Accumulate ring level for CALIB_PACKET_COUNT packets.
+			 * At window end, compute avg_ring_err to set center_freq.
+			 */
+			dc.calib_ring_sum += (int32_t)ring_level;
+			dc.calib_ring_count++;
+
+			if (dc.calib_ring_count < CALIB_PACKET_COUNT) {
+				break;
+			}
+
+			/* Window complete: avg deviation from target. */
+			int32_t avg_ring = dc.calib_ring_sum / (int32_t)CALIB_PACKET_COUNT;
+			int32_t avg_err_us = ((int32_t)RING_TARGET_LEVEL - avg_ring)
+					     * RING_SCALE_US
+					     / DRIFT_REGULATOR_DIV_FACTOR;
+			int32_t freq_adj = APLL_FREQ_ADJ(avg_err_us);
+			uint32_t cf = (uint32_t)((int32_t)APLL_FREQ_CENTER + freq_adj);
+
+			if (cf > APLL_FREQ_MAX || cf < APLL_FREQ_MIN) {
+				printk("[drift] CALIB invalid center (avg_ring=%d), retry\n",
+				       avg_ring);
+				drift_state_transition(&dc, DRIFT_STATE_INIT);
+				break;
+			}
+
+			dc.center_freq = cf;
+			hfclkaudio_set(dc.center_freq);
+			drift_state_transition(&dc, DRIFT_STATE_OFFSET);
+			break;
 		}
 
-		if (step != 0) {
-			bool was_locked = atomic_get(&g_locked) != 0;
-			uint16_t new_freq = (uint16_t)CLAMP((int32_t)freq_value + step,
-							    (int32_t)FREQ_MIN,
-							    (int32_t)FREQ_MAX);
-			if (new_freq != freq_value) {
-				freq_value = new_freq;
-				nrfx_clock_hfclkaudio_config_set(freq_value);
+		case DRIFT_STATE_OFFSET: {
+			/*
+			 * Apply proportional residual correction per packet.
+			 * Transition to LOCKED when ring is close enough to target.
+			 */
+			int32_t err_us = err_us_from_ring(ring_level);
+
+			err_us /= DRIFT_REGULATOR_DIV_FACTOR;
+			int32_t freq_adj = APLL_FREQ_ADJ(err_us);
+
+			hfclkaudio_set((uint32_t)((int32_t)dc.center_freq + freq_adj));
+
+			printk("[drift] OFFSET err=%d freq=0x%04x\n",
+			       err_us, g_freq_value);
+
+			if (err_us < DRIFT_ERR_THRESH_LOCK &&
+			    err_us > -DRIFT_ERR_THRESH_LOCK) {
+				drift_state_transition(&dc, DRIFT_STATE_LOCKED);
 			}
-			printk("[clk] freq=0x%04x step=%+d ring=%u target=%u%s\n",
-			       freq_value, (int)step, ring_level, RING_TARGET_LEVEL,
-			       was_locked ? " [UNLOCK]" : "");
-			lock_count = 0;
-			atomic_set(&g_locked, 0);
-		} else {
-			/* Ring level within target band — track lock time. */
-			if (lock_count < LOCK_COUNT) {
-				lock_count++;
-			}
-			if (lock_count == LOCK_COUNT && !atomic_get(&g_locked)) {
-				printk("[clk] LOCKED freq=0x%04x ring=%u\n",
-				       freq_value, ring_level);
-				atomic_set(&g_locked, 1);
-			}
+			break;
 		}
 
-		ts_prev = ts_now;
+		case DRIFT_STATE_LOCKED: {
+			/*
+			 * Steady-state proportional correction.
+			 * Unlock if ring deviates too far from target.
+			 */
+			int32_t err_us = err_us_from_ring(ring_level);
+
+			err_us /= DRIFT_REGULATOR_DIV_FACTOR;
+			int32_t freq_adj = APLL_FREQ_ADJ(err_us);
+
+			hfclkaudio_set((uint32_t)((int32_t)dc.center_freq + freq_adj));
+
+			if (err_us > DRIFT_ERR_THRESH_UNLOCK ||
+			    err_us < -DRIFT_ERR_THRESH_UNLOCK) {
+				printk("[drift] UNLOCK err=%d, recalibrating\n",
+				       err_us);
+				drift_state_transition(&dc, DRIFT_STATE_INIT);
+			}
+			break;
+		}
+		}
 	}
 }
 
@@ -231,19 +302,18 @@ void clk_sync_init(void)
 	k_thread_name_set(&clk_sync_thread_data, "clk_sync");
 }
 
-void clk_sync_anchor_notify(uint32_t ts_us)
+void clk_sync_rx_notify(uint32_t sdu_ref_us, uint32_t ring_level)
 {
-	atomic_set(&g_ts_us, (atomic_val_t)ts_us);
-	/* k_sem_give is ISR-safe and never blocks.  If the thread hasn't consumed
-	 * the previous notification yet (depth=1 semaphore), this is a no-op —
-	 * the thread will see the freshest timestamp via g_ts_us on its next wake. */
+	atomic_set(&g_rx.sdu_ref_us, (atomic_val_t)sdu_ref_us);
+	atomic_set(&g_rx.ring_level, (atomic_val_t)ring_level);
+	atomic_set(&g_rx.new_data, 1);
 	k_sem_give(&clk_sync_sem);
 }
 
 void clk_sync_reset(void)
 {
 	atomic_set(&g_reset, 1);
-	k_sem_give(&clk_sync_sem); /* wake thread immediately to apply reset */
+	k_sem_give(&clk_sync_sem);
 }
 
 bool clk_sync_is_locked(void)
@@ -251,4 +321,17 @@ bool clk_sync_is_locked(void)
 	return atomic_get(&g_locked) != 0;
 }
 
-/* clk_sync_i2s_notify() removed — Phase D uses ring buffer level instead */
+uint16_t clk_sync_freq_get(void)
+{
+	return g_freq_value;
+}
+
+enum clk_sync_drift_state clk_sync_state_get(void)
+{
+	return (enum clk_sync_drift_state)atomic_get(&g_state);
+}
+
+struct k_msgq *clk_sync_get_uplink_q(void)
+{
+	return &uplink_q;
+}

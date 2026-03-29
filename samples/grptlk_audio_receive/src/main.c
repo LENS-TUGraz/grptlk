@@ -29,23 +29,23 @@
  *  Packet loss: iso_recv() writes a zero-length frame into encoded_frame_q.
  *  The decoder thread calls lc3_decode(NULL) which runs PLC — no click.
  *
- * UPLINK  microphone → BIS2..5  (minimal latency architecture)
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ * UPLINK  microphone → BIS2..5  (FIFO-based drift compensation)
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *  CS47L63 PDM mic → I2S DMA RX (every 5 ms)
  *    └─ DMA ISR: i2s_process_rx_block() → audio_rx_mono_frame() [rx_cb]
  *         copies mic PCM to mic_pcm_shared  [shared buffer, sem-synced]
  *    └─ lc3_encoder thread  [prio 2, 4096 B stack]
  *         waits for mic_frame_sem → lc3_encode()
- *         → stores in encoded_shared → sets encoded_data_ready
+ *         → writes to uplink_q [K_MSGQ, depth 4, managed by clk_sync]
  *    └─ iso_tx thread  [prio 2, 1024 B stack]
- *         polls encoded_data_ready → bt_iso_chan_send(encoded_shared)
+ *         reads uplink_q → bt_iso_chan_send()
  *    └─ iso_sent() [BT ISO callback]
- *         debug GPIO only (TX complete indicator)
- *    └─ PTT button [ISR]
- *         kicks tx_sem to prime TX on first press
+ *         notifies clk_sync for TX drift compensation
+ *    └─ clk_sync thread  [prio 1, 1024 B stack]
+ *         monitors both ring level (RX) and FIFO level (TX)
+ *         adjusts HFCLKAUDIO to eliminate drift
  *
- * Uplink latency: ~5-6ms (mic capture + encode + direct send)
- * Previous architecture: ~25-30ms (3-slot uplink_ring + 2-slot lc3_tx_q)
+ * Uplink latency: ~10-15ms (mic capture + encode + FIFO buffer + send)
  *
  * Downlink audio datapath (1ms ring buffer architecture)
  * -------------------------------------------------------
@@ -59,15 +59,15 @@
  * ------------------
  * ptt_active (io/buttons.c) gates the uplink chain:
  *   0 = uplink chain starves (no TX)
- *   1 = encoder drives TX via encoded_data_ready flag
+ *   1 = encoder drives TX via uplink_q
  *
  * Thread summary
  * --------------
  * Name          Priority  Stack    Blocking on
- * clk_sync         1      1024 B   clk_sync_sem (every BIG anchor, 5 ms)
+ * clk_sync         1      1024 B   clk_sync_sem (RX + TX events, 5 ms)
  * lc3_decoder      1      6144 B   encoded_frame_q (K_FOREVER)
  * lc3_encoder      2      4096 B   mic_frame_sem (forever)
- * iso_tx           2      1024 B   polls encoded_data_ready + tx_sem (PTT kickstart)
+ * iso_tx           2      1024 B   uplink_q + tx_sem (PTT kickstart)
  */
 
 #include <errno.h>
@@ -219,17 +219,18 @@ static struct audio_ring playback_ring = {
 /*
  * DMA ISR (cs47l63.c) accumulates 5×1ms blocks into mic_accum[], then calls
  * audio_rx_mono_frame() which copies to mic_pcm_shared and signals encoder.
- * Encoder reads mic_pcm_shared, encodes to encoded_shared, signals TX thread.
- * TX thread reads encoded_shared and sends via bt_iso_chan_send().
+ * Encoder reads mic_pcm_shared, encodes, writes to uplink_q.
+ * TX thread reads uplink_q and sends via bt_iso_chan_send().
  *
- * No intermediate queues — latency = mic capture (5ms) + encode (~0.5ms) + send.
+ * uplink_q provides buffering for drift detection via clk_sync.
  */
 static int16_t mic_pcm_shared[PCM_SAMPLES_PER_FRAME];
 static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 
-static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
-static size_t encoded_len;
-static atomic_t encoded_data_ready = ATOMIC_INIT(0);
+/* Uplink queue is now managed by clk_sync for drift compensation.
+ * clk_sync_get_uplink_q() returns a pointer to the K_MSGQ. */
+static struct k_msgq *uplink_q;
+
 static atomic_t tx_in_progress = ATOMIC_INIT(0);
 
 /* =========================================================================
@@ -469,13 +470,17 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
  * Uplink audio path: mic → encoder → direct send (minimal latency)
  * ========================================================================= */
 
-/* lc3_encoder thread: waits for mic frames, encodes, signals TX thread. */
+/* lc3_encoder thread: waits for mic frames, encodes, writes to uplink queue.
+ *
+ * The uplink queue (managed by clk_sync) provides buffering between encoder
+ * and TX thread, enabling drift detection via FIFO level monitoring. */
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
 	int16_t local_pcm[PCM_SAMPLES_PER_FRAME];
 	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
 	const int octets_per_frame = preset_active.qos.sdu;
 	static uint32_t enc_frame_cnt;
+	static uint32_t enc_q_full_cnt;
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -483,6 +488,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 	while (1) {
 		int ret;
+		struct encoded_frame ef;
 
 		/* Wait for decoder to complete (drives encoder timing) */
 		k_sem_take(&decoder_proceed_sem, K_FOREVER);
@@ -495,8 +501,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		int32_t pcm_sum = 0;
 		for (int i = 0; i < 8; i++) pcm_sum += local_pcm[i];
 		if ((enc_dbg_cnt++ % 100U) == 0U) {
-			printk("[enc] frame=%u, ptt=%d, pcm[0-7].sum=%d\n",
-			       enc_dbg_cnt, atomic_get(&ptt_active), pcm_sum);
+			printk("[enc] frame=%u, ptt=%ld, pcm[0-7].sum=%d\n",
+			       enc_dbg_cnt, (long)atomic_get(&ptt_active), pcm_sum);
 		}
 
 		/* Skip encode when not transmitting — saves CPU when PTT is off. */
@@ -514,19 +520,27 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		/* Store encoded frame in shared buffer and signal TX thread. */
-		memcpy(encoded_shared, encoded_buf, octets_per_frame);
-		encoded_len = octets_per_frame;
+		/* Prepare encoded frame for uplink queue. */
+		memcpy(ef.data, encoded_buf, octets_per_frame);
+		ef.len = octets_per_frame;
+
+		/* Write to uplink queue (blocking if full — this provides backpressure). */
+		ret = k_msgq_put(uplink_q, &ef, K_NO_WAIT);
+		if (ret != 0) {
+			/* Queue full — drop frame and count. This should be rare
+			 * when clk_sync is working; if frequent, indicates HFCLKAUDIO
+			 * is running too fast relative to BIG anchor. */
+			enc_q_full_cnt++;
+			if ((enc_q_full_cnt % 10U) == 1U) {
+				printk("[enc] WARN: uplink_q full (drop #%u)\n", enc_q_full_cnt);
+			}
+		}
 
 		gpio_pin_set_dt(&debug_lc3_enc, 0);
-		
-		atomic_set(&encoded_data_ready, 1);
-
-		/* Signal TX thread that encoded data is ready.
-		 * TX thread polls on this atomic flag for lowest latency. */
 
 		if ((enc_frame_cnt++ % 200U) == 0U) {
-			printk("[tx] frame=%u\n", enc_frame_cnt);
+			printk("[enc] frame=%u q_full=%u\n", enc_frame_cnt, enc_q_full_cnt);
+			enc_q_full_cnt = 0;
 		}
 	}
 }
@@ -543,9 +557,10 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 	if (num_uplink == 0U) {
 		return NULL;
 	}
-	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
+	uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink) + 1U;
 
-	active_uplink_bis = idx + 1U;
+	active_uplink_bis = idx;
+
 	return bis[active_uplink_bis];
 #else
 	active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
@@ -553,8 +568,12 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 #endif
 }
 
-static int uplink_send_next(struct bt_iso_chan *chan);
+static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef);
 
+/* TX thread: reads encoded frames from uplink queue and sends via BLE ISO.
+ *
+ * Waits on both the uplink queue (for encoder data) and tx_sem (for PTT
+ * kickstart). Uses k_sleep for short delays to avoid busy polling. */
 static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg1);
@@ -563,16 +582,20 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 
 	while (true) {
 		struct bt_iso_chan *ul_chan;
+		struct encoded_frame ef;
+		int ret;
 
 		/* Wait for encoder to produce data or PTT button press.
 		 * Use short timeout to check both conditions efficiently. */
-		while (atomic_get(&encoded_data_ready) == 0) {
-			/* Check for PTT kickstart non-blocking */
+		ret = k_msgq_get(uplink_q, &ef, K_MSEC(10));
+		if (ret != 0) {
+			/* No data yet — check for PTT kickstart */
 			if (k_sem_take(&tx_sem, K_NO_WAIT) == 0) {
-				break;
+				/* PTT pressed: prime TX by waiting for next frame */
+				continue;
 			}
-			/* Wait a bit before checking again to avoid busy polling */
-			k_sleep(K_USEC(100));
+			/* Timeout with no data and no PTT — loop back */
+			continue;
 		}
 
 		/* Wait for previous TX to complete before sending next packet.
@@ -583,20 +606,19 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 
 		ul_chan = iso_select_uplink_chan();
 		if (ul_chan != NULL) {
-			(void)uplink_send_next(ul_chan);
+			(void)uplink_send_next(ul_chan, &ef);
 		}
 	}
 }
 
-static int uplink_send_next(struct bt_iso_chan *chan)
+static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef)
 {
 	struct net_buf *buf;
 	int err;
 
-	/* Don't send if encoder hasn't produced data yet. */
-	if (encoded_len == 0) {
-		printk("[send] skipped: enc_len=0, data_ready=%d\n",
-		       atomic_get(&encoded_data_ready));
+	/* Don't send empty frames. */
+	if (ef->len == 0) {
+		printk("[send] skipped: ef->len=0\n");
 		return -ENODATA;
 	}
 
@@ -617,13 +639,10 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 	}
 
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
-	net_buf_add_mem(buf, encoded_shared, encoded_len);
+	net_buf_add_mem(buf, ef->data, ef->len);
 
-	/* Clear encoded_data_ready and set tx_in_progress before sending.
-	 * This ensures proper sequencing:
-	 * - encoded_data_ready = 0 allows encoder to produce next frame
-	 * - tx_in_progress = 1 blocks TX thread until iso_sent fires */
-	atomic_set(&encoded_data_ready, 0);
+	/* Set tx_in_progress before sending.
+	 * This blocks the TX thread until iso_sent fires. */
 	atomic_set(&tx_in_progress, 1);
 
 	err = bt_iso_chan_send(chan, buf, seq_num);
@@ -633,7 +652,7 @@ static int uplink_send_next(struct bt_iso_chan *chan)
 		return err;
 	}
 
-	// printk("[send] sent %u bytes on chan %p, seq=%u\n", encoded_len, chan, seq_num);
+	// printk("[send] sent %u bytes on chan %p, seq=%u\n", ef->len, chan, seq_num);
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
 	return 0;
@@ -691,21 +710,13 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 
 	gpio_pin_set_dt(&debug_iso_recv, 0);
 
-	/* Feed BIG anchor to clk_sync on every BIS1 frame (valid or not).
-	 * DISABLED: Receiver doesn't need clk_sync because decoder and encoder
-	 * are independent clock domains (no mixing like broadcaster). clk_sync
-	 * was causing periodic underruns by fighting the natural I2S→encoder flow.
-	 *
-	 * info->ts carries the same BIG anchor as bt_iso_chan_get_tx_sync()
-	 * but is available here for free — no HCI round-trip needed.
-	 * ISR-safe: clk_sync_anchor_notify() uses only atomic_set + k_sem_give.
-	 * Feeding every 5 ms keeps the 20-frame accumulation window filling at
-	 * the same rate as the original design, locking in ~2 s. */
-#if 0
+	/* Feed BIG anchor + ring level to clk_sync on every BIS1 frame.
+	 * sdu_ref_us = BLE controller anchor timestamp (µs).
+	 * ring_level = current audio ring buffer fill (HFCLKAUDIO drift proxy).
+	 * ISR-safe: clk_sync_rx_notify() uses only atomic_set + k_sem_give. */
 	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
-		clk_sync_anchor_notify(info->ts);
+		clk_sync_rx_notify(info->ts, RING_FILLED());
 	}
-#endif
 
 	/* Removed tx_sem priming from here - encoder now primes TX after first encode */
 	iso_datapaths_setup = false;
@@ -1043,7 +1054,8 @@ static int setup_iso_datapaths(void)
 		printk("Data path set chan %u.\n", i);
 	}
 
-	/* clk_sync_reset() - DISABLED: Receiver doesn't use clk_sync */
+	/* Reset clk_sync PI integrator and lock counters on each BIG resync. */
+	clk_sync_reset();
 
 	seq_num = 0U;
 	atomic_set(&uplink_tx_active, 0);
@@ -1051,6 +1063,7 @@ static int setup_iso_datapaths(void)
 	/* Reset ring indices and queues so stale frames from a previous BIG sync
 	 * don't play out. */
 	k_msgq_purge(&encoded_frame_q);
+	k_msgq_purge(uplink_q);  /* Purge uplink queue too */
 	ring_prod_idx = 0;
 	ring_cons_idx = 0;
 	/* Drain any pending mic frame semaphore. */
@@ -1219,8 +1232,12 @@ int main(void)
 		return err;
 	}
 
-	/* --- Clock sync thread (BLE anchor → HFCLKAUDIO PI controller) ----- */
-	/* clk_sync_init() - DISABLED: Receiver doesn't use clk_sync */
+	/* --- Clock sync thread (BLE anchor → HFCLKAUDIO PI controller) -----
+	 * Enables both RX (downlink) and TX (uplink) drift compensation. */
+	clk_sync_init();
+
+	/* Get uplink queue from clk_sync for encoder → TX buffering. */
+	uplink_q = clk_sync_get_uplink_q();
 
 	/* --- LC3 codec threads (decoder, encoder, iso_tx) ------------------ */
 	err = lc3_workers_start();
