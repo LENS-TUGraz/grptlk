@@ -414,6 +414,7 @@ static struct k_thread tx_thread_data __maybe_unused;
 
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
+	clk_sync_i2s_notify(k_cyc_to_us_floor32(k_cycle_get_32()));
 	memcpy(mic_pcm_shared, mono_frame, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
 	k_sem_give(&mic_frame_sem);
 }
