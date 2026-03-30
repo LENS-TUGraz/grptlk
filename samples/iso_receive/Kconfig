@@ -38,7 +38,7 @@ config GRPTLK_UPLINK_BIS
 choice GRPTLK_UPLINK_MODE
 	bool "Uplink BIS selection mode"
 	depends on GRPTLK_RECV
-	default GRPTLK_UPLINK_MODE_RANDOM
+	default GRPTLK_UPLINK_MODE_STATIC
 
 config GRPTLK_UPLINK_MODE_STATIC
 	bool "Static"

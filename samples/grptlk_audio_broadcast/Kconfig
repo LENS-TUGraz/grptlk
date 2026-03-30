@@ -1,0 +1,49 @@
+menuconfig GRPTLK
+	bool "GRPTLK [EXPERIMENTAL]"
+	select EXPERIMENTAL
+	default n
+
+if GRPTLK
+
+comment "---- Frequently changed: BIS layout and relay mode ----"
+
+config BT_BAP_BROADCAST_SRC_STREAM_COUNT
+	int "Number of BIS channels (1 TX downlink + N-1 RX uplink)"
+	default 2
+	range 2 5
+	help
+	  Total BIS count including the mandatory TX downlink (BIS1).
+	  Must be 2 to enable relay-only mode (exactly one uplink BIS).
+	  Increase to support more simultaneous uplink speakers.
+
+
+comment "------------------------------------------------"
+
+choice GRPTLK_ROLE
+	bool "GRPTLK Role"
+	default GRPTLK_BCST
+
+config GRPTLK_BCST
+	bool "GRPTLK Broadcaster Role"
+
+config GRPTLK_RECV
+	bool "GRPTLK Receiver Role"
+
+endchoice
+
+if HW_CODEC_CIRRUS_LOGIC
+
+config NRFX_I2S
+	default y
+
+config NRFX_I2S0
+	default y
+
+config NRFX_CLOCK
+	default y
+
+endif # HW_CODEC_CIRRUS_LOGIC
+
+endif # GRPTLK
+
+source "Kconfig.zephyr"

@@ -222,7 +222,8 @@ static void tx_thread(void *arg1, void *arg2, void *arg3) {
 }
 
 static void iso_sent(struct bt_iso_chan *chan) {
-  if (chan == bis[active_uplink_bis]) {
+  if ((active_uplink_bis > 0U) && (active_uplink_bis <= big_actual_num_bis) &&
+      (chan == bis[active_uplink_bis - 1U])) {
     k_sem_give(&tx_sem);
   }
 }
@@ -261,9 +262,10 @@ static struct bt_iso_chan *iso_select_uplink_chan(void) {
   }
   uint8_t idx = (uint8_t)(sys_rand32_get() % num_uplink);
 
-  active_uplink_bis = idx + 1U;
-  return bis[active_uplink_bis];
+  active_uplink_bis = idx + 2U;
+  return bis[active_uplink_bis - 1U];
 #else
+  active_uplink_bis = UPLINK_BIS;
   return bis[UPLINK_BIS - 1];
 #endif
 }
