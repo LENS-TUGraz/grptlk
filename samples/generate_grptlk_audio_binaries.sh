@@ -9,15 +9,10 @@ BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
 
 BUILD_JOBS=(
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=2|grptlk_broadcaster_nrf5340_audio_dk_2BISes.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=3|grptlk_broadcaster_nrf5340_audio_dk_3BISes.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=4|grptlk_broadcaster_nrf5340_audio_dk_4BISes.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=5|grptlk_broadcaster_nrf5340_audio_dk_5BISes.hex"
-  "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=2|grptlk_broadcaster_nrf5340dk_2BISes.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_UPLINK_BIS=2|grptlk_receiver_nrf5340_audio_dk_BIS2_uplink.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_UPLINK_BIS=3|grptlk_receiver_nrf5340_audio_dk_BIS3_uplink.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_UPLINK_BIS=4|grptlk_receiver_nrf5340_audio_dk_BIS4_uplink.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_UPLINK_BIS=5|grptlk_receiver_nrf5340_audio_dk_BIS5_uplink.hex"
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_Open_LC3.hex"
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_LC3.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_Open_LC3.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_LC3.hex"
 )
 
 log()  { echo "[grptlk] $*"; }
