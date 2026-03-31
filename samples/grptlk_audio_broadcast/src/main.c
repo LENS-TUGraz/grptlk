@@ -1,6 +1,10 @@
 #include <errno.h>
 #include <zephyr/kernel.h>
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#include "sw_codec_lc3.h"
+#else
 #include "lc3.h"
+#endif
 
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 #include <nrfx_clock.h>
@@ -316,10 +320,17 @@ static int16_t mixed_uplink_pcm[PCM_SAMPLES_PER_FRAME];
 static atomic_t uplink_audio_ready = ATOMIC_INIT(0);
 
 /* LC3 */
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+/* T2 LC3 - uses global state, no handles needed */
+#define LC3_PCM_BYTES_PER_FRAME (AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t))
+static uint16_t t2_pcm_bytes_req;
+#else
+/* Open LC3 - uses handles */
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
 static lc3_decoder_t lc3_decoders[NUM_RX_BIS];
 static lc3_decoder_mem_16k_t lc3_decoder_mem[NUM_RX_BIS];
+#endif
 
 /* TX ready flag: ignore iso_recv until TX path has sent NUM_PRIME_PACKETS+1 packets */
 static atomic_t iso_tx_ready = ATOMIC_INIT(0);
@@ -453,6 +464,24 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		uint32_t t0 = k_cycle_get_32();
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		uint16_t encoded_len;
+
+		ret = sw_codec_lc3_enc_run(local_pcm, sizeof(local_pcm), LC3_USE_BITRATE_FROM_INIT,
+					    0, sizeof(encoded_shared), encoded_shared, &encoded_len);
+		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
+
+		if (ret) {
+			printk("sw_codec_lc3_enc_run failed: %d\n", ret);
+			debug_lc3_enc_set(0);
+			continue;
+		}
+		/* Verify encoded size matches expected */
+		if (encoded_len != octets_per_frame) {
+			printk("LC3 encode size mismatch: got %u, expected %d\n", encoded_len,
+			       octets_per_frame);
+		}
+#else
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
 				 encoded_shared);
 		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
@@ -462,6 +491,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			debug_lc3_enc_set(0);
 			continue;
 		}
+#endif
 
 		atomic_set(&encoded_data_ready, 1);
 
@@ -505,6 +535,24 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 			struct rx_bis_frame *frame = &rx_frames[i];
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+			uint16_t pcm_len;
+
+			if (!frame->valid) {
+				/* Packet lost - trigger T2 LC3 PLC with bad_frame=true */
+				ret = sw_codec_lc3_dec_run(NULL, 0, sizeof(decoded_pcm[i]),
+						    i, decoded_pcm[i], &pcm_len, true);
+			} else {
+				/* Valid packet - normal decode */
+				ret = sw_codec_lc3_dec_run(frame->data, sizeof(frame->data),
+						    sizeof(decoded_pcm[i]), i,
+						    decoded_pcm[i], &pcm_len, false);
+			}
+			if (ret) {
+				printk("sw_codec_lc3_dec_run failed for BIS%d: %d\n", i, ret);
+			}
+			bis_valid[i] = (ret == 0); /* PLC-concealed frames return success */
+#else
 			if (!frame->valid) {
 				/* Packet lost - trigger LC3 PLC with NULL buffer */
 				ret = lc3_decode(lc3_decoders[i], NULL, 0, LC3_PCM_FORMAT_S16,
@@ -516,6 +564,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 
 			bis_valid[i] = (ret == 0); /* PLC-concealed frames return success */
+#endif
 			frame->received = false;   /* Reset for next interval */
 			frame->valid = false;	   /* Clear valid flag to prevent stale data */
 		}
@@ -1010,13 +1059,38 @@ int main(void)
 
 	(void)vol_buttons_init();
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	/* T2 LC3 encoder init */
+	err = sw_codec_lc3_init(NULL, NULL, preset_active.qos.interval);
+	if (err) {
+		printk("sw_codec_lc3_init failed: %d\n", err);
+		return err;
+	}
+
+	err = sw_codec_lc3_enc_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
+				     32000, 1, &t2_pcm_bytes_req);
+	if (err) {
+		printk("sw_codec_lc3_enc_init failed: %d\n", err);
+		return err;
+	}
+#else
+	/* Open LC3 encoder init */
 	lc3_encoder =
 		lc3_setup_encoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0, &lc3_encoder_mem);
 	if (lc3_encoder == NULL) {
 		printk("Failed to setup LC3 encoder\n");
 		return -EIO;
 	}
+#endif
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	/* T2 LC3 decoder init */
+	err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, NUM_RX_BIS);
+	if (err) {
+		printk("sw_codec_lc3_dec_init failed: %d\n", err);
+		return err;
+	}
+#else
 	/* Setup LC3 decoders for each uplink BIS */
 	for (int i = 0; i < NUM_RX_BIS; i++) {
 		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
@@ -1026,6 +1100,13 @@ int main(void)
 			return -EIO;
 		}
 	}
+#endif
+
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	printk("LC3 codec: T2 Software LC3\n");
+#else
+	printk("LC3 codec: Open-source liblc3\n");
+#endif
 
 	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),
 			decoder_thread_func, NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
