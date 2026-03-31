@@ -86,12 +86,14 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
 #define GRPTLK_VENDOR_VENDOR_ID	 0xBEEF
 
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
 	preset_active.qos.sdu = 20U;
 	preset_active.qos.rtn = 1U;
 }
+#endif
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 /* T2 LC3 - uses global state, no handles needed */
