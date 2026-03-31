@@ -93,6 +93,15 @@ config BT_ISO_TX_MTU
 
 if HW_CODEC_CIRRUS_LOGIC
 
+config GRPTLK_AUDIO_SOURCE_LINE_IN
+	bool "Use 3.5mm line-in as audio source (instead of PDM mic)"
+	default n
+	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
+	help
+	  When enabled, configures the CS47L63 to capture audio from the
+	  3.5mm analog line-in jack instead of the onboard PDM microphone.
+	  Connect a line-level source to J5 on the nRF5340 Audio DK.
+
 config NRFX_I2S
 	default y
 

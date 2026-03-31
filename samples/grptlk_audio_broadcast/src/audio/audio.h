@@ -37,6 +37,10 @@ int audio_start(void);
  * Clamped to [−64 dB, 0 dB]. Only available on CS47L63-equipped boards. */
 int audio_volume_adjust(int8_t step_db);
 
+/* Switch audio input between 3.5mm line-in and PDM mic at runtime.
+ * Returns -EPERM if audio has not been started yet. */
+int audio_input_source_switch(bool use_line_in);
+
 /* Return the number of DMA playback underruns since the last call and
  * reset the counter to zero.  Safe to call from any thread. */
 uint32_t audio_underrun_count_reset(void);

@@ -113,6 +113,9 @@ static int vol_buttons_init(void)
 #endif
 }
 
+/* Input source toggle: boot default is MIC. */
+static atomic_t src_line_in_active = ATOMIC_INIT(0);
+
 /* PTT button (BTN3 = sw2): PTT starts inactive at boot. */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
@@ -125,6 +128,9 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
+	if (atomic_get(&src_line_in_active)) {
+		return; /* PTT is MIC-only */
+	}
 	int val = gpio_pin_get_dt(&ptt_btn);
 
 	atomic_set(&ptt_active, val > 0 ? 1 : 0);
@@ -179,6 +185,9 @@ static struct k_work ptt_lock_toggle_work;
 static void ptt_lock_toggle_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
+	if (atomic_get(&src_line_in_active)) {
+		return; /* PTT-lock is MIC-only */
+	}
 	if (atomic_get(&ptt_lock_active)) {
 		atomic_set(&ptt_lock_active, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
@@ -238,6 +247,85 @@ static int ptt_lock_init(void)
 	return 0;
 #else
 	printk("PTT-lock: sw3/led0 not available on this board\n");
+	return 0;
+#endif
+}
+
+/* Input source toggle: BTN5 (sw4) switches between PDM mic and line-in. */
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#define SRC_TOGGLE_AVAILABLE 1
+static const struct gpio_dt_spec src_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
+static const struct gpio_dt_spec src_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static struct gpio_callback src_cb_data;
+static struct k_work src_toggle_work;
+
+static void src_toggle_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (atomic_get(&src_line_in_active)) {
+		atomic_set(&src_line_in_active, 0);
+		gpio_pin_set_dt(&src_led, 0);
+		audio_input_source_switch(false);
+	} else {
+		atomic_set(&src_line_in_active, 1);
+		gpio_pin_set_dt(&src_led, 1);
+		/* Reset PTT state — buttons are no-ops in LINE-IN mode */
+		atomic_set(&ptt_active, 0);
+#if PTT_LOCK_AVAILABLE
+		if (atomic_get(&ptt_lock_active)) {
+			atomic_set(&ptt_lock_active, 0);
+			gpio_pin_set_dt(&ptt_lock_led, 0);
+		}
+#endif
+		audio_input_source_switch(true);
+	}
+}
+
+static void src_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+	k_work_submit(&src_toggle_work);
+}
+#else
+#define SRC_TOGGLE_AVAILABLE 0
+#endif
+
+static int src_toggle_init(void)
+{
+#if SRC_TOGGLE_AVAILABLE
+	int err;
+
+	k_work_init(&src_toggle_work, src_toggle_work_handler);
+
+	if (!gpio_is_ready_dt(&src_btn) || !gpio_is_ready_dt(&src_led)) {
+		printk("Source toggle button/LED GPIO not ready\n");
+		return -ENODEV;
+	}
+	err = gpio_pin_configure_dt(&src_btn, GPIO_INPUT);
+	if (err) {
+		printk("Source toggle button configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_configure_dt(&src_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		printk("Source LED configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_interrupt_configure_dt(&src_btn, GPIO_INT_EDGE_TO_ACTIVE);
+	if (err) {
+		printk("Source toggle interrupt configure failed: %d\n", err);
+		return err;
+	}
+	gpio_init_callback(&src_cb_data, src_isr, BIT(src_btn.pin));
+	gpio_add_callback(src_btn.port, &src_cb_data);
+
+	printk("Source toggle init: BTN5=toggle mic/line-in, boot=%s\n",
+	       src_line_in_active ? "LINE-IN" : "MIC");
+	return 0;
+#else
+	printk("Source toggle: sw4 not available on this board\n");
 	return 0;
 #endif
 }
@@ -440,8 +528,10 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
-		/* PTT gate: broadcast silence when button is not held. */
-		if (atomic_get(&ptt_active) == 0) {
+		/* PTT gate: broadcast silence when button is not held.
+		 * Bypassed in LINE-IN mode — audio transmits unconditionally.
+		 */
+		if (!atomic_get(&src_line_in_active) && atomic_get(&ptt_active) == 0) {
 			memset(local_pcm, 0, sizeof(local_pcm));
 		}
 
@@ -1054,6 +1144,13 @@ int main(void)
 		printk("audio_start failed: %d\n", err);
 		return err;
 	}
+
+	/* Sync codec to software boot default (MIC). codec_mic_path_prepare() in
+	 * audio_init() applies LINE-IN routing when CONFIG_GRPTLK_AUDIO_SOURCE_LINE_IN=1,
+	 * but our boot state is MIC (src_line_in_active=0). */
+	(void)audio_input_source_switch(false);
+
+	(void)src_toggle_init();
 
 	clk_sync_init();
 
