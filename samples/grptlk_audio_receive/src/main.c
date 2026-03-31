@@ -308,7 +308,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			       (long)atomic_get(&ptt_active), pcm_sum);
 		}
 
-		if (atomic_get(&ptt_active) == 0) {
+		if (!atomic_get(&src_line_in_active) && atomic_get(&ptt_active) == 0) {
 			continue;
 		}
 
@@ -459,7 +459,7 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 		return -ENOMEM;
 	}
 
-	if (atomic_get(&ptt_active) == 0) {
+	if (!atomic_get(&src_line_in_active) && atomic_get(&ptt_active) == 0) {
 		net_buf_unref(buf);
 		return 0;
 	}

@@ -134,6 +134,15 @@ config GRPTLK_UPLINK_RANDOM_PER_PTT
 	  PTT is pressed and uses that same BIS for the entire PTT session.
 	  A new random BIS is selected each time PTT is released and pressed again.
 
+config GRPTLK_AUDIO_SOURCE_LINE_IN
+	bool "Boot with LINE-IN as audio source (instead of PDM mic)"
+	default n
+	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP && HW_CODEC_CIRRUS_LOGIC
+	help
+	  When enabled the CS47L63 codec is configured for the 3.5 mm LINE-IN
+	  jack (IN2L/IN2R) at startup instead of the onboard PDM microphone.
+	  Can be overridden at runtime with BTN5.
+
 endif # GRPTLK
 
 source "Kconfig.zephyr"

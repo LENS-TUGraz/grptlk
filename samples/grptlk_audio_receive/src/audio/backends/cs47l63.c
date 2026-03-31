@@ -329,6 +329,30 @@ int audio_volume_adjust(int8_t step_db)
 	return 0;
 }
 
+int audio_input_source_switch(bool use_line_in)
+{
+	int err;
+
+	if (use_line_in) {
+		err = codec_reg_conf_write(line_in_enable, ARRAY_SIZE(line_in_enable));
+		if (err) {
+			return err;
+		}
+		selected_mic_channel = 0; /* LINE-IN: always left */
+		printk("[SRC] switched to LINE-IN\n");
+	} else {
+		err = codec_reg_conf_write(pdm_mic_enable_configure,
+					   ARRAY_SIZE(pdm_mic_enable_configure));
+		if (err) {
+			return err;
+		}
+		selected_mic_channel = -1; /* PDM mic: auto-detect */
+		printk("[SRC] switched to MIC\n");
+	}
+
+	return 0;
+}
+
 int audio_init(struct audio_ring *playback_ring, audio_rx_cb_t mono_rx_cb)
 {
 	int err;
@@ -343,7 +367,11 @@ int audio_init(struct audio_ring *playback_ring, audio_rx_cb_t mono_rx_cb)
 
 	ring  = playback_ring;
 	rx_cb = mono_rx_cb;
-	selected_mic_channel = -1;
+#if IS_ENABLED(CONFIG_GRPTLK_AUDIO_SOURCE_LINE_IN)
+	selected_mic_channel = 0; /* always left for line-in */
+#else
+	selected_mic_channel = -1; /* auto-detect for PDM mic */
+#endif
 
 	err = codec_mic_path_prepare();
 	if (err) {

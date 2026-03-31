@@ -4,6 +4,7 @@
 #include <zephyr/kernel.h>
 
 extern atomic_t ptt_active;
+extern atomic_t src_line_in_active;
 
 int buttons_init(struct k_sem *tx_sem);
 
