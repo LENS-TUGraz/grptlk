@@ -65,6 +65,7 @@ target_include_directories(app PRIVATE src)
 target_sources(app PRIVATE
   src/main.c
   src/io/led.c
+  src/io/debug_gpio.c
 )
 
 # CS47L63 codec + HFCLKAUDIO clock sync sources (nrf5340_audio_dk only)

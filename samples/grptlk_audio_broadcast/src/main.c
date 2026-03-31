@@ -9,6 +9,7 @@
 #include "audio/drivers/audio_i2s.h"
 #include "audio/sync/clk_sync.h"
 #include "io/led.h"
+#include "io/debug_gpio.h"
 #include <stdint.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -28,23 +29,6 @@ static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gp
 static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 static struct gpio_callback vol_dn_cb_data;
 static struct gpio_callback vol_up_cb_data;
-
-/* =========================================================================
- * Debug GPIO pins for logic analyzer
- * =========================================================================
- * D2 (P0.31) = debug_iso_recv - iso_recv() callback (downlink BIS1)
- * D3 (P1.0)  = debug_lc3_dec - decoder thread processing
- * D4 (P1.1)  = debug_lc3_enc - encoder thread processing
- * P1.14      = debug_iso_sent - iso_sent() callback (uplink TX)
- */
-static const struct gpio_dt_spec debug_iso_sent = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 31, .dt_flags = 0};
-static const struct gpio_dt_spec debug_iso_recv = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 0, .dt_flags = 0};
-static const struct gpio_dt_spec debug_lc3_dec = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 1, .dt_flags = 0};
-static const struct gpio_dt_spec debug_lc3_enc = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 14, .dt_flags = 0};
 
 /* Deferred volume work: ISRs cannot call SPI directly. */
 static struct k_work vol_work;
@@ -441,7 +425,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Wait for decoder to complete (drives encoder timing) */
 		k_sem_take(&decoder_proceed_sem, K_FOREVER);
 
-		gpio_pin_set_dt(&debug_lc3_enc, 1);
+		debug_lc3_enc_set(1);
 
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
@@ -475,13 +459,13 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		if (ret == -1) {
 			printk("LC3 encode failed\n");
-			gpio_pin_set_dt(&debug_lc3_enc, 0);
+			debug_lc3_enc_set(0);
 			continue;
 		}
 
 		atomic_set(&encoded_data_ready, 1);
 
-		gpio_pin_set_dt(&debug_lc3_enc, 0);
+		debug_lc3_enc_set(0);
 
 		/* Only first frame: trigger TX to prime the pump.
 		 * After that, iso_sent() drives TX. */
@@ -510,7 +494,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Wait for all BIS packets to arrive */
 		k_sem_take(&decoder_sem, K_FOREVER);
 
-		gpio_pin_set_dt(&debug_lc3_dec, 1);
+		debug_lc3_dec_set(1);
 
 		/* Clear uplink ready flag at start of each decoder cycle */
 		atomic_set(&uplink_audio_ready, 0);
@@ -617,7 +601,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Signal encoder that uplink audio is ready */
 		atomic_set(&uplink_audio_ready, 1);
 
-		gpio_pin_set_dt(&debug_lc3_dec, 0);
+		debug_lc3_dec_set(0);
 
 		/* Signal encoder that it can now proceed */
 		k_sem_give(&decoder_proceed_sem);
@@ -696,11 +680,11 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	if (chan == bis[0]) {
-		gpio_pin_set_dt(&debug_iso_sent, 1);
+		debug_iso_sent_set(1);
 
 		k_sem_give(&tx_sem); /* RESTORED: Drive TX timing */
 
-		gpio_pin_set_dt(&debug_iso_sent, 0);
+		debug_iso_sent_set(0);
 
 		/* Mark TX as ready after NUM_PRIME_PACKETS+1 packets sent.
 		 * This signals iso_recv that the TX path is stable. */
@@ -755,7 +739,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		return;
 	}
 
-	gpio_pin_set_dt(&debug_iso_recv, 1);
+	debug_iso_recv_set(1);
 
 	/* Only process VALID packets */
 	bool valid = (buf != NULL && buf->len > 0 && !(info->flags & BT_ISO_FLAGS_ERROR));
@@ -784,7 +768,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		k_sem_give(&decoder_sem); /* Trigger decoder */
 	}
 
-	gpio_pin_set_dt(&debug_iso_recv, 0);
+	debug_iso_recv_set(0);
 }
 
 static struct bt_iso_chan_ops iso_ops = {
@@ -1007,42 +991,8 @@ int main(void)
 	(void)ptt_init();
 	(void)ptt_lock_init();
 
-	/* --- Debug GPIO outputs for logic analyzer ------------------------- */
-	if (!device_is_ready(debug_iso_recv.port)) {
-		printk("Debug ISO recv GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_iso_recv, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug ISO recv GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_lc3_dec.port)) {
-		printk("Debug LC3 decode GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_lc3_dec, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug LC3 decode GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_lc3_enc.port)) {
-		printk("Debug LC3 encode GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_lc3_enc, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug LC3 encode GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_iso_sent.port)) {
-		printk("Debug ISO sent GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_iso_sent, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug ISO sent GPIO configure failed: %d\n", err);
-		}
-	}
+	/* Debug GPIO (optional, for logic analyzer timing analysis) */
+	(void)debug_gpio_init();
 
 	err = audio_init(&playback_ring, audio_rx_mono_frame);
 	if (err) {

@@ -37,6 +37,7 @@ target_sources(app PRIVATE
   src/main.c
   src/io/buttons.c
   src/io/led.c
+  src/io/debug_gpio.c
   src/audio/backends/cs47l63.c
   src/audio/drivers/audio_i2s.c
   src/audio/drivers/cs47l63_comm.c

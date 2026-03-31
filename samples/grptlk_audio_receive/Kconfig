@@ -40,6 +40,15 @@ config GRPTLK_AUDIO_FRAME_10_MS
 
 endchoice
 
+config GRPTLK_DEBUG_GPIO
+	bool "Enable debug GPIO pins for logic analyzer"
+	default n
+	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
+	help
+	  Enable 4 GPIO output pins for timing analysis with logic analyzer.
+	  D2/P0.31 = ISO recv, D3/P1.0 = LC3 decode, D4/P1.1 = LC3 encode, P1.14 = ISO sent
+	  Only works on nRF5340 Audio DK. Keep disabled for other platforms.
+
 config GRPTLK_AUDIO_FRAME_DURATION_MS
 	int
 	default 5 if GRPTLK_AUDIO_FRAME_5_MS

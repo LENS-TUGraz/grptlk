@@ -19,6 +19,7 @@
 #include "audio/sync/clk_sync.h"
 #include "io/buttons.h"
 #include "io/led.h"
+#include "io/debug_gpio.h"
 #include "lc3.h"
 #include <zephyr/drivers/gpio.h>
 
@@ -39,16 +40,6 @@
 #define BT_LE_SCAN_CUSTOM                                                                          \
 	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,   \
 			 BT_GAP_SCAN_FAST_WINDOW)
-
-/* Debug GPIO: D2=iso_recv, D3=lc3_dec, D4=lc3_enc, P1.14=iso_sent */
-static const struct gpio_dt_spec debug_iso_sent = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 31, .dt_flags = 0};
-static const struct gpio_dt_spec debug_iso_recv = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 0, .dt_flags = 0};
-static const struct gpio_dt_spec debug_lc3_dec = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 1, .dt_flags = 0};
-static const struct gpio_dt_spec debug_lc3_enc = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 14, .dt_flags = 0};
 
 struct encoded_frame {
 	uint16_t len; /* 0 = loss/PLC */
@@ -218,7 +209,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		k_msgq_get(&encoded_frame_q, &frame, K_FOREVER);
 
-		gpio_pin_set_dt(&debug_lc3_dec, 1);
+		debug_lc3_dec_set(1);
 
 		const uint8_t *lc3_data = (frame.len > 0U) ? frame.data : NULL;
 		const int lc3_len = (frame.len > 0U) ? (int)frame.len : 0;
@@ -233,7 +224,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			memset(mono_pcm, 0, sizeof(mono_pcm));
 		}
 
-		gpio_pin_set_dt(&debug_lc3_dec, 0);
+		debug_lc3_dec_set(0);
 
 		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
 			if (RING_FILLED() >= AUDIO_RING_NUM_BLKS - 1U) {
@@ -299,13 +290,13 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		gpio_pin_set_dt(&debug_lc3_enc, 1);
+		debug_lc3_enc_set(1);
 
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
 				 encoded_buf);
 		if (ret < 0) {
 			printk("[enc] lc3_encode error: %d\n", ret);
-			gpio_pin_set_dt(&debug_lc3_enc, 0);
+			debug_lc3_enc_set(0);
 			continue;
 		}
 
@@ -321,7 +312,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		gpio_pin_set_dt(&debug_lc3_enc, 0);
+		debug_lc3_enc_set(0);
 
 		if ((enc_frame_cnt++ % 200U) == 0U) {
 			printk("[enc] frame=%u q_full=%u\n", enc_frame_cnt, enc_q_full_cnt);
@@ -453,13 +444,13 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 
 static void iso_sent(struct bt_iso_chan *chan)
 {
-	gpio_pin_set_dt(&debug_iso_sent, 1);
+	debug_iso_sent_set(1);
 
 	if (chan == bis[active_uplink_bis]) {
 		atomic_set(&tx_in_progress, 0);
 	}
 
-	gpio_pin_set_dt(&debug_iso_sent, 0);
+	debug_iso_sent_set(0);
 }
 
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
@@ -469,7 +460,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		return;
 	}
 
-	gpio_pin_set_dt(&debug_iso_recv, 1);
+	debug_iso_recv_set(1);
 
 	{
 		struct encoded_frame ef;
@@ -485,7 +476,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		k_msgq_put(&encoded_frame_q, &ef, K_NO_WAIT);
 	}
 
-	gpio_pin_set_dt(&debug_iso_recv, 0);
+	debug_iso_recv_set(0);
 
 	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
 		clk_sync_rx_notify(info->ts, RING_FILLED());
@@ -899,41 +890,8 @@ int main(void)
 		return err;
 	}
 
-	if (!device_is_ready(debug_iso_recv.port)) {
-		printk("Debug ISO recv GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_iso_recv, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug ISO recv GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_lc3_dec.port)) {
-		printk("Debug LC3 decode GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_lc3_dec, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug LC3 decode GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_lc3_enc.port)) {
-		printk("Debug LC3 encode GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_lc3_enc, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug LC3 encode GPIO configure failed: %d\n", err);
-		}
-	}
-
-	if (!device_is_ready(debug_iso_sent.port)) {
-		printk("Debug ISO sent GPIO not ready\n");
-	} else {
-		err = gpio_pin_configure_dt(&debug_iso_sent, GPIO_OUTPUT_LOW);
-		if (err) {
-			printk("Debug ISO sent GPIO configure failed: %d\n", err);
-		}
-	}
+	/* Debug GPIO (optional, for logic analyzer timing analysis) */
+	(void)debug_gpio_init();
 
 	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
 	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
