@@ -1,75 +1,3 @@
-/*
- * Copyright (c) 2026
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
-/*
- * GRPTLK Audio Receiver — main.c
- *
- * Overview
- * --------
- * This file wires together the BLE BIG receiver, the LC3 codec threads, and
- * the audio backend (CS47L63 on nRF5340 Audio DK).
- *
- * Audio data flows — Phase 2 (minimal latency uplink)
- * ---------------------------------------------------
- *
- * DOWNLINK  BIS1 → speaker  (1ms I2S ring buffer architecture)
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *  BLE radio (every 5 ms BIG anchor)
- *    └─ iso_recv() [BT ISO callback]
- *         writes LC3 frame into encoded_frame_q  [K_MSGQ, depth 4]
- *    └─ lc3_decoder thread  [prio 1, 6144 B stack]
- *         reads encoded_frame_q → lc3_decode() → split 80 mono samples
- *         into 5 × 16-sample stereo blocks → ring buffer  [12 × 1ms slots]
- *    └─ DMA ISR (i2s_block_complete, every 1 ms)
- *         reads 1 block from ring buffer → I2S TX DMA → CS47L63 DAC → speaker
- *
- *  Packet loss: iso_recv() writes a zero-length frame into encoded_frame_q.
- *  The decoder thread calls lc3_decode(NULL) which runs PLC — no click.
- *
- * UPLINK  microphone → BIS2..5  (FIFO-based drift compensation)
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *  CS47L63 PDM mic → I2S DMA RX (every 5 ms)
- *    └─ DMA ISR: i2s_process_rx_block() → audio_rx_mono_frame() [rx_cb]
- *         copies mic PCM to mic_pcm_shared  [shared buffer, sem-synced]
- *    └─ lc3_encoder thread  [prio 2, 4096 B stack]
- *         waits for mic_frame_sem → lc3_encode()
- *         → writes to uplink_q [K_MSGQ, depth 4, managed by clk_sync]
- *    └─ iso_tx thread  [prio 2, 1024 B stack]
- *         reads uplink_q → bt_iso_chan_send()
- *    └─ iso_sent() [BT ISO callback]
- *         notifies clk_sync for TX drift compensation
- *    └─ clk_sync thread  [prio 1, 1024 B stack]
- *         monitors both ring level (RX) and FIFO level (TX)
- *         adjusts HFCLKAUDIO to eliminate drift
- *
- * Uplink latency: ~10-15ms (mic capture + encode + FIFO buffer + send)
- *
- * Downlink audio datapath (1ms ring buffer architecture)
- * -------------------------------------------------------
- * iso_recv() → encoded_frame_q (K_MSGQ depth 4) → decoder thread
- * → lc3_decode() → 5 × 1ms stereo blocks → ring_fifo (12 slots)
- * → DMA ISR (every 1ms) reads 1 block → I2S TX DMA → speaker
- *
- * Decode-to-speaker latency: 1–2ms (vs 5–10ms with old 5ms msgq path).
- *
- * PTT (push-to-talk)
- * ------------------
- * ptt_active (io/buttons.c) gates the uplink chain:
- *   0 = uplink chain starves (no TX)
- *   1 = encoder drives TX via uplink_q
- *
- * Thread summary
- * --------------
- * Name          Priority  Stack    Blocking on
- * clk_sync         1      1024 B   clk_sync_sem (RX + TX events, 5 ms)
- * lc3_decoder      1      6144 B   encoded_frame_q (K_FOREVER)
- * lc3_encoder      2      4096 B   mic_frame_sem (forever)
- * iso_tx           2      1024 B   uplink_q + tx_sem (PTT kickstart)
- */
-
 #include <errno.h>
 #include <stdint.h>
 #include <string.h>
@@ -94,31 +22,13 @@
 #include "lc3.h"
 #include <zephyr/drivers/gpio.h>
 
-/* =========================================================================
- * Constants and configuration
- * ========================================================================= */
-
-/* BIG topology: BIS1 = downlink (broadcaster→receiver), BIS2..5 = uplink. */
-#define BIS_ISO_CHAN_COUNT 5
-
-/* Compile-time sizing aliases — used for static buffers, msgq item size, and LC3 setup.
- * Sample rate stays fixed at 16 kHz; frame duration and SDU size are derived at runtime
- * from BIGInfo (big_sdu_interval_us / big_max_sdu) and applied to preset_active.qos. */
-#define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
-#define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
-
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
-#define PA_RETRY_COUNT      6
+#define PA_RETRY_COUNT	    6
 
-#ifndef CONFIG_BT_ISO_TX_MTU
-#define CONFIG_BT_ISO_TX_MTU 40
+#if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > CONFIG_BT_ISO_MAX_CHAN)
+#error "CONFIG_GRPTLK_UPLINK_BIS must be in [2..CONFIG_BT_ISO_MAX_CHAN]"
 #endif
 
-#if (CONFIG_GRPTLK_UPLINK_BIS < 2) || (CONFIG_GRPTLK_UPLINK_BIS > BIS_ISO_CHAN_COUNT)
-#error "CONFIG_GRPTLK_UPLINK_BIS must be in [2..BIS_ISO_CHAN_COUNT]"
-#endif
-
-/* LC3 worker thread parameters. */
 #define DECODER_STACK_SIZE   6144
 #define DECODER_PRIORITY     1
 #define ENCODER_STACK_SIZE   4096
@@ -126,148 +36,65 @@
 #define TX_THREAD_STACK_SIZE 1024
 #define TX_THREAD_PRIORITY   2
 
-/* Custom BLE scan params: active scan, fast interval/window. */
-#define BT_LE_SCAN_CUSTOM \
-	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, \
-			 BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_WINDOW)
+#define BT_LE_SCAN_CUSTOM                                                                          \
+	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,   \
+			 BT_GAP_SCAN_FAST_WINDOW)
 
-/* =========================================================================
- * Debug GPIO pins for logic analyzer
- * =========================================================================
- * D2 (P0.31) = debug_iso_recv - iso_recv() callback (downlink BIS1)
- * D3 (P1.0)  = debug_lc3_dec - decoder thread processing
- * D4 (P1.1)  = debug_lc3_enc - encoder thread processing
- * P1.14      = debug_iso_sent - iso_sent() callback (uplink TX)
- */
+/* Debug GPIO: D2=iso_recv, D3=lc3_dec, D4=lc3_enc, P1.14=iso_sent */
 static const struct gpio_dt_spec debug_iso_sent = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-	.pin = 31,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 31, .dt_flags = 0};
 static const struct gpio_dt_spec debug_iso_recv = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 0,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 0, .dt_flags = 0};
 static const struct gpio_dt_spec debug_lc3_dec = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 1,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 1, .dt_flags = 0};
 static const struct gpio_dt_spec debug_lc3_enc = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 14,
-	.dt_flags = 0
-};
-
-/* =========================================================================
- * Lock-free triple-slot ring buffers
- * =========================================================================
- *
- * Each ring has RING_SLOTS=2 slots.  One slot is "being written" (producer),
- * one is "being read" (consumer).
- * With 2 slots, producer and consumer never share a slot — no lock needed.
- *
- * Protocol:
- *   write_idx  — producer increments after writing each slot
- *   read_idx   — consumer reads slot[read_idx % 2] when write_idx > read_idx
- *   Both are atomic_t so the increment is visible across ISR/thread boundary.
- *
- * encoded_frame_q: iso_recv() [BT callback] → lc3_decoder thread
- *   K_MSGQ of encoded LC3 frames (≤20 bytes each) + length.
- *   len=0 means packet loss → decoder calls lc3_decode(NULL) → PLC.
- *
- * uplink_ring: DMA ISR (i2s_process_rx_block) → lc3_encoder thread
- *   Slot holds one raw mono PCM frame (80 × int16 = 160 bytes).
- *
- * A semaphore accompanies each ring so the consumer thread can sleep when
- * the ring is empty rather than busy-polling.  The producer gives the sem
- * after each write; the consumer takes it before each read.
- */
-
-/* --- Downlink encoded frame queue (BLE → decoder thread) ------------------ */
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 14, .dt_flags = 0};
 
 struct encoded_frame {
-	uint16_t len;                        /* 0 = loss/PLC */
-	uint8_t  data[CONFIG_BT_ISO_TX_MTU];
+	uint16_t len; /* 0 = loss/PLC */
+	uint8_t data[CONFIG_BT_ISO_TX_MTU];
 };
 
 K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct encoded_frame), 2, 1);
 
-/* --- Downlink playback ring buffer (decoder thread → DMA ISR) ------------- */
-/* Circular FIFO of 1ms stereo I2S blocks.
- * Producer: decoder thread (5 blocks per frame).
- * Consumer: I2S DMA ISR (1 block per 1ms). */
 static uint32_t ring_fifo[AUDIO_RING_NUM_BLKS][AUDIO_BLK_SAMPLES_MONO];
 volatile uint16_t ring_prod_idx;
 volatile uint16_t ring_cons_idx;
 
 static struct audio_ring playback_ring = {
-	.fifo     = ring_fifo,
+	.fifo = ring_fifo,
 	.prod_idx = &ring_prod_idx,
 	.cons_idx = &ring_cons_idx,
 	.num_blks = AUDIO_RING_NUM_BLKS,
 };
 
-#define RING_NEXT(i) (((i) + 1U) % AUDIO_RING_NUM_BLKS)
-#define RING_FILLED() /* single-producer/single-consumer safe */ \
-	((ring_prod_idx >= ring_cons_idx) \
-		? (ring_prod_idx - ring_cons_idx) \
-		: (AUDIO_RING_NUM_BLKS - ring_cons_idx + ring_prod_idx))
+#define RING_NEXT(i)  (((i) + 1U) % AUDIO_RING_NUM_BLKS)
+#define RING_FILLED() /* single-producer/single-consumer safe */                                   \
+	((ring_prod_idx >= ring_cons_idx) ? (ring_prod_idx - ring_cons_idx)                        \
+					  : (AUDIO_RING_NUM_BLKS - ring_cons_idx + ring_prod_idx))
 
-/* --- Uplink: minimal latency shared buffers ------------------------------ */
-/*
- * DMA ISR (cs47l63.c) accumulates 5×1ms blocks into mic_accum[], then calls
- * audio_rx_mono_frame() which copies to mic_pcm_shared and signals encoder.
- * Encoder reads mic_pcm_shared, encodes, writes to uplink_q.
- * TX thread reads uplink_q and sends via bt_iso_chan_send().
- *
- * uplink_q provides buffering for drift detection via clk_sync.
- */
-static int16_t mic_pcm_shared[PCM_SAMPLES_PER_FRAME];
+static int16_t mic_pcm_shared[AUDIO_SAMPLES_PER_FRAME];
 static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 
-/* Uplink queue is now managed by clk_sync for drift compensation.
- * clk_sync_get_uplink_q() returns a pointer to the K_MSGQ. */
 static struct k_msgq *uplink_q;
 
 static atomic_t tx_in_progress = ATOMIC_INIT(0);
 
-/* =========================================================================
- * Downlink playback: decoder thread → ring buffer → DMA ISR
- *
- * The ring buffer (ring_fifo / ring_prod_idx / ring_cons_idx) replaces the
- * old tx_msgq.  The decoder writes 5 × 1ms blocks per LC3 frame; the DMA
- * ISR consumes 1 block per 1ms.  This reduces decode-to-speaker latency
- * from 5–10ms to 1–2ms.
- * ========================================================================= */
-
-/* =========================================================================
- * Uplink TX semaphore
- * ========================================================================= */
 K_SEM_DEFINE(tx_sem, 0, 1);
 
-/* =========================================================================
- * LC3 codec state
- * ========================================================================= */
-
-/* BAP preset base — QoS fields overridden at runtime for LC3Plus 5 ms. */
 static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
 	BT_AUDIO_CONTEXT_TYPE_UNSPECIFIED);
 
-#define GRPTLK_VENDOR_CODEC_ID   BT_HCI_CODING_FORMAT_VS
+#define GRPTLK_VENDOR_CODEC_ID	 BT_HCI_CODING_FORMAT_VS
 #define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
-#define GRPTLK_VENDOR_VENDOR_ID  0xBEEF
+#define GRPTLK_VENDOR_VENDOR_ID	 0xBEEF
 
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = 5000U;
-	preset_active.qos.sdu      = 20U;
-	preset_active.qos.rtn      = 1U;
-	/* qos.interval/qos.sdu are updated from BIGInfo before BIG sync. The
-	 * broadcast codec identity is logged from the BASE in periodic
-	 * advertising. */
+	preset_active.qos.sdu = 20U;
+	preset_active.qos.rtn = 1U;
 }
 
 static lc3_decoder_t lc3_decoder;
@@ -276,53 +103,40 @@ static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
 
 /* Decoder → encoder synchronization */
-static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
+static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
 
-/* =========================================================================
- * BLE ISO / BIG state
- * ========================================================================= */
-
-static uint8_t  big_actual_num_bis  = BIS_ISO_CHAN_COUNT;
-static uint8_t  active_uplink_bis   = CONFIG_GRPTLK_UPLINK_BIS - 1U;
+static uint8_t big_actual_num_bis = CONFIG_BT_ISO_MAX_CHAN;
+static uint8_t active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
-/* Cached BIS for current PTT session. 0xFF = not selected yet. */
 static uint8_t ptt_session_bis = 0xFFU;
 #endif
-/* Populated in biginfo_cb; used to configure LC3 and I2S after BIG info arrives. */
-static uint32_t big_sdu_interval_us = 5000U;  /* frame duration µs — default 5 ms */
-static uint16_t big_max_sdu         = 20U;    /* octets per frame  — default 20 B  */
+static uint32_t big_sdu_interval_us = 5000U; /* frame duration µs — default 5 ms */
+static uint16_t big_max_sdu = 20U;	     /* octets per frame  — default 20 B  */
 
-static bool         per_adv_found;
-static bool         per_adv_lost;
+static bool per_adv_found;
+static bool per_adv_lost;
 static bt_addr_le_t per_addr;
-static uint8_t      per_sid;
-static uint32_t     per_interval_us;
-static atomic_t     base_logged;
-static atomic_t     base_parse_warned;
+static uint8_t per_sid;
+static uint32_t per_interval_us;
+static atomic_t base_logged;
+static atomic_t base_parse_warned;
 
-static K_SEM_DEFINE(sem_per_adv,       0, 1);
-static K_SEM_DEFINE(sem_per_sync,      0, 1);
+static K_SEM_DEFINE(sem_per_adv, 0, 1);
+static K_SEM_DEFINE(sem_per_sync, 0, 1);
 static K_SEM_DEFINE(sem_per_sync_lost, 0, 1);
-static K_SEM_DEFINE(sem_per_big_info,  0, 1);
-static K_SEM_DEFINE(sem_big_sync,      0, BIS_ISO_CHAN_COUNT);
-static K_SEM_DEFINE(sem_big_sync_lost, 0, BIS_ISO_CHAN_COUNT);
+static K_SEM_DEFINE(sem_per_big_info, 0, 1);
+static K_SEM_DEFINE(sem_big_sync, 0, CONFIG_BT_ISO_MAX_CHAN);
+static K_SEM_DEFINE(sem_big_sync_lost, 0, CONFIG_BT_ISO_MAX_CHAN);
 
 static atomic_t big_chan_connected;
 static atomic_t uplink_tx_active;
 
-/* Set true after ISO data paths are configured.  Cleared by iso_recv() when
- * it fires the uplink kickstart.  The first bt_iso_chan_send() on a BIG-member
- * uplink channel must happen from within the BT ISO callback context so the
- * nRF5340 controller schedules it at the correct BIG anchor event. */
 static bool iso_datapaths_setup;
 
 static struct bt_iso_big *grptlk_big;
 
-/* -------------------------------------------------------------------------
- * BIS1 inactivity watchdog
- * ------------------------------------------------------------------------- */
 static struct k_timer bis1_activity_timer;
-static struct k_work  bis1_disconnect_work;
+static struct k_work bis1_disconnect_work;
 
 static void bis1_disconnect_work_handler(struct k_work *work)
 {
@@ -343,17 +157,13 @@ static void bis1_activity_timeout_handler(struct k_timer *timer)
 	k_work_submit(&bis1_disconnect_work);
 }
 
-/* =========================================================================
- * ISO channel objects
- * ========================================================================= */
-
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, BIS_ISO_CHAN_COUNT * 1,
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_BT_ISO_MAX_CHAN * 1,
 			  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
-static struct bt_iso_chan     bis_iso_chan[BIS_ISO_CHAN_COUNT];
-static struct bt_iso_chan    *bis[BIS_ISO_CHAN_COUNT];
-static uint16_t               seq_num;
+static struct bt_iso_chan bis_iso_chan[CONFIG_BT_ISO_MAX_CHAN];
+static struct bt_iso_chan *bis[CONFIG_BT_ISO_MAX_CHAN];
+static uint16_t seq_num;
 
 static struct bt_iso_chan_io_qos iso_rx_qos;
 static struct bt_iso_chan_io_qos iso_tx_qos = {
@@ -368,43 +178,34 @@ static struct bt_iso_chan_qos bis_iso_qos = {
 
 static struct bt_iso_big_sync_param big_sync_param = {
 	.bis_channels = bis,
-	.num_bis      = BIS_ISO_CHAN_COUNT,
-	.bis_bitfield = BIT_MASK(BIS_ISO_CHAN_COUNT),
-	.mse          = 1,
+	.num_bis = CONFIG_BT_ISO_MAX_CHAN,
+	.bis_bitfield = BIT_MASK(CONFIG_BT_ISO_MAX_CHAN),
+	.mse = 1,
 	.sync_timeout = 100,
 };
 
-/* =========================================================================
- * Downlink audio path: BIS1 → encoded_frame_q → lc3_decoder → ring → speaker
- * ========================================================================= */
-
-/* Called from the DMA ISR every 5 ms (accumulated from 5 × 1ms blocks)
- * with a captured mono frame.
- * Copies to shared buffer and signals encoder — ISR-safe (memcpy only). */
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
 	static uint32_t rx_frame_cnt;
 
-	memcpy(mic_pcm_shared, mono_frame, sizeof(int16_t) * PCM_SAMPLES_PER_FRAME);
+	memcpy(mic_pcm_shared, mono_frame, sizeof(int16_t) * AUDIO_SAMPLES_PER_FRAME);
 	k_sem_give(&mic_frame_sem);
 
 	if ((rx_frame_cnt++ % 200U) == 0U) {
-		/* Debug: log sample values to verify mic data */
 		int32_t sum = 0;
-		for (int i = 0; i < 8; i++) sum += mono_frame[i];
+		for (int i = 0; i < 8; i++) {
+			sum += mono_frame[i];
+		}
 		printk("[mic] frame=%u, samples[0-7].sum=%d\n", rx_frame_cnt, sum);
 	}
 }
 
-/* lc3_decoder thread: reads encoded frames from the BLE callback, decodes
- * (or PLC on loss), and splits into 5 × 1ms stereo blocks in the ring buffer
- * for the I2S DMA ISR. */
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
 	struct encoded_frame frame;
-	int16_t mono_pcm[PCM_SAMPLES_PER_FRAME];
+	int16_t mono_pcm[AUDIO_SAMPLES_PER_FRAME];
 	static uint32_t rx_frame_cnt;
-	static uint32_t rx_plc_cnt;     /* frames decoded via PLC (no real packet) */
+	static uint32_t rx_plc_cnt;	/* frames decoded via PLC (no real packet) */
 	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
 	static uint32_t rx_overrun_cnt; /* ring overrun — blocks discarded */
 
@@ -420,15 +221,13 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		gpio_pin_set_dt(&debug_lc3_dec, 1);
 
 		const uint8_t *lc3_data = (frame.len > 0U) ? frame.data : NULL;
-		const int      lc3_len  = (frame.len > 0U) ? (int)frame.len : 0;
+		const int lc3_len = (frame.len > 0U) ? (int)frame.len : 0;
 
 		if (lc3_data == NULL) {
 			rx_plc_cnt++;
 		}
 
-		/* lc3_decode(NULL, 0, ...) runs PLC — smooth concealment, no click. */
-		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len,
-				 LC3_PCM_FORMAT_S16, mono_pcm, 1);
+		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len, LC3_PCM_FORMAT_S16, mono_pcm, 1);
 		if (ret < 0) {
 			rx_dec_err_cnt++;
 			memset(mono_pcm, 0, sizeof(mono_pcm));
@@ -436,11 +235,10 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		gpio_pin_set_dt(&debug_lc3_dec, 0);
 
-		/* Split 80 mono samples → 5 × 16-sample blocks, pack stereo into ring. */
 		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
 			if (RING_FILLED() >= AUDIO_RING_NUM_BLKS - 1U) {
 				rx_overrun_cnt++;
-				break; /* overrun — discard remaining blocks */
+				break;
 			}
 
 			uint32_t *dst = ring_fifo[ring_prod_idx];
@@ -448,39 +246,28 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			for (uint8_t s = 0; s < AUDIO_BLK_SAMPLES_MONO; s++) {
 				int16_t sample = mono_pcm[blk * AUDIO_BLK_SAMPLES_MONO + s];
 
-				dst[s] = ((uint32_t)(uint16_t)sample << 16) |
-					 (uint16_t)sample;
+				dst[s] = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
 			}
 
 			ring_prod_idx = RING_NEXT(ring_prod_idx);
 		}
 
-		/* Signal encoder that it can now proceed */
 		k_sem_give(&decoder_proceed_sem);
 
 		if ((rx_frame_cnt++ % 200U) == 0U) {
 			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u\n",
 			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_overrun_cnt,
-			       (uint32_t)RING_FILLED(),
-			       audio_underrun_count_reset());
-			rx_plc_cnt     = 0;
+			       (uint32_t)RING_FILLED(), audio_underrun_count_reset());
+			rx_plc_cnt = 0;
 			rx_dec_err_cnt = 0;
 			rx_overrun_cnt = 0;
 		}
 	}
 }
 
-/* =========================================================================
- * Uplink audio path: mic → encoder → direct send (minimal latency)
- * ========================================================================= */
-
-/* lc3_encoder thread: waits for mic frames, encodes, writes to uplink queue.
- *
- * The uplink queue (managed by clk_sync) provides buffering between encoder
- * and TX thread, enabling drift detection via FIFO level monitoring. */
 static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-	int16_t local_pcm[PCM_SAMPLES_PER_FRAME];
+	int16_t local_pcm[AUDIO_SAMPLES_PER_FRAME];
 	uint8_t encoded_buf[CONFIG_BT_ISO_TX_MTU];
 	const int octets_per_frame = preset_active.qos.sdu;
 	static uint32_t enc_frame_cnt;
@@ -494,46 +281,40 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		int ret;
 		struct encoded_frame ef;
 
-		/* Wait for decoder to complete (drives encoder timing) */
 		k_sem_take(&decoder_proceed_sem, K_FOREVER);
 
-		/* Copy to local buffer (quick, ISR won't overwrite for 5ms). */
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
-		/* Debug: log mic activity and checksum of PCM data */
 		static uint32_t enc_dbg_cnt;
 		int32_t pcm_sum = 0;
-		for (int i = 0; i < 8; i++) pcm_sum += local_pcm[i];
+		for (int i = 0; i < 8; i++) {
+			pcm_sum += local_pcm[i];
+		}
 		if ((enc_dbg_cnt++ % 100U) == 0U) {
-			printk("[enc] frame=%u, ptt=%ld, pcm[0-7].sum=%d\n",
-			       enc_dbg_cnt, (long)atomic_get(&ptt_active), pcm_sum);
+			printk("[enc] frame=%u, ptt=%ld, pcm[0-7].sum=%d\n", enc_dbg_cnt,
+			       (long)atomic_get(&ptt_active), pcm_sum);
 		}
 
-		/* Skip encode when not transmitting — saves CPU when PTT is off. */
 		if (atomic_get(&ptt_active) == 0) {
 			continue;
 		}
 
 		gpio_pin_set_dt(&debug_lc3_enc, 1);
 
-		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1,
-				 octets_per_frame, encoded_buf);
+		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
+				 encoded_buf);
 		if (ret < 0) {
 			printk("[enc] lc3_encode error: %d\n", ret);
 			gpio_pin_set_dt(&debug_lc3_enc, 0);
 			continue;
 		}
 
-		/* Prepare encoded frame for uplink queue. */
 		memcpy(ef.data, encoded_buf, octets_per_frame);
 		ef.len = octets_per_frame;
 
-		/* Write to uplink queue (blocking if full — this provides backpressure). */
 		ret = k_msgq_put(uplink_q, &ef, K_NO_WAIT);
 		if (ret != 0) {
-			/* Queue full — drop frame and count. This should be rare
-			 * when clk_sync is working; if frequent, indicates HFCLKAUDIO
-			 * is running too fast relative to BIG anchor. */
+			/* Queue full — drop frame (clk_sync should prevent this) */
 			enc_q_full_cnt++;
 			if ((enc_q_full_cnt % 10U) == 1U) {
 				printk("[enc] WARN: uplink_q full (drop #%u)\n", enc_q_full_cnt);
@@ -549,23 +330,17 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 	}
 }
 
-/* =========================================================================
- * Uplink BIS selection and ISO TX thread
- * ========================================================================= */
-
 static struct bt_iso_chan *iso_select_uplink_chan(void)
 {
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
-	extern atomic_t ptt_active;  /* From io/buttons.c */
+	extern atomic_t ptt_active; /* From io/buttons.c */
 
-	/* Check if we need to select a new BIS for this PTT session */
 	if (atomic_get(&ptt_active) && ptt_session_bis == 0xFFU) {
 		uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
 
 		if (num_uplink == 0U) {
 			return NULL;
 		}
-		/* Select random BIS for this session */
 		ptt_session_bis = (uint8_t)(sys_rand32_get() % num_uplink) + 1U;
 		printk("[Uplink] Selected BIS%d for PTT session\n", ptt_session_bis + 1);
 	}
@@ -575,7 +350,6 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 		return bis[active_uplink_bis];
 	}
 
-	/* PTT not active, no valid BIS */
 	active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
 	return bis[active_uplink_bis];
 
@@ -597,7 +371,6 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 }
 
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
-/* Reset the cached PTT session BIS. Called from buttons.c when PTT is released. */
 void ptt_session_bis_reset(void)
 {
 	ptt_session_bis = 0xFFU;
@@ -606,10 +379,6 @@ void ptt_session_bis_reset(void)
 
 static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef);
 
-/* TX thread: reads encoded frames from uplink queue and sends via BLE ISO.
- *
- * Waits on both the uplink queue (for encoder data) and tx_sem (for PTT
- * kickstart). Uses k_sleep for short delays to avoid busy polling. */
 static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg1);
@@ -621,21 +390,14 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 		struct encoded_frame ef;
 		int ret;
 
-		/* Wait for encoder to produce data or PTT button press.
-		 * Use short timeout to check both conditions efficiently. */
 		ret = k_msgq_get(uplink_q, &ef, K_MSEC(10));
 		if (ret != 0) {
-			/* No data yet — check for PTT kickstart */
 			if (k_sem_take(&tx_sem, K_NO_WAIT) == 0) {
-				/* PTT pressed: prime TX by waiting for next frame */
 				continue;
 			}
-			/* Timeout with no data and no PTT — loop back */
 			continue;
 		}
 
-		/* Wait for previous TX to complete before sending next packet.
-		 * This prevents buffer exhaustion and ensures proper sequencing. */
 		while (atomic_get(&tx_in_progress) != 0) {
 			k_sleep(K_USEC(100));
 		}
@@ -652,7 +414,6 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 	struct net_buf *buf;
 	int err;
 
-	/* Don't send empty frames. */
 	if (ef->len == 0) {
 		printk("[send] skipped: ef->len=0\n");
 		return -ENODATA;
@@ -668,7 +429,6 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 		return -ENOMEM;
 	}
 
-	/* Check PTT at send time — gate transmission. */
 	if (atomic_get(&ptt_active) == 0) {
 		net_buf_unref(buf);
 		return 0;
@@ -677,8 +437,6 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
 	net_buf_add_mem(buf, ef->data, ef->len);
 
-	/* Set tx_in_progress before sending.
-	 * This blocks the TX thread until iso_sent fires. */
 	atomic_set(&tx_in_progress, 1);
 
 	err = bt_iso_chan_send(chan, buf, seq_num);
@@ -688,23 +446,15 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame
 		return err;
 	}
 
-	// printk("[send] sent %u bytes on chan %p, seq=%u\n", ef->len, chan, seq_num);
 	atomic_set(&uplink_tx_active, 1);
 	seq_num++;
 	return 0;
 }
 
-/* =========================================================================
- * BT ISO callbacks
- * ========================================================================= */
-
 static void iso_sent(struct bt_iso_chan *chan)
 {
 	gpio_pin_set_dt(&debug_iso_sent, 1);
 
-	/* Clear tx_in_progress for the active uplink BIS only.
-	 * This signals the TX thread that the previous transmission is complete
-	 * and allows the next packet to be sent. */
 	if (chan == bis[active_uplink_bis]) {
 		atomic_set(&tx_in_progress, 0);
 	}
@@ -712,15 +462,6 @@ static void iso_sent(struct bt_iso_chan *chan)
 	gpio_pin_set_dt(&debug_iso_sent, 0);
 }
 
-/* iso_recv: receives BIG SDUs on BIS1 (downlink only).
- *
- * Valid frames → encoded_frame_q for the decoder thread.
- * Lost/invalid frames → zero-length frame → decoder runs PLC.
- *
- * Uplink kickstart: on the very first confirmed reception, prime tx_sem once
- * from within this callback.  The nRF5340 controller requires the first
- * bt_iso_chan_send() on a BIG-member uplink to happen inside the BT ISO
- * callback context so it can align it to the BIG anchor event. */
 static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 		     struct net_buf *buf)
 {
@@ -739,22 +480,17 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 			memcpy(ef.data, buf->data, buf->len);
 			k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
 		} else {
-			ef.len = 0U; /* loss → PLC */
+			ef.len = 0U;
 		}
 		k_msgq_put(&encoded_frame_q, &ef, K_NO_WAIT);
 	}
 
 	gpio_pin_set_dt(&debug_iso_recv, 0);
 
-	/* Feed BIG anchor + ring level to clk_sync on every BIS1 frame.
-	 * sdu_ref_us = BLE controller anchor timestamp (µs).
-	 * ring_level = current audio ring buffer fill (HFCLKAUDIO drift proxy).
-	 * ISR-safe: clk_sync_rx_notify() uses only atomic_set + k_sem_give. */
 	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
 		clk_sync_rx_notify(info->ts, RING_FILLED());
 	}
 
-	/* Removed tx_sem priming from here - encoder now primes TX after first encode */
 	iso_datapaths_setup = false;
 }
 
@@ -777,8 +513,7 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 	if (chan == bis[0]) {
 		k_timer_stop(&bis1_activity_timer);
 	}
-	if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB ||
-	    reason == BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
+	if (reason == BT_HCI_ERR_CONN_FAIL_TO_ESTAB || reason == BT_HCI_ERR_OP_CANCELLED_BY_HOST) {
 		k_sem_give(&sem_big_sync);
 	} else {
 		k_sem_give(&sem_big_sync_lost);
@@ -786,15 +521,11 @@ static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 }
 
 static struct bt_iso_chan_ops iso_ops = {
-	.connected    = iso_connected,
+	.connected = iso_connected,
 	.disconnected = iso_disconnected,
-	.sent         = iso_sent,
-	.recv         = iso_recv,
+	.sent = iso_sent,
+	.recv = iso_recv,
 };
-
-/* =========================================================================
- * BLE scan and periodic advertising callbacks
- * ========================================================================= */
 
 static bool base_skip_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len_out)
 {
@@ -820,8 +551,7 @@ static bool base_skip_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len
 
 static bool base_is_grptlk_vendor_codec(uint8_t codec_id, uint16_t cid, uint16_t vid)
 {
-	return (codec_id == GRPTLK_VENDOR_CODEC_ID) &&
-	       (cid == GRPTLK_VENDOR_COMPANY_ID) &&
+	return (codec_id == GRPTLK_VENDOR_CODEC_ID) && (cid == GRPTLK_VENDOR_COMPANY_ID) &&
 	       (vid == GRPTLK_VENDOR_VENDOR_ID);
 }
 
@@ -851,8 +581,8 @@ static int base_log_service_data(const struct bt_data *data)
 		return -EINVAL;
 	}
 
-	printk("BASE: presentation_delay=%u us, num_subgroups=%u\n",
-	       presentation_delay_us, subgroup_count);
+	printk("BASE: presentation_delay=%u us, num_subgroups=%u\n", presentation_delay_us,
+	       subgroup_count);
 
 	for (uint8_t subgroup_idx = 0U; subgroup_idx < subgroup_count; subgroup_idx++) {
 		uint8_t bis_count;
@@ -911,8 +641,8 @@ static int base_log_service_data(const struct bt_data *data)
 
 		printk("BASE subgroup %u: codec_id=0x%02x%s, cid=0x%04x, vid=0x%04x, "
 		       "codec_cfg_len=%u, meta_len=%u, num_bis=%u, bis_bitfield=0x%08x\n",
-		       subgroup_idx + 1U, codec_id, codec_note, cid, vid,
-		       codec_cfg_len, meta_len, bis_count, bis_bitfield);
+		       subgroup_idx + 1U, codec_id, codec_note, cid, vid, codec_cfg_len, meta_len,
+		       bis_count, bis_bitfield);
 	}
 
 	return (buf.len == 0U) ? 0 : -EINVAL;
@@ -945,18 +675,17 @@ static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_si
 {
 	ARG_UNUSED(buf);
 	if (!per_adv_found && info->interval) {
-		per_adv_found   = true;
-		per_sid         = info->sid;
+		per_adv_found = true;
+		per_sid = info->sid;
 		per_interval_us = BT_CONN_INTERVAL_TO_US(info->interval);
 		bt_addr_le_copy(&per_addr, info->addr);
 		k_sem_give(&sem_per_adv);
 	}
 }
 
-static struct bt_le_scan_cb scan_callbacks = { .recv = scan_recv };
+static struct bt_le_scan_cb scan_callbacks = {.recv = scan_recv};
 
-static void sync_cb(struct bt_le_per_adv_sync *sync,
-		    struct bt_le_per_adv_sync_synced_info *info)
+static void sync_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_info *info)
 {
 	ARG_UNUSED(sync);
 	ARG_UNUSED(info);
@@ -964,8 +693,7 @@ static void sync_cb(struct bt_le_per_adv_sync *sync,
 }
 
 static void pa_recv_cb(struct bt_le_per_adv_sync *sync,
-		       const struct bt_le_per_adv_sync_recv_info *info,
-		       struct net_buf_simple *buf)
+		       const struct bt_le_per_adv_sync_recv_info *info, struct net_buf_simple *buf)
 {
 	struct net_buf_simple ad_copy = *buf;
 
@@ -995,11 +723,9 @@ static void term_cb(struct bt_le_per_adv_sync *sync,
 static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_biginfo *biginfo)
 {
 	ARG_UNUSED(sync);
-	big_actual_num_bis  = MIN(biginfo->num_bis, (uint8_t)BIS_ISO_CHAN_COUNT);
+	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)CONFIG_BT_ISO_MAX_CHAN);
 	big_sdu_interval_us = biginfo->sdu_interval;
-	big_max_sdu         = biginfo->max_sdu;
-	/* Only print on first detection — callback fires every ~200 ms while
-	 * the PA scanner is active and would spam the log once synced. */
+	big_max_sdu = biginfo->max_sdu;
 	if (grptlk_big == NULL) {
 		printk("BIG: %u BIS(es), sdu_interval=%u us, max_sdu=%u B, syncing to %u\n",
 		       biginfo->num_bis, big_sdu_interval_us, big_max_sdu, big_actual_num_bis);
@@ -1008,15 +734,11 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 }
 
 static struct bt_le_per_adv_sync_cb sync_callbacks = {
-	.synced  = sync_cb,
-	.recv    = pa_recv_cb,
-	.term    = term_cb,
+	.synced = sync_cb,
+	.recv = pa_recv_cb,
+	.term = term_cb,
 	.biginfo = biginfo_cb,
 };
-
-/* =========================================================================
- * BIG sync state machine helpers
- * ========================================================================= */
 
 static void reset_semaphores(void)
 {
@@ -1032,7 +754,7 @@ static void reset_semaphores(void)
 
 static bool bis_channels_idle(void)
 {
-	for (uint8_t i = 0U; i < BIS_ISO_CHAN_COUNT; i++) {
+	for (uint8_t i = 0U; i < CONFIG_BT_ISO_MAX_CHAN; i++) {
 		if (bis[i]->iso != NULL) {
 			return false;
 		}
@@ -1054,10 +776,10 @@ static void wait_bis_channels_idle(k_timeout_t timeout)
 
 static void bis_channels_init(void)
 {
-	for (uint8_t i = 0U; i < BIS_ISO_CHAN_COUNT; i++) {
+	for (uint8_t i = 0U; i < CONFIG_BT_ISO_MAX_CHAN; i++) {
 		bis_iso_chan[i].ops = &iso_ops;
 		bis_iso_chan[i].qos = &bis_iso_qos;
-		bis[i]              = &bis_iso_chan[i];
+		bis[i] = &bis_iso_chan[i];
 	}
 }
 
@@ -1068,7 +790,7 @@ static int setup_iso_datapaths(void)
 	for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
 		struct bt_iso_chan *chan = bis[i];
 		const struct bt_iso_chan_path hci_path = {
-			.pid    = BT_ISO_DATA_PATH_HCI,
+			.pid = BT_ISO_DATA_PATH_HCI,
 			.format = BT_HCI_CODING_FORMAT_TRANSPARENT,
 		};
 		uint8_t dir = (i == 0U) ? BT_HCI_DATAPATH_DIR_CTLR_TO_HOST
@@ -1077,8 +799,7 @@ static int setup_iso_datapaths(void)
 		printk("Setting data path chan %u...\n", i);
 		err = bt_iso_setup_data_path(chan, dir, &hci_path);
 		if (err == -EACCES) {
-			printk("Data path chan %u busy, removing stale path and retrying...\n",
-			       i);
+			printk("Data path chan %u busy, removing stale path and retrying...\n", i);
 			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_CTLR_TO_HOST);
 			(void)bt_iso_remove_data_path(chan, BT_HCI_DATAPATH_DIR_HOST_TO_CTLR);
 			err = bt_iso_setup_data_path(chan, dir, &hci_path);
@@ -1089,20 +810,14 @@ static int setup_iso_datapaths(void)
 		}
 		printk("Data path set chan %u.\n", i);
 	}
-
-	/* Reset clk_sync PI integrator and lock counters on each BIG resync. */
 	clk_sync_reset();
 
 	seq_num = 0U;
 	atomic_set(&uplink_tx_active, 0);
-
-	/* Reset ring indices and queues so stale frames from a previous BIG sync
-	 * don't play out. */
 	k_msgq_purge(&encoded_frame_q);
-	k_msgq_purge(uplink_q);  /* Purge uplink queue too */
+	k_msgq_purge(uplink_q); /* Purge uplink queue too */
 	ring_prod_idx = 0;
 	ring_cons_idx = 0;
-	/* Drain any pending mic frame semaphore. */
 	while (k_sem_take(&mic_frame_sem, K_NO_WAIT) == 0) {
 	}
 
@@ -1110,12 +825,6 @@ static int setup_iso_datapaths(void)
 	return 0;
 }
 
-/* =========================================================================
- * LC3 worker thread startup
- * =========================================================================
- * Thread stacks must be at file scope — K_THREAD_STACK_DEFINE uses
- * __attribute__((section)) which cannot apply to automatic variables.
- */
 K_THREAD_STACK_DEFINE(decoder_stack, DECODER_STACK_SIZE);
 static struct k_thread decoder_thread_data;
 
@@ -1127,76 +836,56 @@ static struct k_thread tx_thread_data;
 
 static int lc3_workers_start(void)
 {
-	lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
-					0, &lc3_decoder_mem);
+	lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
+					&lc3_decoder_mem);
 	if (lc3_decoder == NULL) {
 		printk("ERROR: Failed to setup LC3 decoder\n");
 		return -EIO;
 	}
 
-	lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
-					0, &lc3_encoder_mem);
+	lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
+					&lc3_encoder_mem);
 	if (lc3_encoder == NULL) {
 		printk("ERROR: Failed to setup LC3 encoder\n");
 		return -EIO;
 	}
 
-	k_thread_create(&decoder_thread_data, decoder_stack,
-			K_THREAD_STACK_SIZEOF(decoder_stack),
-			decoder_thread_func, NULL, NULL, NULL,
-			DECODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),
+			decoder_thread_func, NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&decoder_thread_data, "lc3_decoder");
 
-	k_thread_create(&encoder_thread_data, encoder_stack,
-			K_THREAD_STACK_SIZEOF(encoder_stack),
-			encoder_thread_func, NULL, NULL, NULL,
-			ENCODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),
+			encoder_thread_func, NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
 
-	/* Initialize decoder_proceed_sem as unavailable (encoder runs after decoder) */
 	k_sem_init(&decoder_proceed_sem, 0, 1);
 
-	k_thread_create(&tx_thread_data, tx_thread_stack,
-			K_THREAD_STACK_SIZEOF(tx_thread_stack),
-			tx_thread, NULL, NULL, NULL,
-			TX_THREAD_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&tx_thread_data, tx_thread_stack, K_THREAD_STACK_SIZEOF(tx_thread_stack),
+			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&tx_thread_data, "iso_tx");
 
 	return 0;
 }
 
-/* =========================================================================
- * main — system init and BIG sync state machine
- * =========================================================================
- *
- * Startup sequence:
- *   1. Audio backend (CS47L63 + I2S DMA)
- *   2. Buttons (PTT, PTT-lock, volume)
- *   3. LC3 worker threads (decoder, encoder, iso_tx)
- *   4. Bluetooth enable + scan
- *
- * BIG sync loop (restarts on every loss or timeout):
- *   scan → PA found → PA sync → BIGInfo → BIG sync → data paths
- *      └──────────── re-scan on any failure ──────────────────────┘
- */
 int main(void)
 {
 	struct bt_le_per_adv_sync_param sync_create_param;
-	struct bt_le_per_adv_sync      *sync;
+	struct bt_le_per_adv_sync *sync;
 	uint32_t sem_timeout_us;
 	int err;
 	int led_err;
 
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 	override_preset_for_lc3plus_5ms();
+#endif
 
 	printk("Starting GRPTLK Receiver\n");
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
-	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n", BIS_ISO_CHAN_COUNT);
+	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n", CONFIG_BT_ISO_MAX_CHAN);
 #else
 	printk("Config: downlink=BIS1, uplink=static BIS%u\n", CONFIG_GRPTLK_UPLINK_BIS);
 #endif
 
-	/* --- Status LED ---------------------------------------------------- */
 	led_err = led_init();
 	if (led_err) {
 		printk("led_init failed: %d\n", led_err);
@@ -1204,14 +893,12 @@ int main(void)
 		(void)led_set_receiver_synced(false);
 	}
 
-	/* --- Buttons: PTT, PTT-lock, volume --------------------------------- */
 	err = buttons_init(&tx_sem);
 	if (err) {
 		printk("buttons_init failed: %d\n", err);
 		return err;
 	}
 
-	/* --- Debug GPIO outputs for logic analyzer ------------------------- */
 	if (!device_is_ready(debug_iso_recv.port)) {
 		printk("Debug ISO recv GPIO not ready\n");
 	} else {
@@ -1248,14 +935,11 @@ int main(void)
 		}
 	}
 
-	/* --- BIS1 inactivity watchdog --------------------------------------- */
 	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
 	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
 
-	/* --- ISO channel objects -------------------------------------------- */
 	bis_channels_init();
 
-	/* --- Audio backend (CS47L63 codec + I2S DMA) ------------------------ */
 	err = audio_init(&playback_ring, audio_rx_mono_frame);
 	if (err) {
 		printk("audio_init failed: %d\n", err);
@@ -1268,20 +952,15 @@ int main(void)
 		return err;
 	}
 
-	/* --- Clock sync thread (BLE anchor → HFCLKAUDIO PI controller) -----
-	 * Enables both RX (downlink) and TX (uplink) drift compensation. */
 	clk_sync_init();
 
-	/* Get uplink queue from clk_sync for encoder → TX buffering. */
 	uplink_q = clk_sync_get_uplink_q();
 
-	/* --- LC3 codec threads (decoder, encoder, iso_tx) ------------------ */
 	err = lc3_workers_start();
 	if (err) {
 		return err;
 	}
 
-	/* --- Bluetooth ----------------------------------------------------- */
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
@@ -1291,7 +970,6 @@ int main(void)
 	bt_le_scan_cb_register(&scan_callbacks);
 	bt_le_per_adv_sync_cb_register(&sync_callbacks);
 
-	/* --- BIG sync state machine (loops on loss / timeout) -------------- */
 	do {
 		reset_semaphores();
 		per_adv_lost = false;
@@ -1323,8 +1001,8 @@ int main(void)
 
 		bt_addr_le_copy(&sync_create_param.addr, &per_addr);
 		sync_create_param.options = 0;
-		sync_create_param.sid     = per_sid;
-		sync_create_param.skip    = 0;
+		sync_create_param.sid = per_sid;
+		sync_create_param.skip = 0;
 		sync_create_param.timeout =
 			(per_interval_us * PA_RETRY_COUNT) / (10 * USEC_PER_MSEC);
 		sem_timeout_us = per_interval_us * PA_RETRY_COUNT;
@@ -1354,28 +1032,17 @@ int main(void)
 			continue;
 		}
 
-		/* Synchronise preset_active QoS to what the broadcaster is actually sending.
-		 * big_sdu_interval_us = frame duration; big_max_sdu = octets per SDU. */
 		preset_active.qos.interval = big_sdu_interval_us;
-		preset_active.qos.sdu      = big_max_sdu;
+		preset_active.qos.sdu = big_max_sdu;
 
-		/* I2S DMA block size is fixed at 1ms (16 words @ 16 kHz) regardless
-		 * of the LC3 frame duration.  The ring buffer bridges the cadences. */
-		audio_i2s_set_block_size(AUDIO_BLK_SAMPLES_MONO);
-
-		/* Re-initialise LC3 codec instances with the discovered frame duration.
-		 * lc3_setup_decoder/encoder are fast pointer-setup calls; the worker
-		 * threads are already running but will not consume stale data because
-		 * the BIG is not yet synced — encoded_frame_q is empty and mic_frame_sem
-		 * is not signaled. */
-		lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
-						0, &lc3_decoder_mem);
+		lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
+						&lc3_decoder_mem);
 		if (lc3_decoder == NULL) {
 			printk("ERROR: lc3_setup_decoder failed\n");
 			goto per_sync_lost_check;
 		}
-		lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, SAMPLE_RATE_HZ,
-						0, &lc3_encoder_mem);
+		lc3_encoder = lc3_setup_encoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
+						&lc3_encoder_mem);
 		if (lc3_encoder == NULL) {
 			printk("ERROR: lc3_setup_encoder failed\n");
 			goto per_sync_lost_check;
@@ -1387,14 +1054,15 @@ big_sync_create:
 			wait_bis_channels_idle(K_SECONDS(2));
 		}
 		if (!bis_channels_idle()) {
-			printk("Previous BIG channels still allocated, waiting for fresh BIGInfo\n");
+			printk("Previous BIG channels still allocated, waiting for fresh "
+			       "BIGInfo\n");
 			goto per_sync_lost_check;
 		}
 
-		big_sync_param.num_bis      = big_actual_num_bis;
+		big_sync_param.num_bis = big_actual_num_bis;
 		big_sync_param.bis_bitfield = BIT_MASK(big_actual_num_bis);
-		printk("Create BIG Sync (num_bis=%u, bitfield=0x%x)...\n",
-		       big_sync_param.num_bis, big_sync_param.bis_bitfield);
+		printk("Create BIG Sync (num_bis=%u, bitfield=0x%x)...\n", big_sync_param.num_bis,
+		       big_sync_param.bis_bitfield);
 
 		atomic_set(&big_chan_connected, 0);
 		err = bt_iso_big_sync(sync, &big_sync_param, &grptlk_big);
@@ -1417,8 +1085,8 @@ big_sync_create:
 		}
 
 		if (err || (int)atomic_get(&big_chan_connected) < (int)big_actual_num_bis) {
-			printk("BIG sync failed (err %d, connected %d/%u)\n",
-			       err, (int)atomic_get(&big_chan_connected), big_actual_num_bis);
+			printk("BIG sync failed (err %d, connected %d/%u)\n", err,
+			       (int)atomic_get(&big_chan_connected), big_actual_num_bis);
 			err = bt_iso_big_terminate(grptlk_big);
 			if ((err != 0) && (err != -EINVAL) && (err != -EIO)) {
 				printk("bt_iso_big_terminate failed: %d\n", err);

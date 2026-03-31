@@ -29,52 +29,29 @@
 #include <stdbool.h>
 
 enum clk_sync_drift_state {
-	DRIFT_STATE_INIT   = 0,
-	DRIFT_STATE_CALIB  = 1,
+	DRIFT_STATE_INIT = 0,
+	DRIFT_STATE_CALIB = 1,
 	DRIFT_STATE_OFFSET = 2,
 	DRIFT_STATE_LOCKED = 3,
 };
 
-/*
- * Call once before audio_start().  Spawns the clk_sync_thread at priority 1.
- */
+/* Spawns clk_sync_thread at priority 1. Call once before audio_start(). */
 void clk_sync_init(void);
 
 /*
- * Called from iso_recv() on every BIS1 packet when BT_ISO_FLAGS_TS is set.
- *
- * sdu_ref_us:  BLE controller anchor timestamp from info->ts (µs)
- * ring_level:  current audio ring buffer fill level (RING_FILLED())
- *
+ * Called from iso_recv() on each BIS1 packet with BT_ISO_FLAGS_TS set.
  * ISR-safe: only atomic writes + k_sem_give() inside.
  */
 void clk_sync_rx_notify(uint32_t sdu_ref_us, uint32_t ring_level);
 
-/*
- * Reset the drift state machine.
- * Call from setup_iso_datapaths() on every BIG re-sync.
- */
+/* Call from setup_iso_datapaths() on every BIG re-sync. */
 void clk_sync_reset(void);
 
-/*
- * Get pointer to the uplink queue for main.c to register.
- * Defined here to avoid circular dependencies.
- */
+/* Returns uplink queue pointer; defined here to avoid circular dependencies. */
 struct k_msgq *clk_sync_get_uplink_q(void);
 
-/*
- * Returns true when the drift machine is in DRIFT_STATE_LOCKED.
- */
 bool clk_sync_is_locked(void);
-
-/*
- * Current HFCLKAUDIO FREQ_VALUE (for debugging / logging).
- */
 uint16_t clk_sync_freq_get(void);
-
-/*
- * Current drift-compensation state (for debugging).
- */
 enum clk_sync_drift_state clk_sync_state_get(void);
 
 #endif /* CLK_SYNC_H_ */

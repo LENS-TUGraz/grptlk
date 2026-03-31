@@ -11,7 +11,7 @@
 #include "cs47l63.h"
 
 #define CS47L63_THREAD_PRIO 5
-#define CS47L63_STACK_SIZE 700
+#define CS47L63_STACK_SIZE  700
 
 /**@brief Initialize the CS47L63
  *
