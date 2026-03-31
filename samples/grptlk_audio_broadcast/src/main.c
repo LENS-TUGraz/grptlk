@@ -20,7 +20,6 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
 
-
 #define VOLUME_STEP_DB 3
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
@@ -39,25 +38,13 @@ static struct gpio_callback vol_up_cb_data;
  * P1.14      = debug_iso_sent - iso_sent() callback (uplink TX)
  */
 static const struct gpio_dt_spec debug_iso_sent = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-	.pin = 31,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio0)), .pin = 31, .dt_flags = 0};
 static const struct gpio_dt_spec debug_iso_recv = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 0,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 0, .dt_flags = 0};
 static const struct gpio_dt_spec debug_lc3_dec = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 1,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 1, .dt_flags = 0};
 static const struct gpio_dt_spec debug_lc3_enc = {
-	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
-	.pin = 14,
-	.dt_flags = 0
-};
+	.port = DEVICE_DT_GET(DT_NODELABEL(gpio1)), .pin = 14, .dt_flags = 0};
 
 /* Deferred volume work: ISRs cannot call SPI directly. */
 static struct k_work vol_work;
@@ -267,14 +254,19 @@ static int ptt_lock_init(void)
 #endif
 }
 
-
 /* BAP preset base: kept as-is per project requirement.
- * Runtime QoS fields are overridden below for LC3Plus 5 ms operation. */
-#define GRPTLK_VENDOR_CODEC_ID  BT_HCI_CODING_FORMAT_VS
+ * For LC3Plus 5ms, QoS fields are overridden at runtime.
+ * For BAP 16_2_1, the preset is used as-is (no override). */
+#define GRPTLK_VENDOR_CODEC_ID	 BT_HCI_CODING_FORMAT_VS
 #define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
-#define GRPTLK_VENDOR_VENDOR_ID  0xBEEF
-#define GRPTLK_CODEC_INTERVAL_US            5000U
-#define GRPTLK_CODEC_SDU_BYTES              20U
+#define GRPTLK_VENDOR_VENDOR_ID	 0xBEEF
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_10_MS)
+#define GRPTLK_CODEC_INTERVAL_US 10000U
+#define GRPTLK_CODEC_SDU_BYTES	 40U
+#else
+#define GRPTLK_CODEC_INTERVAL_US 5000U
+#define GRPTLK_CODEC_SDU_BYTES	 20U
+#endif
 
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
@@ -288,27 +280,29 @@ static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADC
  * The receiver reads the vendor codec identity from the BASE and the transport
  * sizing from BIGInfo, so there is no need for extra private codec-config
  * fields here. */
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
-	preset_active.qos.sdu      = GRPTLK_CODEC_SDU_BYTES;
+	preset_active.qos.sdu = GRPTLK_CODEC_SDU_BYTES;
 	/* rtn=2: two retransmit opportunities per BIG event. Reduces streak_max from
 	 * 3-4 to 0-1 in burst-loss conditions, keeping PLC below the audible threshold.
 	 * latency=10ms = (rtn+1)*interval = 3*5ms, the required minimum for rtn=2. */
-	preset_active.qos.latency  = 10U;
-	preset_active.qos.rtn      = 2U;
+	preset_active.qos.latency = 10U;
+	preset_active.qos.rtn = 2U;
 	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
 	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
 	preset_active.codec_cfg.vid = GRPTLK_VENDOR_VENDOR_ID;
 	preset_active.codec_cfg.data_len = 0U;
 }
+#endif
 
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
-#define SAMPLE_RATE_HZ        AUDIO_SAMPLE_RATE_HZ
-#define BLOCK_BYTES           AUDIO_BLOCK_BYTES
+#define SAMPLE_RATE_HZ	      AUDIO_SAMPLE_RATE_HZ
+#define BLOCK_BYTES	      AUDIO_BLOCK_BYTES
 /* BIS layout: bis[0] = TX (BIS1), bis[1..N] = RX uplink */
-#define NUM_RX_BIS        (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
-#define NUM_PRIME_PACKETS 1
+#define NUM_RX_BIS	      (CONFIG_GRPTLK_NUM_CHAN - 1)
+#define NUM_PRIME_PACKETS     1
 
 /* Speaker playback ring buffer — kept for audio_init() but never written by
  * iso_recv, so the DMA output path produces silence. */
@@ -317,7 +311,7 @@ static volatile uint16_t ring_prod_idx;
 static volatile uint16_t ring_cons_idx;
 
 static struct audio_ring playback_ring = {
-	.fifo     = ring_fifo,
+	.fifo = ring_fifo,
 	.prod_idx = &ring_prod_idx,
 	.cons_idx = &ring_cons_idx,
 	.num_blks = AUDIO_RING_NUM_BLKS,
@@ -345,10 +339,10 @@ static lc3_decoder_mem_16k_t lc3_decoder_mem[NUM_RX_BIS];
 
 /* TX ready flag: ignore iso_recv until TX path has sent NUM_PRIME_PACKETS+1 packets */
 static atomic_t iso_tx_ready = ATOMIC_INIT(0);
-#define ISO_TX_READY_THRESHOLD (NUM_PRIME_PACKETS + 1)  /* 3 packets */
+#define ISO_TX_READY_THRESHOLD (NUM_PRIME_PACKETS + 1) /* 3 packets */
 
 /* Uplink RX decoder */
-#define NUM_RX_BIS (CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT - 1)
+#define NUM_RX_BIS (CONFIG_GRPTLK_NUM_CHAN - 1)
 
 struct rx_bis_frame {
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
@@ -359,38 +353,39 @@ struct rx_bis_frame {
 
 static struct rx_bis_frame rx_frames[NUM_RX_BIS];
 static atomic_t rx_bis_received_count = ATOMIC_INIT(0);
-static K_SEM_DEFINE(decoder_sem, 0, 1);  /* Signals decoder: all BIS received */
-static K_SEM_DEFINE(decoder_proceed_sem, 0, 1);  /* Decoder signals encoder */
+static K_SEM_DEFINE(decoder_sem, 0, 1);		/* Signals decoder: all BIS received */
+static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
 
 /* PRR (Packet Reception Rate) tracking for uplink BISes */
-#define PRR_WINDOW_SIZE 100  /* 100 frames = 500ms @ 5ms/frame, matches print interval */
+#define PRR_WINDOW_SIZE (500000U / GRPTLK_CODEC_INTERVAL_US)
+/* 5ms profile → 100 frames; 10ms profile → 50 frames; both give ~500ms window */
 
 struct bis_prr_tracker {
-	uint8_t window[PRR_WINDOW_SIZE];  /* 1 = valid, 0 = invalid/missing */
-	uint8_t window_idx;               /* Current position in circular buffer */
-	uint8_t window_filled;            /* Whether window is fully populated */
+	uint8_t window[PRR_WINDOW_SIZE]; /* 1 = valid, 0 = invalid/missing */
+	uint8_t window_idx;		 /* Current position in circular buffer */
+	uint8_t window_filled;		 /* Whether window is fully populated */
 };
 
 static struct bis_prr_tracker prr_trackers[NUM_RX_BIS];
 
 /* BAP */
 static struct bt_bap_broadcast_source *broadcast_source __maybe_unused;
-static struct bt_bap_stream streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
+static struct bt_bap_stream streams[CONFIG_GRPTLK_NUM_CHAN] __maybe_unused;
 
 /* ISO */
-NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT *NUM_PRIME_PACKETS,
+NET_BUF_POOL_FIXED_DEFINE(bis_tx_pool, CONFIG_GRPTLK_NUM_CHAN *NUM_PRIME_PACKETS,
 			  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
 
-static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT);
+static K_SEM_DEFINE(sem_big_cmplt, 0, CONFIG_GRPTLK_NUM_CHAN);
 static K_SEM_DEFINE(tx_sem, 0, NUM_PRIME_PACKETS);
 
-static struct bt_iso_chan *bis[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
-static struct bt_iso_chan bis_iso_chan[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT] __maybe_unused;
+static struct bt_iso_chan *bis[CONFIG_GRPTLK_NUM_CHAN];
+static struct bt_iso_chan bis_iso_chan[CONFIG_GRPTLK_NUM_CHAN] __maybe_unused;
 static uint16_t seq_num __maybe_unused;
 
 static struct bt_iso_big_create_param big_create_param __maybe_unused = {
-	.num_bis = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT,
+	.num_bis = CONFIG_GRPTLK_NUM_CHAN,
 	.bis_channels = bis,
 	.packing = BT_ISO_PACKING_SEQUENTIAL,
 	.framing = BT_ISO_FRAMING_UNFRAMED,
@@ -407,12 +402,12 @@ static struct bt_iso_chan_qos bis_iso_qos __maybe_unused = {
 };
 
 /* Threads */
-#define ENCODER_STACK_SIZE    4096
-#define ENCODER_PRIORITY      2
-#define DECODER_STACK_SIZE    4096
-#define DECODER_PRIORITY      3  /* Higher than encoder (runs first) */
-#define TX_THREAD_STACK_SIZE  1024
-#define TX_THREAD_PRIORITY    2
+#define ENCODER_STACK_SIZE   4096
+#define ENCODER_PRIORITY     2
+#define DECODER_STACK_SIZE   4096
+#define DECODER_PRIORITY     3 /* Higher than encoder (runs first) */
+#define TX_THREAD_STACK_SIZE 1024
+#define TX_THREAD_PRIORITY   2
 K_THREAD_STACK_DEFINE(encoder_stack, ENCODER_STACK_SIZE);
 K_THREAD_STACK_DEFINE(decoder_stack, DECODER_STACK_SIZE);
 K_THREAD_STACK_DEFINE(tx_thread_stack, TX_THREAD_STACK_SIZE);
@@ -474,8 +469,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		uint32_t t0 = k_cycle_get_32();
 
-		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1,
-				 octets_per_frame, encoded_shared);
+		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
+				 encoded_shared);
 		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 
 		if (ret == -1) {
@@ -521,24 +516,24 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		atomic_set(&uplink_audio_ready, 0);
 
 		/* Decode each BIS - NULL buffer triggers LC3 PLC for lost packets */
-		bool bis_valid[NUM_RX_BIS] = {false};  /* Track which BISes had valid data */
+		bool bis_valid[NUM_RX_BIS] = {false}; /* Track which BISes had valid data */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 
 			struct rx_bis_frame *frame = &rx_frames[i];
 
 			if (!frame->valid) {
 				/* Packet lost - trigger LC3 PLC with NULL buffer */
-				ret = lc3_decode(lc3_decoders[i], NULL, 0,
-						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
+				ret = lc3_decode(lc3_decoders[i], NULL, 0, LC3_PCM_FORMAT_S16,
+						 decoded_pcm[i], 1);
 			} else {
 				/* Valid packet - normal decode */
 				ret = lc3_decode(lc3_decoders[i], frame->data, sizeof(frame->data),
 						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
 			}
 
-			bis_valid[i] = (ret == 0);  /* PLC-concealed frames return success */
-			frame->received = false;  /* Reset for next interval */
-			frame->valid = false;  /* Clear valid flag to prevent stale data */
+			bis_valid[i] = (ret == 0); /* PLC-concealed frames return success */
+			frame->received = false;   /* Reset for next interval */
+			frame->valid = false;	   /* Clear valid flag to prevent stale data */
 		}
 
 		/* Calculate and print PRR for each BIS (every 100 frames) */
@@ -547,7 +542,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < NUM_RX_BIS; i++) {
 				struct bis_prr_tracker *tracker = &prr_trackers[i];
 				uint8_t valid_count = 0;
-				uint8_t window_size = tracker->window_filled ? PRR_WINDOW_SIZE : tracker->window_idx;
+				uint8_t window_size = tracker->window_filled ? PRR_WINDOW_SIZE
+									     : tracker->window_idx;
 
 				for (int j = 0; j < window_size; j++) {
 					valid_count += tracker->window[j];
@@ -561,17 +557,17 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		/* Log which BISes were mixed this frame */
 		int valid_count = 0;
-//		printk("[mix] frame=%u bis=", dec_frame_cnt);
-//		for (int i = 0; i < NUM_RX_BIS; i++) {
-//			if (bis_valid[i]) {
-//				if (valid_count > 0) {
-//					printk(",");
-//				}
-//				printk("%d", i);
-//				valid_count++;
-//			}
-//		}
-//		printk(" valid=%d\n", valid_count);
+		//		printk("[mix] frame=%u bis=", dec_frame_cnt);
+		//		for (int i = 0; i < NUM_RX_BIS; i++) {
+		//			if (bis_valid[i]) {
+		//				if (valid_count > 0) {
+		//					printk(",");
+		//				}
+		//				printk("%d", i);
+		//				valid_count++;
+		//			}
+		//		}
+		//		printk(" valid=%d\n", valid_count);
 
 		/* Count valid BISes for mixing (count from bis_valid array) */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
@@ -593,7 +589,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				/* Sum only valid BISes for this sample */
 				for (int i = 0; i < NUM_RX_BIS; i++) {
 					if (bis_valid[i]) {
-						mixed_sample += decoded_pcm[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
+						mixed_sample += decoded_pcm
+							[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
 					}
 				}
 
@@ -702,15 +699,14 @@ static void iso_sent(struct bt_iso_chan *chan)
 	if (chan == bis[0]) {
 		gpio_pin_set_dt(&debug_iso_sent, 1);
 
-		k_sem_give(&tx_sem);  /* RESTORED: Drive TX timing */
+		k_sem_give(&tx_sem); /* RESTORED: Drive TX timing */
 
 		gpio_pin_set_dt(&debug_iso_sent, 0);
 
 		/* Mark TX as ready after NUM_PRIME_PACKETS+1 packets sent.
 		 * This signals iso_recv that the TX path is stable. */
 		static uint32_t tx_sent_count;
-		if (atomic_get(&iso_tx_ready) == 0 &&
-		    ++tx_sent_count >= ISO_TX_READY_THRESHOLD) {
+		if (atomic_get(&iso_tx_ready) == 0 && ++tx_sent_count >= ISO_TX_READY_THRESHOLD) {
 			atomic_set(&iso_tx_ready, 1);
 		}
 
@@ -738,16 +734,15 @@ static void iso_sent(struct bt_iso_chan *chan)
 /* Helper to get 0-based index for uplink BIS (bis[1] -> 0, bis[2] -> 1, etc.) */
 static int get_uplink_bis_index(struct bt_iso_chan *chan)
 {
-	for (int i = 1; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (int i = 1; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		if (chan == bis[i]) {
-			return i - 1;  /* Convert to 0-based array index */
+			return i - 1; /* Convert to 0-based array index */
 		}
 	}
-	return -1;  /* Not an uplink BIS (bis[0] is TX only) */
+	return -1; /* Not an uplink BIS (bis[0] is TX only) */
 }
 
-static void iso_recv(struct bt_iso_chan *chan,
-		     const struct bt_iso_recv_info *info,
+static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *info,
 		     struct net_buf *buf)
 {
 	int bis_idx = get_uplink_bis_index(chan);
@@ -781,13 +776,13 @@ static void iso_recv(struct bt_iso_chan *chan,
 
 	if (valid) {
 		memcpy(frame->data, buf->data, MIN(buf->len, sizeof(frame->data)));
-	} 
+	}
 
 	/* Check if all BIS received this interval */
 	uint32_t count = atomic_inc(&rx_bis_received_count);
 	if (count + 1 >= NUM_RX_BIS) {
 		atomic_set(&rx_bis_received_count, 0);
-		k_sem_give(&decoder_sem);  /* Trigger decoder */
+		k_sem_give(&decoder_sem); /* Trigger decoder */
 	}
 
 	gpio_pin_set_dt(&debug_iso_recv, 0);
@@ -800,11 +795,9 @@ static struct bt_iso_chan_ops iso_ops = {
 	.recv = iso_recv,
 };
 
-
 static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 {
-	struct bt_bap_broadcast_source_stream_param
-		stream_params[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
+	struct bt_bap_broadcast_source_stream_param stream_params[CONFIG_GRPTLK_NUM_CHAN];
 	struct bt_bap_broadcast_source_subgroup_param subgroup_param[1];
 	struct bt_bap_broadcast_source_param create_param = {0};
 
@@ -813,13 +806,13 @@ static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 	uint8_t right_loc[] = {BT_AUDIO_CODEC_DATA(
 		BT_AUDIO_CODEC_CFG_CHAN_ALLOC, BT_BYTES_LIST_LE32(BT_AUDIO_LOCATION_FRONT_RIGHT))};
 
-	for (size_t i = 0U; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (size_t i = 0U; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		stream_params[i].stream = &streams[i];
 		stream_params[i].data = (i == 0) ? left_loc : right_loc;
 		stream_params[i].data_len = (i == 0) ? sizeof(left_loc) : sizeof(right_loc);
 	}
 
-	subgroup_param[0].params_count = CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT;
+	subgroup_param[0].params_count = CONFIG_GRPTLK_NUM_CHAN;
 	subgroup_param[0].params = stream_params;
 	subgroup_param[0].codec_cfg = &preset_active.codec_cfg;
 
@@ -909,13 +902,13 @@ static int create_big(struct bt_le_ext_adv *adv, struct bt_iso_big **big)
 {
 	int err;
 
-	for (size_t i = 0; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (size_t i = 0; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		bis_iso_chan[i].ops = &iso_ops;
 		bis_iso_chan[i].qos = &bis_iso_qos;
 		bis[i] = &bis_iso_chan[i];
 	}
 
-	for (uint8_t i = 0U; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (uint8_t i = 0U; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		bis[i]->qos->tx->rtn = preset_active.qos.rtn;
 	}
 
@@ -929,7 +922,7 @@ static int create_big(struct bt_le_ext_adv *adv, struct bt_iso_big **big)
 		return err;
 	}
 
-	for (uint8_t i = 0U; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (uint8_t i = 0U; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		printk("Waiting for BIG complete chan %u...\n", i);
 		err = k_sem_take(&sem_big_cmplt, K_FOREVER);
 		if (err) {
@@ -950,7 +943,7 @@ static int setup_iso_datapaths(void)
 	 * starts fresh rather than applying a stale correction. */
 	clk_sync_reset();
 
-	for (uint8_t i = 0U; i < CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT; i++) {
+	for (uint8_t i = 0U; i < CONFIG_GRPTLK_NUM_CHAN; i++) {
 		printk("Setting data path chan %u...\n", i);
 
 		const struct bt_iso_chan_path hci_path = {
@@ -989,7 +982,10 @@ int main(void)
 	int err;
 	int led_err;
 
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 	override_preset_for_lc3plus_5ms();
+#endif
+	/* BAP 16_2_1: preset_active already holds correct spec values, no override needed */
 
 #if defined(CONFIG_SOC_NRF5340_CPUAPP)
 	int clk_ret = nrfx_clock_divider_set(NRF_CLOCK_DOMAIN_HFCLK, NRF_CLOCK_HFCLK_DIV_1);
@@ -1074,19 +1070,16 @@ int main(void)
 
 	/* Setup LC3 decoders for each uplink BIS */
 	for (int i = 0; i < NUM_RX_BIS; i++) {
-		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval,
-						   SAMPLE_RATE_HZ, 0,
-						   &lc3_decoder_mem[i]);
+		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
+						    &lc3_decoder_mem[i]);
 		if (lc3_decoders[i] == NULL) {
 			printk("Failed to setup LC3 decoder %d\n", i);
 			return -EIO;
 		}
 	}
 
-	k_thread_create(&decoder_thread_data, decoder_stack,
-			K_THREAD_STACK_SIZEOF(decoder_stack),
-			decoder_thread_func, NULL, NULL, NULL,
-			DECODER_PRIORITY, 0, K_NO_WAIT);
+	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),
+			decoder_thread_func, NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&decoder_thread_data, "lc3_decoder");
 
 	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),

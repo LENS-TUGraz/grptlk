@@ -5,20 +5,6 @@ menuconfig GRPTLK
 
 if GRPTLK
 
-comment "---- Frequently changed: BIS layout and relay mode ----"
-
-config BT_BAP_BROADCAST_SRC_STREAM_COUNT
-	int "Number of BIS channels (1 TX downlink + N-1 RX uplink)"
-	default 2
-	range 2 5
-	help
-	  Total BIS count including the mandatory TX downlink (BIS1).
-	  Must be 2 to enable relay-only mode (exactly one uplink BIS).
-	  Increase to support more simultaneous uplink speakers.
-
-
-comment "------------------------------------------------"
-
 choice GRPTLK_ROLE
 	bool "GRPTLK Role"
 	default GRPTLK_BCST
@@ -31,6 +17,43 @@ config GRPTLK_RECV
 
 endchoice
 
+config GRPTLK_NUM_CHAN
+	int "Number of ISO channels (BISes)"
+	default 5
+	range 2 5
+	help
+	  Number of isochronous channels to support. Includes 1 downlink BIS
+	  plus (n-1) uplink BISes for push-to-talk.
+
+choice GRPTLK_AUDIO_FRAME_DURATION
+	prompt "Audio frame duration"
+	default GRPTLK_AUDIO_FRAME_10_MS
+	help
+	  5ms: LC3Plus custom format (32kbps = 20 bytes/frame)
+	  10ms: BAP 16_2_1 compliant LC3 (32kbps = 40 bytes/frame)
+
+config GRPTLK_AUDIO_FRAME_5_MS
+	bool "5 ms (LC3Plus custom)"
+
+config GRPTLK_AUDIO_FRAME_10_MS
+	bool "10 ms (BAP 16_2_1 LC3)"
+
+endchoice
+
+config GRPTLK_AUDIO_FRAME_DURATION_MS
+	int
+	default 5 if GRPTLK_AUDIO_FRAME_5_MS
+	default 10 if GRPTLK_AUDIO_FRAME_10_MS
+
+config GRPTLK_AUDIO_RING_NUM_BLKS
+	int
+	default 8 if GRPTLK_AUDIO_FRAME_5_MS
+	default 13 if GRPTLK_AUDIO_FRAME_10_MS
+
+config BT_ISO_TX_MTU
+	default 20 if GRPTLK_AUDIO_FRAME_5_MS
+	default 40 if GRPTLK_AUDIO_FRAME_10_MS
+
 if HW_CODEC_CIRRUS_LOGIC
 
 config NRFX_I2S
@@ -41,6 +64,14 @@ config NRFX_I2S0
 
 config NRFX_CLOCK
 	default y
+
+config BT_ISO_MAX_CHAN
+	int
+	default GRPTLK_NUM_CHAN
+
+config BT_BAP_BROADCAST_SRC_STREAM_COUNT
+	int
+	default GRPTLK_NUM_CHAN
 
 endif # HW_CODEC_CIRRUS_LOGIC
 

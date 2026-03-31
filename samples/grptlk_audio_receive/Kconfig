@@ -17,7 +17,43 @@ config GRPTLK_RECV
 
 endchoice
 
-# Audio backend: CS47L63 on nRF5340 Audio DK (the only supported target).
+config GRPTLK_NUM_CHAN
+	int "Number of ISO channels (BISes)"
+	default 5
+	range 2 5
+	help
+	  Number of isochronous channels to support. Includes 1 downlink BIS
+	  plus (n-1) uplink BISes for push-to-talk.
+
+choice GRPTLK_AUDIO_FRAME_DURATION
+	prompt "Audio frame duration"
+	default GRPTLK_AUDIO_FRAME_10_MS
+	help
+	  5ms: LC3Plus custom format (32kbps = 20 bytes/frame)
+	  10ms: BAP 16_2_1 compliant LC3 (32kbps = 40 bytes/frame)
+
+config GRPTLK_AUDIO_FRAME_5_MS
+	bool "5 ms (LC3Plus custom)"
+
+config GRPTLK_AUDIO_FRAME_10_MS
+	bool "10 ms (BAP 16_2_1 LC3)"
+
+endchoice
+
+config GRPTLK_AUDIO_FRAME_DURATION_MS
+	int
+	default 5 if GRPTLK_AUDIO_FRAME_5_MS
+	default 10 if GRPTLK_AUDIO_FRAME_10_MS
+
+config GRPTLK_AUDIO_RING_NUM_BLKS
+	int
+	default 8 if GRPTLK_AUDIO_FRAME_5_MS
+	default 13 if GRPTLK_AUDIO_FRAME_10_MS
+
+config BT_ISO_TX_MTU
+	default 20 if GRPTLK_AUDIO_FRAME_5_MS
+	default 40 if GRPTLK_AUDIO_FRAME_10_MS
+
 config NRFX_I2S
 	default y
 
@@ -26,6 +62,10 @@ config NRFX_I2S0
 
 config NRFX_CLOCK
 	default y
+
+config BT_ISO_MAX_CHAN
+	int
+	default GRPTLK_NUM_CHAN
 
 config HW_CODEC_CIRRUS_LOGIC
 	default y
@@ -50,7 +90,7 @@ config GRPTLK_UPLINK_RANDOM
 
 config GRPTLK_UPLINK_RANDOM_PER_PTT
 	bool "Randomly select uplink BIS once per PTT session"
-	default n
+	default y
 	depends on !GRPTLK_UPLINK_RANDOM
 	help
 	  When enabled, the receiver picks a random uplink BIS (BIS2..BISn) when

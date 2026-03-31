@@ -1,10 +1,3 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
- *
- * Button inputs: PTT, PTT-lock, volume up/down.
- * See buttons.h for the design rationale.
- */
-
 #include "io/buttons.h"
 #include "audio/audio.h"
 #include "audio/sync/clk_sync.h"
@@ -13,30 +6,16 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 
-/* Volume step in dB per button press. */
 #define VOLUME_STEP_DB 3
 
-/* Semaphore pointer set by buttons_init() — shared with PTT and PTT-lock. */
 static struct k_sem *uplink_tx_sem;
 
-/* =========================================================================
- * ptt_active — exported; read by iso_sent() and iso_recv() in main.c.
- *
- * Default: 1 (always TX) if no PTT button is present on this board.
- * ========================================================================= */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
-atomic_t ptt_active = ATOMIC_INIT(0); /* start silent; button arms TX */
+atomic_t ptt_active = ATOMIC_INIT(0);
 #else
-atomic_t ptt_active = ATOMIC_INIT(1); /* no button — always transmitting */
+atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
-/* =========================================================================
- * PTT (push-to-talk)  — sw2
- *
- * Edge-both interrupt.  On press: set ptt_active=1 and give tx_sem to
- * kick-start the uplink send chain.  On release: clear ptt_active=0 so
- * iso_sent() stops re-arming tx_sem and the chain starves naturally.
- * ========================================================================= */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
 static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
@@ -50,7 +29,7 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 
 	if (gpio_pin_get_dt(&ptt_btn) > 0) {
 		atomic_set(&ptt_active, 1);
-		clk_sync_reset();   /* restart lock detection (freq preserved) */
+		clk_sync_reset();
 		printk("[PTT] pressed\n");
 		k_sem_give(uplink_tx_sem);
 	} else {
@@ -84,25 +63,20 @@ static int ptt_init(void)
 	gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
 	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
 
-	printk("PTT init: sw2 ready, mic TX disabled at boot\n");
+	printk("PTT init: sw2 ready, mic disabled at boot\n");
 	return 0;
 }
 #else
 #define PTT_AVAILABLE 0
 static int ptt_init(void)
 {
-	printk("PTT: no sw2 alias — always transmitting\n");
+	printk("PTT: no sw2 alias - always TX\n");
 	return 0;
 }
-#endif /* PTT sw2 */
+#endif
 
-/* =========================================================================
- * PTT-lock  — sw3 (toggle button) + led0 (status LED)
- *
- * Each press toggles between locked (always TX) and unlocked (PTT mode).
- * The SPI-backed LED write is deferred to a work item so it is safe to
- * call from the GPIO ISR.
- * ========================================================================= */
+/* PTT-lock: sw3 (toggle) + led0 (status). SPI-backed LED write deferred
+ * to work item for ISR safety. */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 #define PTT_LOCK_AVAILABLE 1
 static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
@@ -115,7 +89,6 @@ static void ptt_lock_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	if (atomic_get(&ptt_lock_active)) {
-		/* Unlock: back to PTT mode. */
 		atomic_set(&ptt_lock_active, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
 		atomic_set(&ptt_active, 0);
@@ -123,15 +96,14 @@ static void ptt_lock_work_handler(struct k_work *work)
 		extern void ptt_session_bis_reset(void);
 		ptt_session_bis_reset();
 #endif
-		printk("[PTT-LOCK] disabled — PTT mode active\n");
+		printk("[PTT-LOCK] disabled\n");
 	} else {
-		/* Lock: latch TX on. */
 		atomic_set(&ptt_lock_active, 1);
 		gpio_pin_set_dt(&ptt_lock_led, 1);
 		atomic_set(&ptt_active, 1);
-		clk_sync_reset();   /* restart lock detection (freq preserved) */
+		clk_sync_reset();
 		k_sem_give(uplink_tx_sem);
-		printk("[PTT-LOCK] enabled — always transmitting\n");
+		printk("[PTT-LOCK] enabled\n");
 	}
 }
 
@@ -173,25 +145,20 @@ static int ptt_lock_init(void)
 	gpio_init_callback(&ptt_lock_cb_data, ptt_lock_isr, BIT(ptt_lock_btn.pin));
 	gpio_add_callback(ptt_lock_btn.port, &ptt_lock_cb_data);
 
-	printk("PTT-lock init: sw3=toggle, led0=status\n");
+	printk("PTT-lock: sw3=toggle, led0=status\n");
 	return 0;
 }
 #else
 #define PTT_LOCK_AVAILABLE 0
 static int ptt_lock_init(void)
 {
-	printk("PTT-lock: sw3/led0 not available on this board\n");
+	printk("PTT-lock: sw3/led0 not available\n");
 	return 0;
 }
-#endif /* PTT-lock sw3+led0 */
+#endif
 
-/* =========================================================================
- * Volume buttons  — sw0 (down) + sw1 (up)
- *
- * The CS47L63 volume register is accessed via SPI so the actual adjustment
- * must happen outside the ISR.  Presses accumulate into vol_pending_step
- * (atomic) and a work item drains it.
- * ========================================================================= */
+/* Volume buttons: sw0 (down) + sw1 (up). CS47L63 volume accessed via SPI,
+ * so adjustments deferred to work queue. */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -262,21 +229,17 @@ static int vol_buttons_init(void)
 	gpio_add_callback(vol_dn_btn.port, &vol_dn_cb_data);
 	gpio_add_callback(vol_up_btn.port, &vol_up_cb_data);
 
-	printk("Volume buttons: sw0=down, sw1=up, step=%d dB\n", VOLUME_STEP_DB);
+	printk("Volume: sw0=down, sw1=up, step=%d dB\n", VOLUME_STEP_DB);
 	return 0;
 }
 #else
 #define VOL_BTN_AVAILABLE 0
 static int vol_buttons_init(void)
 {
-	printk("Volume buttons: sw0/sw1 not available on this board\n");
+	printk("Volume buttons: sw0/sw1 not available\n");
 	return 0;
 }
-#endif /* Volume sw0+sw1 */
-
-/* =========================================================================
- * Public API
- * ========================================================================= */
+#endif
 
 int buttons_init(struct k_sem *tx_sem)
 {

@@ -54,14 +54,11 @@ static nrfx_i2s_config_t cfg = {
 };
 
 static audio_i2s_blk_cb_t blk_cb;
-static uint32_t s_words_per_block = AUDIO_I2S_WORDS_PER_BLOCK_DEFAULT;
 
 static void i2s_comp_handler(nrfx_i2s_buffers_t const *released_bufs, uint32_t status)
 {
 	if ((status == NRFX_I2S_STATUS_NEXT_BUFFERS_NEEDED) && released_bufs && blk_cb &&
 	    (released_bufs->p_rx_buffer || released_bufs->p_tx_buffer)) {
-		/* Timestamp capture removed in Phase D — ring buffer level
-		 * is used for drift detection instead. */
 		blk_cb(released_bufs->p_rx_buffer, released_bufs->p_tx_buffer);
 	}
 }
@@ -69,11 +66,6 @@ static void i2s_comp_handler(nrfx_i2s_buffers_t const *released_bufs, uint32_t s
 void audio_i2s_blk_cb_register(audio_i2s_blk_cb_t cb)
 {
 	blk_cb = cb;
-}
-
-void audio_i2s_set_block_size(uint32_t words_per_block)
-{
-	s_words_per_block = words_per_block;
 }
 
 int audio_i2s_init(void)
@@ -86,7 +78,6 @@ int audio_i2s_init(void)
 	}
 
 	nrfx_clock_hfclkaudio_config_set(HFCLKAUDIO_12_288_MHZ);
-	NRF_CLOCK->EVENTS_HFCLKAUDIOSTARTED = 0;
 	NRF_CLOCK->TASKS_HFCLKAUDIOSTART = 1;
 
 	/* Wait for ACLK to start */
@@ -123,7 +114,7 @@ int audio_i2s_start(uint32_t *rx_buf_initial, uint32_t *tx_buf_initial)
 
 	i2s_buf.p_rx_buffer = rx_buf_initial;
 	i2s_buf.p_tx_buffer = tx_buf_initial;
-	i2s_buf.buffer_size = s_words_per_block;
+	i2s_buf.buffer_size = AUDIO_I2S_WORDS_PER_BLOCK;
 
 	ret = nrfx_i2s_start(&i2s_inst, &i2s_buf, 0);
 	if (ret != NRFX_SUCCESS) {
@@ -145,7 +136,7 @@ int audio_i2s_set_next_buf(uint32_t *rx_buf, uint32_t *tx_buf)
 
 	i2s_buf.p_rx_buffer = rx_buf;
 	i2s_buf.p_tx_buffer = tx_buf;
-	i2s_buf.buffer_size = s_words_per_block;
+	i2s_buf.buffer_size = AUDIO_I2S_WORDS_PER_BLOCK;
 
 	ret = nrfx_i2s_next_buffers_set(&i2s_inst, &i2s_buf);
 	if (ret != NRFX_SUCCESS) {
