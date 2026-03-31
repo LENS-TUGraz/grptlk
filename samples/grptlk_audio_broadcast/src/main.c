@@ -619,7 +619,6 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		gpio_pin_set_dt(&debug_lc3_dec, 0);
 
-signal_encoder:
 		/* Signal encoder that it can now proceed */
 		k_sem_give(&decoder_proceed_sem);
 
