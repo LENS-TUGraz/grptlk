@@ -40,6 +40,33 @@ config GRPTLK_AUDIO_FRAME_10_MS
 
 endchoice
 
+choice GRPTLK_LC3_CODEC
+	prompt "LC3 codec implementation"
+	default GRPTLK_LC3_CODEC_T2
+
+config GRPTLK_LC3_CODEC_OPEN
+	bool "Open-source liblc3 (default)"
+	help
+	  Use the open-source liblc3 codec (CONFIG_LIBLC3).
+
+config GRPTLK_LC3_CODEC_T2
+	bool "T2 Software LC3"
+	select SW_CODEC_LC3
+	select SW_CODEC_LC3_T2_SOFTWARE
+	help
+	  Use T2 Software LC3 codec via Nordic's sw_codec_lc3 wrapper.
+	  Requires FP_HARDABI support.
+
+endchoice
+
+if GRPTLK_LC3_CODEC_T2
+
+config LC3_DEC_CHAN_MAX
+	int
+	default GRPTLK_NUM_CHAN
+
+endif
+
 config GRPTLK_DEBUG_GPIO
 	bool "Enable debug GPIO pins for logic analyzer"
 	default n

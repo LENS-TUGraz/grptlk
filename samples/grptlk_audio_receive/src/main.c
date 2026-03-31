@@ -20,7 +20,12 @@
 #include "io/buttons.h"
 #include "io/led.h"
 #include "io/debug_gpio.h"
+
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#include "sw_codec_lc3.h"
+#else
 #include "lc3.h"
+#endif
 #include <zephyr/drivers/gpio.h>
 
 #define TIMEOUT_SYNC_CREATE K_SECONDS(10)
@@ -88,10 +93,17 @@ static void override_preset_for_lc3plus_5ms(void)
 	preset_active.qos.rtn = 1U;
 }
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+/* T2 LC3 - uses global state, no handles needed */
+#define LC3_PCM_BYTES_PER_FRAME (AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t))
+static uint16_t t2_pcm_bytes_req;
+#else
+/* Open LC3 - uses handles */
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
+#endif
 
 /* Decoder → encoder synchronization */
 static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
@@ -218,7 +230,15 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			rx_plc_cnt++;
 		}
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		uint16_t pcm_len;
+		bool bad_frame = (lc3_data == NULL);
+
+		ret = sw_codec_lc3_dec_run(lc3_data, lc3_len, sizeof(mono_pcm),
+					   0, mono_pcm, &pcm_len, bad_frame);
+#else
 		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len, LC3_PCM_FORMAT_S16, mono_pcm, 1);
+#endif
 		if (ret < 0) {
 			rx_dec_err_cnt++;
 			memset(mono_pcm, 0, sizeof(mono_pcm));
@@ -292,6 +312,22 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		debug_lc3_enc_set(1);
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		uint16_t encoded_len;
+
+		ret = sw_codec_lc3_enc_run(local_pcm, sizeof(local_pcm), LC3_USE_BITRATE_FROM_INIT,
+					   0, sizeof(encoded_buf), encoded_buf, &encoded_len);
+		if (ret) {
+			printk("[enc] sw_codec_lc3_enc_run failed: %d\n", ret);
+			debug_lc3_enc_set(0);
+			continue;
+		}
+		/* Verify encoded size matches expected */
+		if (encoded_len != octets_per_frame) {
+			printk("[enc] LC3 encode size mismatch: got %u, expected %d\n",
+			       encoded_len, octets_per_frame);
+		}
+#else
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
 				 encoded_buf);
 		if (ret < 0) {
@@ -299,6 +335,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			debug_lc3_enc_set(0);
 			continue;
 		}
+#endif
 
 		memcpy(ef.data, encoded_buf, octets_per_frame);
 		ef.len = octets_per_frame;
@@ -827,6 +864,29 @@ static struct k_thread tx_thread_data;
 
 static int lc3_workers_start(void)
 {
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	/* T2 LC3 init */
+	int err;
+
+	err = sw_codec_lc3_init(NULL, NULL, preset_active.qos.interval);
+	if (err) {
+		printk("sw_codec_lc3_init failed: %d\n", err);
+		return err;
+	}
+
+	err = sw_codec_lc3_enc_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
+				    32000, 1, &t2_pcm_bytes_req);
+	if (err) {
+		printk("sw_codec_lc3_enc_init failed: %d\n", err);
+		return err;
+	}
+
+	err = sw_codec_lc3_dec_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval, 1);
+	if (err) {
+		printk("sw_codec_lc3_dec_init failed: %d\n", err);
+		return err;
+	}
+#else
 	lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
 					&lc3_decoder_mem);
 	if (lc3_decoder == NULL) {
@@ -840,6 +900,7 @@ static int lc3_workers_start(void)
 		printk("ERROR: Failed to setup LC3 encoder\n");
 		return -EIO;
 	}
+#endif
 
 	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),
 			decoder_thread_func, NULL, NULL, NULL, DECODER_PRIORITY, 0, K_NO_WAIT);
@@ -871,6 +932,11 @@ int main(void)
 #endif
 
 	printk("Starting GRPTLK Receiver\n");
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	printk("LC3 codec: T2 Software LC3\n");
+#else
+	printk("LC3 codec: Open-source liblc3\n");
+#endif
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM)
 	printk("Config: downlink=BIS1, uplink=random from BIS2..BIS%u\n", CONFIG_BT_ISO_MAX_CHAN);
 #else
@@ -993,6 +1059,27 @@ int main(void)
 		preset_active.qos.interval = big_sdu_interval_us;
 		preset_active.qos.sdu = big_max_sdu;
 
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		/* Re-init T2 LC3 for new parameters */
+		err = sw_codec_lc3_init(NULL, NULL, preset_active.qos.interval);
+		if (err) {
+			printk("sw_codec_lc3_init re-init failed: %d\n", err);
+			goto per_sync_lost_check;
+		}
+
+		err = sw_codec_lc3_enc_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
+					    32000, 1, &t2_pcm_bytes_req);
+		if (err) {
+			printk("sw_codec_lc3_enc_init re-init failed: %d\n", err);
+			goto per_sync_lost_check;
+		}
+
+		err = sw_codec_lc3_dec_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval, 1);
+		if (err) {
+			printk("sw_codec_lc3_dec_init re-init failed: %d\n", err);
+			goto per_sync_lost_check;
+		}
+#else
 		lc3_decoder = lc3_setup_decoder(preset_active.qos.interval, AUDIO_SAMPLE_RATE_HZ, 0,
 						&lc3_decoder_mem);
 		if (lc3_decoder == NULL) {
@@ -1005,6 +1092,7 @@ int main(void)
 			printk("ERROR: lc3_setup_encoder failed\n");
 			goto per_sync_lost_check;
 		}
+#endif
 
 big_sync_create:
 		if (!bis_channels_idle()) {
