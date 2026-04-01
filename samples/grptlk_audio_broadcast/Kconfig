@@ -40,8 +40,8 @@ config GRPTLK_AUDIO_FRAME_10_MS
 
 endchoice
 
-choice GRPTLK_LC3_CODEC
-	prompt "LC3 codec implementation"
+choice GRPTLK_CODEC
+	prompt "Codec implementation"
 	default GRPTLK_LC3_CODEC_OPEN if GRPTLK_AUDIO_FRAME_5_MS
 	default GRPTLK_LC3_CODEC_T2 if GRPTLK_AUDIO_FRAME_10_MS
 
@@ -57,6 +57,12 @@ config GRPTLK_LC3_CODEC_T2
 	help
 	  Use T2 Software LC3 codec via Nordic's sw_codec_lc3 wrapper.
 	  Requires FP_HARDABI support.
+
+config GRPTLK_G726
+	bool "G.726-32 (local SpanDSP wrapper)"
+	help
+	  Use the sample-local G.726-32 wrapper based on the vendored SpanDSP
+	  implementation.
 
 endchoice
 

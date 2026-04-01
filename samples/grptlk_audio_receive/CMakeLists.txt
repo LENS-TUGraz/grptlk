@@ -35,6 +35,7 @@ target_include_directories(app PRIVATE src)
 
 target_sources(app PRIVATE
   src/main.c
+  src/codec/g726_zephyr.c
   src/io/buttons.c
   src/io/led.c
   src/io/debug_gpio.c
@@ -42,6 +43,7 @@ target_sources(app PRIVATE
   src/audio/drivers/audio_i2s.c
   src/audio/drivers/cs47l63_comm.c
   src/audio/sync/clk_sync.c
+  src/third_party/spandsp_g726/spandsp_g726.c
 )
 
 add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)

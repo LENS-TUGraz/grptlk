@@ -10,9 +10,16 @@ BUILD_DIR_NAME="build_gen"
 
 BUILD_JOBS=(
   "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_Open_LC3.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_LC3.hex"
   "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_Open_LC3.hex"
+
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_LC3.hex"
   "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_LC3.hex"
+
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y CONFIG_GRPTLK_G726=y|grptlk_bcst_nrf5340_audio_dk_5ms_G726.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y CONFIG_GRPTLK_G726=y CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n CONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_5ms_G726.hex"
+  
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y CONFIG_GRPTLK_G726=y|grptlk_bcst_nrf5340_audio_dk_10ms_G726.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y CONFIG_GRPTLK_G726=y CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n CONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_10ms_G726.hex"
 )
 
 log()  { echo "[grptlk] $*"; }

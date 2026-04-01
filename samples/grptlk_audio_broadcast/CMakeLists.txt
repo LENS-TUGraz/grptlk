@@ -64,8 +64,10 @@ target_include_directories(app PRIVATE src)
 # Common sources (all boards)
 target_sources(app PRIVATE
   src/main.c
+  src/codec/g726_zephyr.c
   src/io/led.c
   src/io/debug_gpio.c
+  src/third_party/spandsp_g726/spandsp_g726.c
 )
 
 # CS47L63 codec + HFCLKAUDIO clock sync sources (nrf5340_audio_dk only)

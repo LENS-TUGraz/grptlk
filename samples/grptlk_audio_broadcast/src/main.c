@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <zephyr/kernel.h>
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+#include "codec/g726_zephyr.h"
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 #include "sw_codec_lc3.h"
 #else
 #include "lc3.h"
@@ -356,7 +358,7 @@ static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADC
  * The receiver reads the vendor codec identity from the BASE and the transport
  * sizing from BIGInfo, so there is no need for extra private codec-config
  * fields here. */
-#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS) && !defined(CONFIG_GRPTLK_G726)
 static void override_preset_for_lc3plus_5ms(void)
 {
 	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
@@ -373,9 +375,39 @@ static void override_preset_for_lc3plus_5ms(void)
 }
 #endif
 
+#if defined(CONFIG_GRPTLK_G726)
+static void override_preset_for_g726(void)
+{
+	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
+	preset_active.qos.sdu = GRPTLK_CODEC_SDU_BYTES;
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
+	preset_active.qos.latency = 10U;
+	preset_active.qos.rtn = 2U;
+#endif
+	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
+	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
+	preset_active.codec_cfg.vid = GRPTLK_VENDOR_VENDOR_ID;
+	preset_active.codec_cfg.data_len = 0U;
+}
+#endif
+
 #define PCM_SAMPLES_PER_FRAME AUDIO_SAMPLES_PER_FRAME
 #define SAMPLE_RATE_HZ	      AUDIO_SAMPLE_RATE_HZ
 #define BLOCK_BYTES	      AUDIO_BLOCK_BYTES
+#if defined(CONFIG_GRPTLK_G726)
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_10_MS)
+#define G726_PCM_SAMPLES_PER_FRAME G726_ZEPHYR_10MS_SAMPLES
+#define G726_BYTES_PER_FRAME	      G726_ZEPHYR_10MS_BYTES
+#else
+#define G726_PCM_SAMPLES_PER_FRAME G726_ZEPHYR_5MS_SAMPLES
+#define G726_BYTES_PER_FRAME	      G726_ZEPHYR_5MS_BYTES
+#endif
+
+BUILD_ASSERT(PCM_SAMPLES_PER_FRAME == (G726_PCM_SAMPLES_PER_FRAME * 2U),
+	     "G.726 expects a 2:1 16 kHz to 8 kHz sample mapping");
+BUILD_ASSERT(CONFIG_BT_ISO_TX_MTU == G726_BYTES_PER_FRAME,
+	     "Transport MTU must match the selected G.726 frame size");
+#endif
 /* BIS layout: bis[0] = TX (BIS1), bis[1..N] = RX uplink */
 #define NUM_RX_BIS	      (CONFIG_GRPTLK_NUM_CHAN - 1)
 #define NUM_PRIME_PACKETS     1
@@ -407,8 +439,11 @@ static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 static int16_t mixed_uplink_pcm[PCM_SAMPLES_PER_FRAME];
 static atomic_t uplink_audio_ready = ATOMIC_INIT(0);
 
-/* LC3 */
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+/* Codec backend state */
+#if defined(CONFIG_GRPTLK_G726)
+static struct g726_zephyr_encoder_state g726_encoder;
+static struct g726_zephyr_decoder_state g726_decoders[NUM_RX_BIS];
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 /* T2 LC3 - uses global state, no handles needed */
 #define LC3_PCM_BYTES_PER_FRAME (AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t))
 static uint16_t t2_pcm_bytes_req;
@@ -501,6 +536,63 @@ static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
 
+#if defined(CONFIG_GRPTLK_G726)
+static void g726_downsample_16k_to_8k(const int16_t *pcm_16k, int16_t *pcm_8k)
+{
+	for (size_t i = 0; i < G726_PCM_SAMPLES_PER_FRAME; i++) {
+		int32_t sum = (int32_t)pcm_16k[2U * i] + (int32_t)pcm_16k[(2U * i) + 1U];
+
+		pcm_8k[i] = (int16_t)(sum / 2);
+	}
+}
+
+static void g726_upsample_8k_to_16k(const int16_t *pcm_8k, int16_t *pcm_16k)
+{
+	for (size_t i = 0; i < G726_PCM_SAMPLES_PER_FRAME; i++) {
+		pcm_16k[2U * i] = pcm_8k[i];
+		pcm_16k[(2U * i) + 1U] = pcm_8k[i];
+	}
+}
+
+static int g726_encode_current_frame(const int16_t *pcm_16k, uint8_t *adpcm)
+{
+	int16_t pcm_8k[G726_PCM_SAMPLES_PER_FRAME];
+
+	/* Packet-stateless mode: restart the encoder predictor for every frame. */
+	g726_zephyr_encoder_reset(&g726_encoder);
+	g726_downsample_16k_to_8k(pcm_16k, pcm_8k);
+
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_10_MS)
+	return g726_zephyr_encode_10ms(&g726_encoder, pcm_8k, adpcm);
+#else
+	return g726_zephyr_encode_5ms(&g726_encoder, pcm_8k, adpcm);
+#endif
+}
+
+static int g726_decode_current_frame(struct g726_zephyr_decoder_state *state,
+				     const uint8_t *adpcm,
+				     int16_t *pcm_16k)
+{
+	int ret;
+	int16_t pcm_8k[G726_PCM_SAMPLES_PER_FRAME];
+
+	/* Packet-stateless mode: decode each packet from a clean predictor state. */
+	g726_zephyr_decoder_reset(state);
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_10_MS)
+	ret = g726_zephyr_decode_10ms(state, adpcm, pcm_8k);
+#else
+	ret = g726_zephyr_decode_5ms(state, adpcm, pcm_8k);
+#endif
+	if (ret) {
+		return ret;
+	}
+
+	g726_upsample_8k_to_16k(pcm_8k, pcm_16k);
+
+	return 0;
+}
+#endif
+
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
 	clk_sync_i2s_notify(k_cyc_to_us_floor32(k_cycle_get_32()));
@@ -554,7 +646,23 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		uint32_t t0 = k_cycle_get_32();
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+		if (octets_per_frame != G726_BYTES_PER_FRAME) {
+			printk("G.726 encode size mismatch: preset=%d expected=%u\n",
+			       octets_per_frame, (unsigned int)G726_BYTES_PER_FRAME);
+			debug_lc3_enc_set(0);
+			continue;
+		}
+
+		ret = g726_encode_current_frame(local_pcm, encoded_shared);
+		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
+
+		if (ret) {
+			printk("G.726 encode failed: %d\n", ret);
+			debug_lc3_enc_set(0);
+			continue;
+		}
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 		uint16_t encoded_len;
 
 		ret = sw_codec_lc3_enc_run(local_pcm, sizeof(local_pcm), LC3_USE_BITRATE_FROM_INIT,
@@ -619,13 +727,30 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Clear uplink ready flag at start of each decoder cycle */
 		atomic_set(&uplink_audio_ready, 0);
 
-		/* Decode each BIS - NULL buffer triggers LC3 PLC for lost packets */
+		/* Decode each BIS into the sample's 16 kHz mixing domain. */
 		bool bis_valid[NUM_RX_BIS] = {false}; /* Track which BISes had valid data */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 
 			struct rx_bis_frame *frame = &rx_frames[i];
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+			if (!frame->valid) {
+				memset(decoded_pcm[i], 0, sizeof(decoded_pcm[i]));
+				g726_zephyr_decoder_reset(&g726_decoders[i]);
+				bis_valid[i] = false;
+			} else {
+				ret = g726_decode_current_frame(&g726_decoders[i], frame->data,
+								 decoded_pcm[i]);
+				if (ret) {
+					printk("G.726 decode failed for BIS%d: %d\n", i, ret);
+					memset(decoded_pcm[i], 0, sizeof(decoded_pcm[i]));
+					g726_zephyr_decoder_reset(&g726_decoders[i]);
+					bis_valid[i] = false;
+				} else {
+					bis_valid[i] = true;
+				}
+			}
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 			uint16_t pcm_len;
 
 			if (!frame->valid) {
@@ -699,8 +824,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		/* Mix all valid decoded BISes and play to speaker */
-		/* One LC3 frame (80 samples) = 5 ring blocks (16 samples each) */
+		/* Mix all valid decoded BISes and play to speaker. */
+		/* One audio frame spans AUDIO_I2S_BLKS_PER_FRAME 1 ms ring blocks. */
 		for (int blk = 0; blk < AUDIO_I2S_BLKS_PER_FRAME; blk++) {
 			uint16_t pi = ring_prod_idx;
 			uint32_t *ring_blk = playback_ring.fifo[pi];
@@ -1104,7 +1229,9 @@ int main(void)
 	int err;
 	int led_err;
 
-#if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
+#if defined(CONFIG_GRPTLK_G726)
+	override_preset_for_g726();
+#elif defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 	override_preset_for_lc3plus_5ms();
 #endif
 	/* BAP 16_2_1: preset_active already holds correct spec values, no override needed */
@@ -1156,7 +1283,9 @@ int main(void)
 
 	(void)vol_buttons_init();
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+	g726_zephyr_encoder_init(&g726_encoder);
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	/* T2 LC3 encoder init */
 	err = sw_codec_lc3_init(NULL, NULL, preset_active.qos.interval);
 	if (err) {
@@ -1180,7 +1309,11 @@ int main(void)
 	}
 #endif
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+	for (int i = 0; i < NUM_RX_BIS; i++) {
+		g726_zephyr_decoder_init(&g726_decoders[i]);
+	}
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	/* T2 LC3 decoder init */
 	err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, NUM_RX_BIS);
 	if (err) {
@@ -1199,7 +1332,9 @@ int main(void)
 	}
 #endif
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_G726)
+	printk("Codec: G.726-32 (sample-local SpanDSP wrapper)\n");
+#elif defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	printk("LC3 codec: T2 Software LC3\n");
 #else
 	printk("LC3 codec: Open-source liblc3\n");
