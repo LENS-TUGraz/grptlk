@@ -428,6 +428,7 @@ static atomic_t iso_tx_ready = ATOMIC_INIT(0);
 #define NUM_RX_BIS (CONFIG_GRPTLK_NUM_CHAN - 1)
 
 struct rx_bis_frame {
+	uint16_t len;
 	uint8_t data[CONFIG_BT_ISO_TX_MTU];
 	bool received;
 	bool valid;
@@ -500,6 +501,45 @@ static struct k_thread decoder_thread_data __maybe_unused;
 static struct k_thread tx_thread_data __maybe_unused;
 
 /* -------------------------------------------------------------------------- */
+
+static void reset_rx_frame_state(struct rx_bis_frame *frame)
+{
+	frame->len = 0U;
+	frame->received = false;
+	frame->valid = false;
+}
+
+#if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
+static int reset_uplink_decoder_state(uint8_t bis_idx)
+{
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	ARG_UNUSED(bis_idx);
+	int err = sw_codec_lc3_dec_uninit_all();
+
+	if (err != 0 && err != -EALREADY) {
+		printk("[uplink-reset] sw_codec_lc3_dec_uninit_all failed: %d\n", err);
+		return err;
+	}
+
+	err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, NUM_RX_BIS);
+	if (err != 0) {
+		printk("[uplink-reset] sw_codec_lc3_dec_init reset failed: %d\n", err);
+	}
+
+	return err;
+#else
+	lc3_decoders[bis_idx] =
+		lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
+				  &lc3_decoder_mem[bis_idx]);
+	if (lc3_decoders[bis_idx] == NULL) {
+		printk("[uplink-reset] lc3_setup_decoder reset failed for BIS%u\n", bis_idx + 2U);
+		return -EIO;
+	}
+
+	return 0;
+#endif
+}
+#endif
 
 static void audio_rx_mono_frame(const int16_t *mono_frame)
 {
@@ -619,44 +659,63 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		/* Clear uplink ready flag at start of each decoder cycle */
 		atomic_set(&uplink_audio_ready, 0);
 
-		/* Decode each BIS - NULL buffer triggers LC3 PLC for lost packets */
+		/* Decode each BIS. Experimental mode resets state on valid packets and
+		 * renders misses as silence; otherwise lost packets use codec PLC.
+		 */
 		bool bis_valid[NUM_RX_BIS] = {false}; /* Track which BISes had valid data */
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 
 			struct rx_bis_frame *frame = &rx_frames[i];
+			bool have_valid_frame = frame->valid && frame->len > 0U;
+
+#if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
+			if (!have_valid_frame) {
+				memset(decoded_pcm[i], 0, sizeof(decoded_pcm[i]));
+				reset_rx_frame_state(frame);
+				continue;
+			}
+
+			ret = reset_uplink_decoder_state(i);
+			if (ret != 0) {
+				memset(decoded_pcm[i], 0, sizeof(decoded_pcm[i]));
+				reset_rx_frame_state(frame);
+				continue;
+			}
+#endif
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 			uint16_t pcm_len;
 
-			if (!frame->valid) {
+			if (!have_valid_frame) {
 				/* Packet lost - trigger T2 LC3 PLC with bad_frame=true */
-				ret = sw_codec_lc3_dec_run(NULL, 0, sizeof(decoded_pcm[i]),
-						    i, decoded_pcm[i], &pcm_len, true);
+				ret = sw_codec_lc3_dec_run(NULL, 0, sizeof(decoded_pcm[i]), i,
+							   decoded_pcm[i], &pcm_len, true);
 			} else {
 				/* Valid packet - normal decode */
-				ret = sw_codec_lc3_dec_run(frame->data, sizeof(frame->data),
-						    sizeof(decoded_pcm[i]), i,
-						    decoded_pcm[i], &pcm_len, false);
+				ret = sw_codec_lc3_dec_run(frame->data, frame->len, sizeof(decoded_pcm[i]),
+							   i, decoded_pcm[i], &pcm_len, false);
 			}
 			if (ret) {
 				printk("sw_codec_lc3_dec_run failed for BIS%d: %d\n", i, ret);
 			}
-			bis_valid[i] = (ret == 0); /* PLC-concealed frames return success */
+			bis_valid[i] = (ret == 0);
 #else
-			if (!frame->valid) {
+			if (!have_valid_frame) {
 				/* Packet lost - trigger LC3 PLC with NULL buffer */
 				ret = lc3_decode(lc3_decoders[i], NULL, 0, LC3_PCM_FORMAT_S16,
 						 decoded_pcm[i], 1);
 			} else {
 				/* Valid packet - normal decode */
-				ret = lc3_decode(lc3_decoders[i], frame->data, sizeof(frame->data),
+				ret = lc3_decode(lc3_decoders[i], frame->data, frame->len,
 						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
 			}
 
-			bis_valid[i] = (ret == 0); /* PLC-concealed frames return success */
+			bis_valid[i] = (ret == 0);
 #endif
-			frame->received = false;   /* Reset for next interval */
-			frame->valid = false;	   /* Clear valid flag to prevent stale data */
+#if !defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
+			bis_valid[i] = have_valid_frame && bis_valid[i];
+#endif
+			reset_rx_frame_state(frame);
 		}
 
 		/* Calculate and print PRR for each BIS (every 100 frames) */
@@ -665,8 +724,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < NUM_RX_BIS; i++) {
 				struct bis_prr_tracker *tracker = &prr_trackers[i];
 				uint8_t valid_count = 0;
-				uint8_t window_size = tracker->window_filled ? PRR_WINDOW_SIZE
-									     : tracker->window_idx;
+				uint8_t window_size =
+					tracker->window_filled ? PRR_WINDOW_SIZE : tracker->window_idx;
 
 				for (int j = 0; j < window_size; j++) {
 					valid_count += tracker->window[j];
@@ -678,21 +737,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			printk("\n");
 		}
 
-		/* Log which BISes were mixed this frame */
-		int valid_count = 0;
-		//		printk("[mix] frame=%u bis=", dec_frame_cnt);
-		//		for (int i = 0; i < NUM_RX_BIS; i++) {
-		//			if (bis_valid[i]) {
-		//				if (valid_count > 0) {
-		//					printk(",");
-		//				}
-		//				printk("%d", i);
-		//				valid_count++;
-		//			}
-		//		}
-		//		printk(" valid=%d\n", valid_count);
-
 		/* Count valid BISes for mixing (count from bis_valid array) */
+		int valid_count = 0;
 		for (int i = 0; i < NUM_RX_BIS; i++) {
 			if (bis_valid[i]) {
 				valid_count++;
@@ -712,8 +758,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				/* Sum only valid BISes for this sample */
 				for (int i = 0; i < NUM_RX_BIS; i++) {
 					if (bis_valid[i]) {
-						mixed_sample += decoded_pcm
-							[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
+						mixed_sample +=
+							decoded_pcm[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
 					}
 				}
 
@@ -738,7 +784,11 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		/* Signal encoder that uplink audio is ready */
+#if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
+		atomic_set(&uplink_audio_ready, valid_count > 0 ? 1 : 0);
+#else
 		atomic_set(&uplink_audio_ready, 1);
+#endif
 
 		debug_lc3_dec_set(0);
 
@@ -884,6 +934,7 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	bool valid = (buf != NULL && buf->len > 0 && !(info->flags & BT_ISO_FLAGS_ERROR));
 
 	struct rx_bis_frame *frame = &rx_frames[bis_idx];
+	frame->len = 0U;
 	frame->received = true;
 	frame->valid = valid;
 	frame->seq_num = info->seq_num;
@@ -897,7 +948,8 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	}
 
 	if (valid) {
-		memcpy(frame->data, buf->data, MIN(buf->len, sizeof(frame->data)));
+		frame->len = MIN(buf->len, sizeof(frame->data));
+		memcpy(frame->data, buf->data, frame->len);
 	}
 
 	/* Check if all BIS received this interval */
@@ -1152,7 +1204,11 @@ int main(void)
 
 	(void)src_toggle_init();
 
-	clk_sync_init();
+	err = clk_sync_init(preset_active.qos.interval);
+	if (err) {
+		printk("clk_sync_init failed: %d\n", err);
+		return err;
+	}
 
 	(void)vol_buttons_init();
 
@@ -1180,29 +1236,35 @@ int main(void)
 	}
 #endif
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
-	/* T2 LC3 decoder init */
-	err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, NUM_RX_BIS);
-	if (err) {
-		printk("sw_codec_lc3_dec_init failed: %d\n", err);
-		return err;
-	}
-#else
-	/* Setup LC3 decoders for each uplink BIS */
-	for (int i = 0; i < NUM_RX_BIS; i++) {
-		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
-						    &lc3_decoder_mem[i]);
-		if (lc3_decoders[i] == NULL) {
-			printk("Failed to setup LC3 decoder %d\n", i);
-			return -EIO;
+	#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		/* T2 LC3 decoder init */
+		err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
+					    NUM_RX_BIS);
+		if (err) {
+			printk("sw_codec_lc3_dec_init failed: %d\n", err);
+			return err;
 		}
-	}
-#endif
+	#else
+		/* Setup LC3 decoders for each uplink BIS */
+		for (int i = 0; i < NUM_RX_BIS; i++) {
+			lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
+							    &lc3_decoder_mem[i]);
+			if (lc3_decoders[i] == NULL) {
+				printk("Failed to setup LC3 decoder %d\n", i);
+				return -EIO;
+			}
+		}
+	#endif
 
-#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	printk("LC3 codec: T2 Software LC3\n");
-#else
+	#else
 	printk("LC3 codec: Open-source liblc3\n");
+	#endif
+#if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
+	printk("Uplink decoder mode: reset per-BIS decoder on valid packets, silence on misses\n");
+#else
+	printk("Uplink decoder mode: persistent per-BIS decoders\n");
 #endif
 
 	k_thread_create(&decoder_thread_data, decoder_stack, K_THREAD_STACK_SIZEOF(decoder_stack),

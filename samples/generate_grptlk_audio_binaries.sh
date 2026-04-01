@@ -9,10 +9,15 @@ BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
 
 BUILD_JOBS=(
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_Open_LC3.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_LC3.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_Open_LC3.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_LC3.hex"
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_fully_random.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_fully_random.hex"
+
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
+  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_partly_random.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
+  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_partly_random.hex"
 )
 
 log()  { echo "[grptlk] $*"; }

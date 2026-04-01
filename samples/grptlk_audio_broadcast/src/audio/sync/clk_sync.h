@@ -19,11 +19,11 @@
 #include <stdbool.h>
 
 /*
- * Call once after audio_start() and after BIG creation.
+ * Call once after audio_start() and after the active BIG interval is known.
  * Spawns the clk_sync thread at Zephyr priority 1.
  * The thread blocks until the first iso_sent() call delivers an anchor.
  */
-void clk_sync_init(void);
+int clk_sync_init(uint32_t blk_period_us);
 
 /*
  * Called from iso_sent() after bt_iso_chan_get_tx_sync() succeeds.

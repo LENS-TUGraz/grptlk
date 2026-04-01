@@ -5,22 +5,23 @@
  * Adapted for the grptlk_audio_broadcast context:
  *   - BLE anchor source: bt_iso_chan_get_tx_sync() in iso_sent()
  *   - I2S source:        audio DMA callback (audio_rx_mono_frame in main.c)
- *   - BLK_PERIOD_US = BIG_INTERVAL_US = 5000 µs
+ *   - BIG interval / I2S frame period is configured at runtime
  *
  * State machine
  * -------------
  * INIT   → Waits for first valid BLE anchor.  Records meas_start_ts and
  *          moves to CALIB.
  *
- * CALIB  → Open-loop 100 ms measurement window.  Counts DRIFT_COMP_WAITING_CNT
- *          (20) wakeups, then computes the frequency error from the total BLE
+ * CALIB  → Open-loop 100 ms measurement window.  Counts the configured number
+ *          of anchor wakeups, then computes the frequency error from the total BLE
  *          anchor drift vs expected DRIFT_MEAS_PERIOD_US.  Sets center_freq and
  *          moves to OFFSET.
  *
- * OFFSET → Closed-loop 100 ms windows.  Every 20 wakeups computes the direct
- *          cross-domain phase error (ble_ts - i2s_ts) % BLK_PERIOD_US and
- *          applies center_freq + APLL_FREQ_ADJ(err/2).  Transitions to LOCKED
- *          when |err| < DRIFT_ERR_THRESH_LOCK for one window.
+ * OFFSET → Closed-loop 100 ms windows.  Every configured correction window
+ *          computes the direct cross-domain phase error
+ *          (ble_ts - i2s_ts) % BIG_INTERVAL_US and applies
+ *          center_freq + APLL_FREQ_ADJ(err/2).  Transitions to LOCKED when
+ *          |err| < DRIFT_ERR_THRESH_LOCK for one window.
  *
  * LOCKED → Identical to OFFSET.  Returns to INIT when |err| >
  *          DRIFT_ERR_THRESH_UNLOCK.
@@ -34,6 +35,7 @@
 
 #include "clk_sync.h"
 
+#include <errno.h>
 #include <zephyr/kernel.h>
 #include <nrfx_clock.h>
 
@@ -41,12 +43,8 @@
  * Tuning constants
  * ------------------------------------------------------------------------- */
 
-/* BIG interval / I2S frame period. */
-#define BLK_PERIOD_US           5000
-
-/* Drift measurement window: 100 ms = 20 × 5 ms frames. */
+/* Drift measurement window: 100 ms. */
 #define DRIFT_MEAS_PERIOD_US    100000
-#define DRIFT_COMP_WAITING_CNT  (DRIFT_MEAS_PERIOD_US / BLK_PERIOD_US)  /* 20 */
 
 /* Proportional gain divisor: halve the per-window error before applying. */
 #define DRIFT_REGULATOR_DIV     2
@@ -101,6 +99,8 @@ static atomic_t g_ts_us     = ATOMIC_INIT(0); /* latest BLE TX anchor (µs) */
 static atomic_t g_i2s_ts_us = ATOMIC_INIT(0); /* latest I2S DMA frame (µs) */
 static atomic_t g_reset     = ATOMIC_INIT(1); /* 1 = thread should re-init  */
 static atomic_t g_locked    = ATOMIC_INIT(0); /* 1 = controller converged   */
+static uint32_t g_blk_period_us = 5000U;
+static uint32_t g_waiting_cnt   = DRIFT_MEAS_PERIOD_US / 5000U;
 
 /* Semaphore given by clk_sync_anchor_notify() each BIG anchor. */
 static K_SEM_DEFINE(clk_sync_sem, 0, 1);
@@ -118,21 +118,23 @@ static struct k_thread clk_sync_thread_data;
 /*
  * err_us_calculate — direct cross-domain phase error (µs).
  *
- * Returns (ble_ts - i2s_ts) wrapped to (−BLK_PERIOD_US/2, +BLK_PERIOD_US/2].
+ * Returns (ble_ts - i2s_ts) wrapped to
+ * (−configured_big_interval/2, +configured_big_interval/2].
  */
 static int32_t err_us_calculate(uint32_t ble_ts, uint32_t i2s_ts)
 {
 	int64_t total = (int64_t)ble_ts - (int64_t)i2s_ts;
 	bool neg = (total < 0);
+	uint32_t blk_period_us = g_blk_period_us;
 
 	if (neg) {
 		total = -total;
 	}
 
-	int32_t err = (int32_t)(total % BLK_PERIOD_US);
+	int32_t err = (int32_t)(total % blk_period_us);
 
-	if (err > BLK_PERIOD_US / 2) {
-		err -= BLK_PERIOD_US;
+	if (err > (int32_t)(blk_period_us / 2U)) {
+		err -= (int32_t)blk_period_us;
 	}
 
 	return neg ? -err : err;
@@ -167,7 +169,8 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 			meas_start_ts = 0;
 			prev_ble_ts   = 0;
 			atomic_set(&g_locked, 0);
-			printk("[clk] RESET → INIT\n");
+			printk("[clk] RESET → INIT interval=%u wait=%u\n",
+			       g_blk_period_us, g_waiting_cnt);
 			continue;
 		}
 
@@ -181,7 +184,8 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 			prev_ble_ts   = ble_ts;
 			wait_count    = 0;
 			state         = CLK_STATE_CALIB;
-			printk("[clk] CALIB start ts=%u\n", ble_ts);
+			printk("[clk] CALIB start ts=%u interval=%u wait=%u\n",
+			       ble_ts, g_blk_period_us, g_waiting_cnt);
 			break;
 
 		/* ---------------------------------------------------------- */
@@ -189,7 +193,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 			prev_ble_ts = ble_ts;
 			wait_count++;
 
-			if (wait_count < DRIFT_COMP_WAITING_CNT) {
+			if (wait_count < g_waiting_cnt) {
 				break;
 			}
 
@@ -225,7 +229,7 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
 			prev_ble_ts = ble_ts;
 			wait_count++;
 
-			if (wait_count < DRIFT_COMP_WAITING_CNT) {
+			if (wait_count < g_waiting_cnt) {
 				break;
 			}
 
@@ -281,13 +285,24 @@ static void clk_sync_thread_fn(void *a, void *b, void *c)
  * Public API
  * ------------------------------------------------------------------------- */
 
-void clk_sync_init(void)
+int clk_sync_init(uint32_t blk_period_us)
 {
+	if (blk_period_us == 0U || blk_period_us > DRIFT_MEAS_PERIOD_US ||
+	    (DRIFT_MEAS_PERIOD_US % blk_period_us) != 0U) {
+		printk("[clk] invalid interval=%u us\n", blk_period_us);
+		return -EINVAL;
+	}
+
+	g_blk_period_us = blk_period_us;
+	g_waiting_cnt = DRIFT_MEAS_PERIOD_US / blk_period_us;
+	printk("[clk] init interval=%u wait=%u\n", g_blk_period_us, g_waiting_cnt);
+
 	k_thread_create(&clk_sync_thread_data, clk_sync_stack,
 			K_THREAD_STACK_SIZEOF(clk_sync_stack),
 			clk_sync_thread_fn, NULL, NULL, NULL,
 			CLK_SYNC_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&clk_sync_thread_data, "clk_sync");
+	return 0;
 }
 
 void clk_sync_anchor_notify(uint32_t ts_us)

@@ -77,6 +77,17 @@ config GRPTLK_DEBUG_GPIO
 	  D2/P0.31 = ISO recv, D3/P1.0 = LC3 decode, D4/P1.1 = LC3 encode, P1.14 = ISO sent
 	  Only works on nRF5340 Audio DK. Keep disabled for other platforms.
 
+config GRPTLK_INIT_LC3_CONSTANTLY
+	bool "Experimental: reset uplink LC3 state on every valid packet"
+	default n
+	select LC3_PLC_DISABLED if GRPTLK_LC3_CODEC_T2
+	help
+		  Reinitialize the decoder state before every valid uplink decode so
+		  that no LC3 history is carried across packets on a BIS.
+		  Missed uplink packets are rendered as silence instead of invoking PLC.
+		  This is intended to test whether decoder history is what breaks when
+		  the receiver changes uplink BIS every interval.
+
 config GRPTLK_AUDIO_FRAME_DURATION_MS
 	int
 	default 5 if GRPTLK_AUDIO_FRAME_5_MS
