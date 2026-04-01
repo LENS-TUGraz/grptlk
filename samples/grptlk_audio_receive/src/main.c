@@ -73,6 +73,7 @@ static int16_t mic_pcm_shared[AUDIO_SAMPLES_PER_FRAME];
 static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 
 static struct k_msgq *uplink_q;
+static atomic_t uplink_path_ready = ATOMIC_INIT(0);
 
 static atomic_t tx_in_progress = ATOMIC_INIT(0);
 
@@ -106,9 +107,6 @@ static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static lc3_encoder_t lc3_encoder;
 static lc3_encoder_mem_16k_t lc3_encoder_mem;
 #endif
-
-/* Decoder → encoder synchronization */
-static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
 
 static uint8_t big_actual_num_bis = CONFIG_BT_ISO_MAX_CHAN;
 static uint8_t active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
@@ -148,6 +146,7 @@ static void bis1_disconnect_work_handler(struct k_work *work)
 	ARG_UNUSED(work);
 	printk("BIS1 activity timeout — terminating BIG sync\n");
 	k_timer_stop(&bis1_activity_timer);
+	atomic_set(&uplink_path_ready, 0);
 	if (grptlk_big != NULL) {
 		int err = bt_iso_big_terminate(grptlk_big);
 
@@ -265,8 +264,6 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			ring_prod_idx = RING_NEXT(ring_prod_idx);
 		}
 
-		k_sem_give(&decoder_proceed_sem);
-
 		if ((rx_frame_cnt++ % 200U) == 0U) {
 			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u\n",
 			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_overrun_cnt,
@@ -294,7 +291,11 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		int ret;
 		struct encoded_frame ef;
 
-		k_sem_take(&decoder_proceed_sem, K_FOREVER);
+		k_sem_take(&mic_frame_sem, K_FOREVER);
+
+		if (!atomic_get(&uplink_path_ready)) {
+			continue;
+		}
 
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
@@ -537,6 +538,7 @@ static void iso_connected(struct bt_iso_chan *chan)
 static void iso_disconnected(struct bt_iso_chan *chan, uint8_t reason)
 {
 	printk("ISO Channel %p disconnected with reason 0x%02x\n", chan, reason);
+	atomic_set(&uplink_path_ready, 0);
 	if (chan == bis[active_uplink_bis]) {
 		atomic_set(&uplink_tx_active, 0);
 	}
@@ -817,6 +819,8 @@ static int setup_iso_datapaths(void)
 {
 	int err;
 
+	atomic_set(&uplink_path_ready, 0);
+
 	for (uint8_t i = 0U; i < big_sync_param.num_bis; i++) {
 		struct bt_iso_chan *chan = bis[i];
 		const struct bt_iso_chan_path hci_path = {
@@ -852,6 +856,7 @@ static int setup_iso_datapaths(void)
 	}
 
 	iso_datapaths_setup = true;
+	atomic_set(&uplink_path_ready, 1);
 	return 0;
 }
 
@@ -911,8 +916,6 @@ static int lc3_workers_start(void)
 	k_thread_create(&encoder_thread_data, encoder_stack, K_THREAD_STACK_SIZEOF(encoder_stack),
 			encoder_thread_func, NULL, NULL, NULL, ENCODER_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&encoder_thread_data, "lc3_encoder");
-
-	k_sem_init(&decoder_proceed_sem, 0, 1);
 
 	k_thread_create(&tx_thread_data, tx_thread_stack, K_THREAD_STACK_SIZEOF(tx_thread_stack),
 			tx_thread, NULL, NULL, NULL, TX_THREAD_PRIORITY, 0, K_NO_WAIT);
