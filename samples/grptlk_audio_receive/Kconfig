@@ -88,8 +88,8 @@ config GRPTLK_AUDIO_RING_NUM_BLKS
 	default 13 if GRPTLK_AUDIO_FRAME_10_MS
 
 config BT_ISO_TX_MTU
-	default 20 if GRPTLK_AUDIO_FRAME_5_MS
-	default 40 if GRPTLK_AUDIO_FRAME_10_MS
+	default 24 if GRPTLK_AUDIO_FRAME_5_MS
+	default 44 if GRPTLK_AUDIO_FRAME_10_MS
 
 config NRFX_I2S
 	default y

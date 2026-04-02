@@ -13,6 +13,8 @@
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/net_buf.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 
 #include "audio/audio.h"
 #include "audio/drivers/audio_i2s.h"
@@ -86,12 +88,21 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define GRPTLK_VENDOR_CODEC_ID	 BT_HCI_CODING_FORMAT_VS
 #define GRPTLK_VENDOR_COMPANY_ID 0xDEAD
 #define GRPTLK_VENDOR_VENDOR_ID	 0xBEEF
+#if defined(CONFIG_GRPTLK_AUDIO_FRAME_10_MS)
+#define GRPTLK_CODEC_INTERVAL_US 10000U
+#define GRPTLK_CODEC_SDU_BYTES	 40U
+#else
+#define GRPTLK_CODEC_INTERVAL_US 5000U
+#define GRPTLK_CODEC_SDU_BYTES	 20U
+#endif
+#define GRPTLK_DOWNLINK_APPENDIX_LEN	      4U
+#define GRPTLK_MAX_UPLINK_BIS_BITMAP_BITS 30U
 
 #if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
 static void override_preset_for_lc3plus_5ms(void)
 {
-	preset_active.qos.interval = 5000U;
-	preset_active.qos.sdu = 20U;
+	preset_active.qos.interval = GRPTLK_CODEC_INTERVAL_US;
+	preset_active.qos.sdu = GRPTLK_CODEC_SDU_BYTES;
 	preset_active.qos.rtn = 1U;
 }
 #endif
@@ -112,9 +123,14 @@ static uint8_t big_actual_num_bis = CONFIG_BT_ISO_MAX_CHAN;
 static uint8_t active_uplink_bis = CONFIG_GRPTLK_UPLINK_BIS - 1U;
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
 static uint8_t ptt_session_bis = 0xFFU;
+static uint32_t ptt_wait_no_free_log_cnt;
 #endif
-static uint32_t big_sdu_interval_us = 5000U; /* frame duration µs — default 5 ms */
-static uint16_t big_max_sdu = 20U;	     /* octets per frame  — default 20 B  */
+static uint32_t big_sdu_interval_us = GRPTLK_CODEC_INTERVAL_US;
+static uint16_t big_max_sdu;
+static atomic_t downlink_codec_sdu_bytes = ATOMIC_INIT(GRPTLK_CODEC_SDU_BYTES);
+static atomic_t downlink_appendix_bytes = ATOMIC_INIT(0);
+static atomic_t downlink_uplink_bitmap = ATOMIC_INIT(0);
+static atomic_t downlink_format_warned = ATOMIC_INIT(0);
 
 static bool per_adv_found;
 static bool per_adv_lost;
@@ -123,6 +139,140 @@ static uint8_t per_sid;
 static uint32_t per_interval_us;
 static atomic_t base_logged;
 static atomic_t base_parse_warned;
+
+static uint16_t get_downlink_codec_sdu_bytes(void)
+{
+	return (uint16_t)atomic_get(&downlink_codec_sdu_bytes);
+}
+
+static uint8_t get_downlink_appendix_bytes(void)
+{
+	return (uint8_t)atomic_get(&downlink_appendix_bytes);
+}
+
+static uint32_t get_downlink_uplink_bitmap(void)
+{
+	return (uint32_t)atomic_get(&downlink_uplink_bitmap);
+}
+
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+static bool select_random_uplink_bis_from_mask(uint32_t bis_mask, uint8_t *selected_idx)
+{
+	uint32_t candidate_count;
+	uint32_t choice;
+
+	if ((bis_mask == 0U) || (selected_idx == NULL)) {
+		return false;
+	}
+
+	candidate_count = POPCOUNT(bis_mask);
+	choice = sys_rand32_get() % candidate_count;
+
+	for (uint8_t bit_idx = 0U; bit_idx < GRPTLK_MAX_UPLINK_BIS_BITMAP_BITS; bit_idx++) {
+		if ((bis_mask & BIT(bit_idx)) == 0U) {
+			continue;
+		}
+
+		if (choice == 0U) {
+			*selected_idx = bit_idx + 1U;
+			return true;
+		}
+
+		choice--;
+	}
+
+	return false;
+}
+
+static bool ptt_try_select_session_bis(void)
+{
+	const uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
+	uint32_t candidate_mask;
+	uint8_t selected_idx;
+
+	if (ptt_session_bis != 0xFFU) {
+		return true;
+	}
+
+	if ((atomic_get(&src_line_in_active) != 0) || (atomic_get(&ptt_active) == 0)) {
+		return false;
+	}
+
+	if (num_uplink == 0U) {
+		return false;
+	}
+
+	candidate_mask = BIT_MASK(num_uplink);
+
+	if (get_downlink_appendix_bytes() == GRPTLK_DOWNLINK_APPENDIX_LEN) {
+		candidate_mask &= ~get_downlink_uplink_bitmap();
+		if (candidate_mask == 0U) {
+			if ((ptt_wait_no_free_log_cnt++ % 200U) == 0U) {
+				printk("[Uplink] Waiting for a free uplink BIS for PTT session\n");
+			}
+			return false;
+		}
+	}
+
+	if (!select_random_uplink_bis_from_mask(candidate_mask, &selected_idx)) {
+		return false;
+	}
+
+	ptt_session_bis = selected_idx;
+	ptt_wait_no_free_log_cnt = 0U;
+	printk("[Uplink] Selected BIS%d for PTT session\n", ptt_session_bis + 1U);
+
+	return true;
+}
+#endif
+
+static void format_downlink_appendix_bitmap(uint32_t appendix, char *bitmap, size_t len)
+{
+	const size_t bit_count =
+		(len > 0U) ? MIN((size_t)GRPTLK_MAX_UPLINK_BIS_BITMAP_BITS, len - 1U) : 0U;
+
+	for (size_t i = 0; i < bit_count; i++) {
+		bitmap[i] = (appendix & BIT(i)) ? '1' : '0';
+	}
+
+	if (len > 0U) {
+		bitmap[bit_count] = '\0';
+	}
+}
+
+static void note_downlink_transport_overhead(uint16_t payload_bytes, const char *source)
+{
+	const uint16_t codec_sdu_bytes = get_downlink_codec_sdu_bytes();
+	const uint16_t extra_bytes =
+		(payload_bytes > codec_sdu_bytes) ? (payload_bytes - codec_sdu_bytes) : 0U;
+
+	if ((extra_bytes == 0U) || (extra_bytes == GRPTLK_DOWNLINK_APPENDIX_LEN)) {
+		atomic_set(&downlink_appendix_bytes, extra_bytes);
+		if (extra_bytes == 0U) {
+			atomic_set(&downlink_uplink_bitmap, 0);
+		}
+		return;
+	}
+
+	atomic_set(&downlink_appendix_bytes, 0);
+	atomic_set(&downlink_uplink_bitmap, 0);
+	if (atomic_cas(&downlink_format_warned, 0, 1)) {
+		printk("Unexpected %s overhead: payload=%u codec=%u extra=%u\n", source,
+		       payload_bytes, codec_sdu_bytes, extra_bytes);
+	}
+}
+
+static void update_downlink_codec_sdu_bytes(uint16_t codec_sdu_bytes)
+{
+	if ((codec_sdu_bytes == 0U) || (codec_sdu_bytes > CONFIG_BT_ISO_TX_MTU)) {
+		return;
+	}
+
+	atomic_set(&downlink_codec_sdu_bytes, codec_sdu_bytes);
+	if (big_max_sdu > 0U) {
+		note_downlink_transport_overhead(big_max_sdu, "BIGInfo");
+	}
+}
 
 static K_SEM_DEFINE(sem_per_adv, 0, 1);
 static K_SEM_DEFINE(sem_per_sync, 0, 1);
@@ -209,6 +359,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	struct encoded_frame frame;
 	int16_t mono_pcm[AUDIO_SAMPLES_PER_FRAME];
 	static uint32_t rx_frame_cnt;
+	static uint32_t downlink_appendix_log_cnt;
 	static uint32_t rx_plc_cnt;	/* frames decoded via PLC (no real packet) */
 	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
 	static uint32_t rx_overrun_cnt; /* ring overrun — blocks discarded */
@@ -221,11 +372,13 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		int ret;
 
 		k_msgq_get(&encoded_frame_q, &frame, K_FOREVER);
+		const uint16_t codec_sdu_bytes = get_downlink_codec_sdu_bytes();
 
 		debug_lc3_dec_set(1);
 
 		const uint8_t *lc3_data = (frame.len > 0U) ? frame.data : NULL;
-		const int lc3_len = (frame.len > 0U) ? (int)frame.len : 0;
+		const int lc3_len =
+			(frame.len > 0U) ? MIN((int)frame.len, (int)codec_sdu_bytes) : 0;
 
 		if (lc3_data == NULL) {
 			rx_plc_cnt++;
@@ -246,6 +399,19 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		debug_lc3_dec_set(0);
+
+		if (frame.len == (codec_sdu_bytes + GRPTLK_DOWNLINK_APPENDIX_LEN)) {
+			char uplink_bitmap[GRPTLK_MAX_UPLINK_BIS_BITMAP_BITS + 1U];
+			uint32_t downlink_appendix = sys_get_le32(&frame.data[codec_sdu_bytes]);
+
+			atomic_set(&downlink_uplink_bitmap, (atomic_val_t)downlink_appendix);
+
+			if ((downlink_appendix_log_cnt++ % 100U) == 0U) {
+				format_downlink_appendix_bitmap(downlink_appendix, uplink_bitmap,
+								sizeof(uplink_bitmap));
+				printk("[rx] downlink appendix uplinks=%s\n", uplink_bitmap);
+			}
+		}
 
 		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
 			if (RING_FILLED() >= AUDIO_RING_NUM_BLKS - 1U) {
@@ -313,6 +479,13 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+		if ((atomic_get(&src_line_in_active) == 0) && (atomic_get(&ptt_active) != 0) &&
+		    !ptt_try_select_session_bis()) {
+			continue;
+		}
+#endif
+
 		debug_lc3_enc_set(1);
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
@@ -341,7 +514,11 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 #endif
 
 		memcpy(ef.data, encoded_buf, octets_per_frame);
-		ef.len = octets_per_frame;
+		const uint8_t appendix_bytes = get_downlink_appendix_bytes();
+		if (appendix_bytes > 0U) {
+			memset(&ef.data[octets_per_frame], 0, appendix_bytes);
+		}
+		ef.len = octets_per_frame + appendix_bytes;
 
 		ret = k_msgq_put(uplink_q, &ef, K_NO_WAIT);
 		if (ret != 0) {
@@ -364,16 +541,10 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 static struct bt_iso_chan *iso_select_uplink_chan(void)
 {
 #if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
-	extern atomic_t ptt_active; /* From io/buttons.c */
-
-	if (atomic_get(&ptt_active) && ptt_session_bis == 0xFFU) {
-		uint8_t num_uplink = (big_actual_num_bis > 1U) ? (big_actual_num_bis - 1U) : 0U;
-
-		if (num_uplink == 0U) {
+	if ((atomic_get(&src_line_in_active) == 0) && (atomic_get(&ptt_active) != 0)) {
+		if (!ptt_try_select_session_bis()) {
 			return NULL;
 		}
-		ptt_session_bis = (uint8_t)(sys_rand32_get() % num_uplink) + 1U;
-		printk("[Uplink] Selected BIS%d for PTT session\n", ptt_session_bis + 1);
 	}
 
 	if (ptt_session_bis != 0xFFU) {
@@ -405,6 +576,7 @@ static struct bt_iso_chan *iso_select_uplink_chan(void)
 void ptt_session_bis_reset(void)
 {
 	ptt_session_bis = 0xFFU;
+	ptt_wait_no_free_log_cnt = 0U;
 }
 #endif
 
@@ -505,10 +677,11 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	{
 		struct encoded_frame ef;
 
-		if ((buf != NULL) && (buf->len <= CONFIG_BT_ISO_TX_MTU) &&
+		if ((buf != NULL) && (buf->len <= sizeof(ef.data)) &&
 		    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
 			ef.len = (uint16_t)buf->len;
 			memcpy(ef.data, buf->data, buf->len);
+			note_downlink_transport_overhead(ef.len, "RX frame");
 			k_timer_start(&bis1_activity_timer, K_MSEC(500), K_NO_WAIT);
 		} else {
 			ef.len = 0U;
@@ -559,9 +732,11 @@ static struct bt_iso_chan_ops iso_ops = {
 	.recv = iso_recv,
 };
 
-static bool base_skip_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len_out)
+static bool base_pull_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len_out,
+					const uint8_t **data_out)
 {
 	uint8_t len;
+	const uint8_t *data;
 
 	if (buf->len < sizeof(len)) {
 		return false;
@@ -572,8 +747,14 @@ static bool base_skip_len_prefixed_blob(struct net_buf_simple *buf, uint8_t *len
 		return false;
 	}
 
+	data = buf->data;
+
 	if (len_out != NULL) {
 		*len_out = len;
+	}
+
+	if (data_out != NULL) {
+		*data_out = data;
 	}
 
 	net_buf_simple_pull_mem(buf, len);
@@ -585,6 +766,35 @@ static bool base_is_grptlk_vendor_codec(uint8_t codec_id, uint16_t cid, uint16_t
 {
 	return (codec_id == GRPTLK_VENDOR_CODEC_ID) && (cid == GRPTLK_VENDOR_COMPANY_ID) &&
 	       (vid == GRPTLK_VENDOR_VENDOR_ID);
+}
+
+static bool base_extract_octets_per_frame(const uint8_t *codec_cfg, uint8_t codec_cfg_len,
+					  uint16_t *octets_per_frame)
+{
+	size_t pos = 0U;
+
+	while (pos < codec_cfg_len) {
+		uint8_t len;
+		uint8_t type;
+		uint8_t value_len;
+
+		len = codec_cfg[pos++];
+		if ((len == 0U) || (pos + len > codec_cfg_len)) {
+			return false;
+		}
+
+		type = codec_cfg[pos++];
+		value_len = len - 1U;
+
+		if (type == BT_AUDIO_CODEC_CFG_FRAME_LEN && value_len == sizeof(uint16_t)) {
+			*octets_per_frame = sys_get_le16(&codec_cfg[pos]);
+			return true;
+		}
+
+		pos += value_len;
+	}
+
+	return false;
 }
 
 static int base_log_service_data(const struct bt_data *data)
@@ -621,6 +831,7 @@ static int base_log_service_data(const struct bt_data *data)
 		uint8_t codec_id;
 		uint8_t codec_cfg_len;
 		uint8_t meta_len;
+		const uint8_t *codec_cfg;
 		uint16_t cid;
 		uint16_t vid;
 		uint32_t bis_bitfield = 0U;
@@ -639,9 +850,17 @@ static int base_log_service_data(const struct bt_data *data)
 		cid = net_buf_simple_pull_le16(&buf);
 		vid = net_buf_simple_pull_le16(&buf);
 
-		if (!base_skip_len_prefixed_blob(&buf, &codec_cfg_len) ||
-		    !base_skip_len_prefixed_blob(&buf, &meta_len)) {
+		if (!base_pull_len_prefixed_blob(&buf, &codec_cfg_len, &codec_cfg) ||
+		    !base_pull_len_prefixed_blob(&buf, &meta_len, NULL)) {
 			return -EINVAL;
+		}
+
+		{
+			uint16_t octets_per_frame;
+
+			if (base_extract_octets_per_frame(codec_cfg, codec_cfg_len, &octets_per_frame)) {
+				update_downlink_codec_sdu_bytes(octets_per_frame);
+			}
 		}
 
 		for (uint8_t bis_idx = 0U; bis_idx < bis_count; bis_idx++) {
@@ -758,6 +977,7 @@ static void biginfo_cb(struct bt_le_per_adv_sync *sync, const struct bt_iso_bigi
 	big_actual_num_bis = MIN(biginfo->num_bis, (uint8_t)CONFIG_BT_ISO_MAX_CHAN);
 	big_sdu_interval_us = biginfo->sdu_interval;
 	big_max_sdu = biginfo->max_sdu;
+	note_downlink_transport_overhead(big_max_sdu, "BIGInfo");
 	if (grptlk_big == NULL) {
 		printk("BIG: %u BIS(es), sdu_interval=%u us, max_sdu=%u B, syncing to %u\n",
 		       biginfo->num_bis, big_sdu_interval_us, big_max_sdu, big_actual_num_bis);
@@ -782,6 +1002,11 @@ static void reset_semaphores(void)
 	k_sem_reset(&sem_big_sync_lost);
 	atomic_set(&base_logged, 0);
 	atomic_set(&base_parse_warned, 0);
+	atomic_set(&downlink_codec_sdu_bytes, GRPTLK_CODEC_SDU_BYTES);
+	atomic_set(&downlink_appendix_bytes, 0);
+	atomic_set(&downlink_uplink_bitmap, 0);
+	atomic_set(&downlink_format_warned, 0);
+	big_max_sdu = 0U;
 }
 
 static bool bis_channels_idle(void)
@@ -1062,7 +1287,7 @@ int main(void)
 		}
 
 		preset_active.qos.interval = big_sdu_interval_us;
-		preset_active.qos.sdu = big_max_sdu;
+		preset_active.qos.sdu = GRPTLK_CODEC_SDU_BYTES;
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 		/* Re-init T2 LC3 for new parameters */

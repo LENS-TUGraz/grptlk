@@ -24,6 +24,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/iso.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 
 #define VOLUME_STEP_DB 3
 
@@ -343,6 +344,12 @@ static int src_toggle_init(void)
 #define GRPTLK_CODEC_INTERVAL_US 5000U
 #define GRPTLK_CODEC_SDU_BYTES	 20U
 #endif
+#if defined(CONFIG_GRPTLK_DOWNLINK_APPENDIX)
+#define GRPTLK_DOWNLINK_APPENDIX_BYTES 4U
+#else
+#define GRPTLK_DOWNLINK_APPENDIX_BYTES 0U
+#endif
+#define GRPTLK_ISO_PAYLOAD_BYTES (GRPTLK_CODEC_SDU_BYTES + GRPTLK_DOWNLINK_APPENDIX_BYTES)
 
 static struct bt_bap_lc3_preset preset_active __maybe_unused = BT_BAP_LC3_BROADCAST_PRESET_16_2_1(
 	BT_AUDIO_LOCATION_FRONT_LEFT | BT_AUDIO_LOCATION_FRONT_RIGHT,
@@ -400,7 +407,7 @@ static K_SEM_DEFINE(mic_frame_sem, 0, 1);
 /* Encoder → TX thread: shared buffer + atomic flag (no queue latency).
  * iso_sent() drives tx_sem unconditionally to keep the BIG stream alive.
  * The TX thread reads the freshest encoded frame or sends silence. */
-static uint8_t encoded_shared[CONFIG_BT_ISO_TX_MTU];
+static uint8_t encoded_shared[GRPTLK_CODEC_SDU_BYTES];
 static atomic_t encoded_data_ready = ATOMIC_INIT(0);
 
 /* Mixed uplink audio from decoder → encoder */
@@ -439,6 +446,82 @@ static struct rx_bis_frame rx_frames[NUM_RX_BIS];
 static atomic_t rx_bis_received_count = ATOMIC_INIT(0);
 static K_SEM_DEFINE(decoder_sem, 0, 1);		/* Signals decoder: all BIS received */
 static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
+
+#if defined(CONFIG_GRPTLK_DOWNLINK_APPENDIX)
+#define GRPTLK_DOWNLINK_APPENDIX_ACTIVITY_HOLD_INTERVALS 6U
+BUILD_ASSERT(NUM_RX_BIS <= 30U,
+	     "GRPTLK_DOWNLINK_APPENDIX supports up to 30 uplink BISes (31 BIS BIG with BIS1 as downlink)");
+static bool uplink_interval_valid[NUM_RX_BIS];
+static uint8_t uplink_recent_age[NUM_RX_BIS];
+static bool uplink_recent_active[NUM_RX_BIS];
+static atomic_t uplink_activity_mask = ATOMIC_INIT(0);
+
+static void reset_uplink_activity_mask(void)
+{
+	for (int i = 0; i < NUM_RX_BIS; i++) {
+		uplink_interval_valid[i] = false;
+		uplink_recent_age[i] = 0U;
+		uplink_recent_active[i] = false;
+	}
+
+	atomic_set(&uplink_activity_mask, 0);
+}
+
+static void note_uplink_activity(uint8_t bis_idx, bool valid)
+{
+	uplink_interval_valid[bis_idx] |= valid;
+}
+
+static void finalize_uplink_activity_interval(void)
+{
+	uint32_t mask = 0U;
+
+	for (int i = 0; i < NUM_RX_BIS; i++) {
+		if (uplink_interval_valid[i]) {
+			uplink_recent_age[i] = 0U;
+			uplink_recent_active[i] = true;
+		} else if (uplink_recent_active[i]) {
+			if (uplink_recent_age[i] >= GRPTLK_DOWNLINK_APPENDIX_ACTIVITY_HOLD_INTERVALS) {
+				uplink_recent_active[i] = false;
+			} else {
+				uplink_recent_age[i]++;
+			}
+		}
+
+		if (uplink_recent_active[i]) {
+			mask |= BIT(i);
+		}
+
+		uplink_interval_valid[i] = false;
+	}
+
+	atomic_set(&uplink_activity_mask, mask);
+}
+
+static uint32_t get_uplink_activity_appendix(void)
+{
+	return (uint32_t)atomic_get(&uplink_activity_mask);
+}
+#else
+static inline void reset_uplink_activity_mask(void)
+{
+}
+
+static inline void note_uplink_activity(uint8_t bis_idx, bool valid)
+{
+	ARG_UNUSED(bis_idx);
+	ARG_UNUSED(valid);
+}
+
+static inline void finalize_uplink_activity_interval(void)
+{
+}
+
+static inline uint32_t get_uplink_activity_appendix(void)
+{
+	return 0U;
+}
+#endif
 
 /* PRR (Packet Reception Rate) tracking for uplink BISes */
 #define PRR_WINDOW_SIZE (500000U / GRPTLK_CODEC_INTERVAL_US)
@@ -667,6 +750,7 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 			struct rx_bis_frame *frame = &rx_frames[i];
 			bool have_valid_frame = frame->valid && frame->len > 0U;
+			uint16_t lc3_len = MIN(frame->len, GRPTLK_CODEC_SDU_BYTES);
 
 #if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
 			if (!have_valid_frame) {
@@ -691,8 +775,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				ret = sw_codec_lc3_dec_run(NULL, 0, sizeof(decoded_pcm[i]), i,
 							   decoded_pcm[i], &pcm_len, true);
 			} else {
-				/* Valid packet - normal decode */
-				ret = sw_codec_lc3_dec_run(frame->data, frame->len, sizeof(decoded_pcm[i]),
+				/* Valid packet - normal decode from the LC3 portion only */
+				ret = sw_codec_lc3_dec_run(frame->data, lc3_len, sizeof(decoded_pcm[i]),
 							   i, decoded_pcm[i], &pcm_len, false);
 			}
 			if (ret) {
@@ -705,8 +789,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				ret = lc3_decode(lc3_decoders[i], NULL, 0, LC3_PCM_FORMAT_S16,
 						 decoded_pcm[i], 1);
 			} else {
-				/* Valid packet - normal decode */
-				ret = lc3_decode(lc3_decoders[i], frame->data, frame->len,
+				/* Valid packet - normal decode from the LC3 portion only */
+				ret = lc3_decode(lc3_decoders[i], frame->data, lc3_len,
 						 LC3_PCM_FORMAT_S16, decoded_pcm[i], 1);
 			}
 
@@ -805,7 +889,7 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
 	int err;
 	struct net_buf *buf;
-	uint8_t enc_data[CONFIG_BT_ISO_TX_MTU];
+	uint8_t tx_payload[GRPTLK_ISO_PAYLOAD_BYTES];
 	static uint32_t tx_frame_cnt;
 	static uint32_t tx_underrun_cnt;
 
@@ -827,14 +911,19 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 		/* Since encoder now triggers TX, encoded_data_ready should always be set.
 		 * The atomic check is kept for safety in case of timing anomalies. */
 		if (atomic_set(&encoded_data_ready, 0) != 0) {
-			memcpy(enc_data, encoded_shared, sizeof(enc_data));
+			memcpy(tx_payload, encoded_shared, sizeof(encoded_shared));
 		} else {
 			/* This should never happen with encoder-driven timing */
-			memset(enc_data, 0, sizeof(enc_data));
+			memset(tx_payload, 0, GRPTLK_CODEC_SDU_BYTES);
 			tx_underrun_cnt++;
 			printk("[tx] WARNING: Unexpected underrun (cnt=%u)\n", tx_underrun_cnt);
 		}
-		net_buf_add_mem(buf, enc_data, sizeof(enc_data));
+		/* Appendix bits 0..N-1 map to uplink BIS2..BIS(N+1) activity. */
+		if (GRPTLK_DOWNLINK_APPENDIX_BYTES > 0U) {
+			sys_put_le32(get_uplink_activity_appendix(),
+				     &tx_payload[GRPTLK_CODEC_SDU_BYTES]);
+		}
+		net_buf_add_mem(buf, tx_payload, sizeof(tx_payload));
 
 		err = bt_iso_chan_send(bis[0], buf, seq_num);
 		if (err < 0) {
@@ -858,6 +947,9 @@ static void iso_connected(struct bt_iso_chan *chan)
 {
 	printk("ISO Channel %p connected\n", chan);
 	seq_num = 0U;
+	if (chan == bis[0]) {
+		reset_uplink_activity_mask();
+	}
 	k_sem_give(&sem_big_cmplt);
 }
 
@@ -952,10 +1044,13 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 		memcpy(frame->data, buf->data, frame->len);
 	}
 
+	note_uplink_activity((uint8_t)bis_idx, valid);
+
 	/* Check if all BIS received this interval */
 	uint32_t count = atomic_inc(&rx_bis_received_count);
 	if (count + 1 >= NUM_RX_BIS) {
 		atomic_set(&rx_bis_received_count, 0);
+		finalize_uplink_activity_interval();
 		k_sem_give(&decoder_sem); /* Trigger decoder */
 	}
 

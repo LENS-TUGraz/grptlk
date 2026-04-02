@@ -98,8 +98,19 @@ config GRPTLK_AUDIO_RING_NUM_BLKS
 	default 8 if GRPTLK_AUDIO_FRAME_5_MS
 	default 13 if GRPTLK_AUDIO_FRAME_10_MS
 
+config GRPTLK_DOWNLINK_APPENDIX
+	bool "Append 4-byte downlink ISO appendix"
+	default n
+	help
+	  Append a 4-byte downlink application appendix after each LC3 frame in the
+	  ISO SDU. This is used for the uplink BIS activity bitmap. Disable this to
+	  send only raw LC3 payload bytes. Keep this aligned with the receiver
+	  sample if both ends should use the same transport format.
+
 config BT_ISO_TX_MTU
+	default 24 if GRPTLK_AUDIO_FRAME_5_MS && GRPTLK_DOWNLINK_APPENDIX
 	default 20 if GRPTLK_AUDIO_FRAME_5_MS
+	default 44 if GRPTLK_AUDIO_FRAME_10_MS && GRPTLK_DOWNLINK_APPENDIX
 	default 40 if GRPTLK_AUDIO_FRAME_10_MS
 
 if HW_CODEC_CIRRUS_LOGIC
