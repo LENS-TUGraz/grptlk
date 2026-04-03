@@ -7,6 +7,7 @@
 
 #define AUDIO_SAMPLE_RATE_HZ	16000
 #define AUDIO_FRAME_DURATION_MS CONFIG_GRPTLK_AUDIO_FRAME_DURATION_MS
+#define AUDIO_FRAME_DURATION_US (AUDIO_FRAME_DURATION_MS * 1000U)
 #define AUDIO_CHANNELS		2
 #define AUDIO_BITS_PER_SAMPLE	16
 #define AUDIO_SAMPLES_PER_FRAME ((AUDIO_SAMPLE_RATE_HZ * AUDIO_FRAME_DURATION_MS) / 1000)
@@ -20,6 +21,13 @@
 
 BUILD_ASSERT(AUDIO_BLK_SAMPLES_MONO *AUDIO_BLKS_PER_FRAME == AUDIO_SAMPLES_PER_FRAME,
 	     "1ms block count x block size must equal frame size");
+
+/* Shared queue item for downlink decode and uplink transmit paths. */
+struct audio_encoded_frame {
+	uint16_t len; /* 0 = loss/PLC */
+	uint32_t sdu_ref_us;
+	uint8_t data[CONFIG_BT_ISO_TX_MTU];
+};
 
 struct audio_ring {
 	uint32_t (*fifo)[AUDIO_BLK_SAMPLES_MONO];
@@ -56,5 +64,8 @@ uint32_t audio_served_count_reset(void);
  * DMA callbacks — audible as a silence burst or rumble.
  * Safe to call from any thread. */
 uint32_t audio_max_consec_underrun_reset(void);
+
+/* Reset playback arming and underrun tracking on stream re-sync. */
+void audio_playback_reset(void);
 
 #endif /* GRPTLK_AUDIO_H_ */

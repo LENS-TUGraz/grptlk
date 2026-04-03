@@ -230,9 +230,31 @@ uint32_t audio_served_count_reset(void)
 static uint32_t g_consec_underrun;
 static atomic_t g_max_consec_underrun = ATOMIC_INIT(0);
 
+enum playback_state {
+	PLAYBACK_STATE_DISARMED = 0,
+	PLAYBACK_STATE_ARMED = 1,
+};
+
+static enum playback_state g_playback_state = PLAYBACK_STATE_DISARMED;
+
 uint32_t audio_max_consec_underrun_reset(void)
 {
 	return (uint32_t)atomic_set(&g_max_consec_underrun, 0);
+}
+
+void audio_playback_reset(void)
+{
+	g_playback_state = PLAYBACK_STATE_DISARMED;
+	g_consec_underrun = 0U;
+	atomic_set(&g_underrun_cnt, 0);
+	atomic_set(&g_served_cnt, 0);
+	atomic_set(&g_max_consec_underrun, 0);
+}
+
+static uint16_t playback_ring_fill_get(uint16_t cons_idx, uint16_t prod_idx, uint16_t num_blks)
+{
+	return (prod_idx >= cons_idx) ? (uint16_t)(prod_idx - cons_idx)
+				      : (uint16_t)(num_blks - cons_idx + prod_idx);
 }
 
 static void tx_buffer_fill(uint32_t *tx_words)
@@ -240,14 +262,23 @@ static void tx_buffer_fill(uint32_t *tx_words)
 	if (ring != NULL) {
 		uint16_t ci = *ring->cons_idx;
 		uint16_t pi = *ring->prod_idx;
+		uint16_t fill = playback_ring_fill_get(ci, pi, ring->num_blks);
+
+		if (g_playback_state == PLAYBACK_STATE_DISARMED) {
+			if (fill < AUDIO_BLKS_PER_FRAME) {
+				memset(tx_words, 0, AUDIO_I2S_SAMPLES_PER_BLOCK * sizeof(uint32_t));
+				return;
+			}
+
+			g_playback_state = PLAYBACK_STATE_ARMED;
+			printk("[ring] playback armed (fill %u/%u)\n", fill, ring->num_blks);
+		}
 
 		if (ci != pi) {
 			/* Ring has data — log if we're recovering from a gap. */
 			if (g_consec_underrun > 0U) {
 				printk("[ring] gap_end: %u ms silence (fill now %u/%u)\n",
-				       g_consec_underrun,
-				       (uint16_t)((pi - ci + ring->num_blks) % ring->num_blks),
-				       ring->num_blks);
+				       g_consec_underrun, fill, ring->num_blks);
 				g_consec_underrun = 0U;
 			}
 			memcpy(tx_words, ring->fifo[ci],
@@ -410,6 +441,7 @@ int audio_start(void)
 
 	memset(i2s_tx_buf_a, 0, sizeof(i2s_tx_buf_a));
 	memset(i2s_tx_buf_b, 0, sizeof(i2s_tx_buf_b));
+	audio_playback_reset();
 
 	/* ring_fifo is zero-initialised (static storage); no pre-fill needed.
 	 * tx_buffer_fill() outputs zeros on underrun. */

@@ -84,8 +84,17 @@ config GRPTLK_AUDIO_FRAME_DURATION_MS
 
 config GRPTLK_AUDIO_RING_NUM_BLKS
 	int
-	default 8 if GRPTLK_AUDIO_FRAME_5_MS
-	default 13 if GRPTLK_AUDIO_FRAME_10_MS
+	default 10 if GRPTLK_AUDIO_FRAME_5_MS
+	default 16 if GRPTLK_AUDIO_FRAME_10_MS
+
+config GRPTLK_RX_TARGET_PREFILL_BLKS
+	int "Target playback ring fill before writing a decoded frame"
+	default 2
+	range 0 8
+	help
+	  The drift controller aims to keep roughly this many 1 ms playback
+	  blocks in the ring just before the next decoded LC3 frame is written.
+	  This keeps latency low while still leaving room for a whole frame.
 
 config BT_ISO_TX_MTU
 	default 24 if GRPTLK_AUDIO_FRAME_5_MS

@@ -48,12 +48,7 @@
 	BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_ACTIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,   \
 			 BT_GAP_SCAN_FAST_WINDOW)
 
-struct encoded_frame {
-	uint16_t len; /* 0 = loss/PLC */
-	uint8_t data[CONFIG_BT_ISO_TX_MTU];
-};
-
-K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct encoded_frame), 2, 1);
+K_MSGQ_DEFINE(encoded_frame_q, sizeof(struct audio_encoded_frame), 2, 1);
 
 static uint32_t ring_fifo[AUDIO_RING_NUM_BLKS][AUDIO_BLK_SAMPLES_MONO];
 volatile uint16_t ring_prod_idx;
@@ -356,13 +351,13 @@ static void audio_rx_mono_frame(const int16_t *mono_frame)
 
 static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 {
-	struct encoded_frame frame;
+	struct audio_encoded_frame frame;
 	int16_t mono_pcm[AUDIO_SAMPLES_PER_FRAME];
 	static uint32_t rx_frame_cnt;
 	static uint32_t downlink_appendix_log_cnt;
 	static uint32_t rx_plc_cnt;	/* frames decoded via PLC (no real packet) */
 	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
-	static uint32_t rx_overrun_cnt; /* ring overrun — blocks discarded */
+	static uint32_t rx_frame_drop_cnt; /* whole decoded frame dropped */
 
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
@@ -413,13 +408,19 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
-			if (RING_FILLED() >= AUDIO_RING_NUM_BLKS - 1U) {
-				rx_overrun_cnt++;
-				break;
-			}
+		const uint16_t prewrite_fill = (uint16_t)RING_FILLED();
+		const uint16_t free_blks = (AUDIO_RING_NUM_BLKS - 1U) - prewrite_fill;
 
-			uint32_t *dst = ring_fifo[ring_prod_idx];
+		clk_sync_rx_notify(prewrite_fill);
+
+		if (free_blks < AUDIO_BLKS_PER_FRAME) {
+			rx_frame_drop_cnt++;
+			continue;
+		}
+
+		for (uint8_t blk = 0; blk < AUDIO_BLKS_PER_FRAME; blk++) {
+			const uint16_t prod_idx = ring_prod_idx;
+			uint32_t *dst = ring_fifo[prod_idx];
 
 			for (uint8_t s = 0; s < AUDIO_BLK_SAMPLES_MONO; s++) {
 				int16_t sample = mono_pcm[blk * AUDIO_BLK_SAMPLES_MONO + s];
@@ -427,16 +428,16 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				dst[s] = ((uint32_t)(uint16_t)sample << 16) | (uint16_t)sample;
 			}
 
-			ring_prod_idx = RING_NEXT(ring_prod_idx);
+			ring_prod_idx = RING_NEXT(prod_idx);
 		}
 
 		if ((rx_frame_cnt++ % 200U) == 0U) {
-			printk("[rx] frame=%u plc=%u err=%u overrun=%u ring=%u underrun=%u\n",
-			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_overrun_cnt,
+			printk("[rx] frame=%u plc=%u err=%u drop=%u ring=%u underrun=%u\n",
+			       rx_frame_cnt, rx_plc_cnt, rx_dec_err_cnt, rx_frame_drop_cnt,
 			       (uint32_t)RING_FILLED(), audio_underrun_count_reset());
 			rx_plc_cnt = 0;
 			rx_dec_err_cnt = 0;
-			rx_overrun_cnt = 0;
+			rx_frame_drop_cnt = 0;
 		}
 	}
 }
@@ -455,7 +456,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 	while (1) {
 		int ret;
-		struct encoded_frame ef;
+		struct audio_encoded_frame ef = { 0 };
 
 		k_sem_take(&mic_frame_sem, K_FOREVER);
 
@@ -580,7 +581,7 @@ void ptt_session_bis_reset(void)
 }
 #endif
 
-static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef);
+static int uplink_send_next(struct bt_iso_chan *chan, const struct audio_encoded_frame *ef);
 
 static void tx_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -590,7 +591,7 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 
 	while (true) {
 		struct bt_iso_chan *ul_chan;
-		struct encoded_frame ef;
+		struct audio_encoded_frame ef;
 		int ret;
 
 		ret = k_msgq_get(uplink_q, &ef, K_MSEC(10));
@@ -612,7 +613,7 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 	}
 }
 
-static int uplink_send_next(struct bt_iso_chan *chan, const struct encoded_frame *ef)
+static int uplink_send_next(struct bt_iso_chan *chan, const struct audio_encoded_frame *ef)
 {
 	struct net_buf *buf;
 	int err;
@@ -675,7 +676,13 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	debug_iso_recv_set(1);
 
 	{
-		struct encoded_frame ef;
+		struct audio_encoded_frame ef;
+
+		memset(&ef, 0, sizeof(ef));
+
+		if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
+			ef.sdu_ref_us = info->ts;
+		}
 
 		if ((buf != NULL) && (buf->len <= sizeof(ef.data)) &&
 		    ((info->flags & BT_ISO_FLAGS_VALID) != 0U)) {
@@ -690,10 +697,6 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	}
 
 	debug_iso_recv_set(0);
-
-	if ((info->flags & BT_ISO_FLAGS_TS) != 0U) {
-		clk_sync_rx_notify(info->ts, RING_FILLED());
-	}
 
 	iso_datapaths_setup = false;
 }
@@ -1077,6 +1080,8 @@ static int setup_iso_datapaths(void)
 	k_msgq_purge(uplink_q); /* Purge uplink queue too */
 	ring_prod_idx = 0;
 	ring_cons_idx = 0;
+	memset(ring_fifo, 0, sizeof(ring_fifo));
+	audio_playback_reset();
 	while (k_sem_take(&mic_frame_sem, K_NO_WAIT) == 0) {
 	}
 
