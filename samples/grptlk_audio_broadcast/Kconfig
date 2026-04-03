@@ -113,6 +113,28 @@ config BT_ISO_TX_MTU
 	default 44 if GRPTLK_AUDIO_FRAME_10_MS && GRPTLK_DOWNLINK_APPENDIX
 	default 40 if GRPTLK_AUDIO_FRAME_10_MS
 
+config BT_ISO_MAX_CHAN
+	int
+	default GRPTLK_NUM_CHAN
+
+config BT_BAP_BROADCAST_SRC_STREAM_COUNT
+	int
+	default GRPTLK_NUM_CHAN
+
+config NRFX_CLOCK
+	default y
+
+config GRPTLK_LOCAL_AUDIO_IO
+	bool "Enable local audio I/O"
+	default y if HW_CODEC_CIRRUS_LOGIC
+	default n
+	help
+	  Enable local audio capture/playback plumbing for boards that have a
+	  local audio source or sink. Disable this for relay-only boards that
+	  only decode, mix, re-encode, and re-broadcast BIS audio.
+
+if GRPTLK_LOCAL_AUDIO_IO
+
 if HW_CODEC_CIRRUS_LOGIC
 
 config GRPTLK_AUDIO_SOURCE_LINE_IN
@@ -130,18 +152,9 @@ config NRFX_I2S
 config NRFX_I2S0
 	default y
 
-config NRFX_CLOCK
-	default y
-
-config BT_ISO_MAX_CHAN
-	int
-	default GRPTLK_NUM_CHAN
-
-config BT_BAP_BROADCAST_SRC_STREAM_COUNT
-	int
-	default GRPTLK_NUM_CHAN
-
 endif # HW_CODEC_CIRRUS_LOGIC
+
+endif # GRPTLK_LOCAL_AUDIO_IO
 
 endif # GRPTLK
 

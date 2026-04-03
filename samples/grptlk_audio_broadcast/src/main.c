@@ -28,7 +28,8 @@
 
 #define VOLUME_STEP_DB 3
 
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -72,6 +73,7 @@ static void vol_up_isr(const struct device *dev, struct gpio_callback *cb, uint3
 #define VOL_BTN_AVAILABLE 0
 #endif
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 static int vol_buttons_init(void)
 {
 #if VOL_BTN_AVAILABLE
@@ -113,12 +115,14 @@ static int vol_buttons_init(void)
 	return 0;
 #endif
 }
+#endif
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 /* Input source toggle: boot default is MIC. */
 static atomic_t src_line_in_active = ATOMIC_INIT(0);
 
 /* PTT button (BTN3 = sw2): PTT starts inactive at boot. */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
 static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 static struct gpio_callback ptt_cb_data;
@@ -175,7 +179,8 @@ static int ptt_init(void)
 
 /* PTT lock toggle: BTN4 (sw3) cycles between PTT mode and always-TX mode.
  * When lock is active, LED1 (led0/rgb1_red) is lit and mic always transmits. */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 #define PTT_LOCK_AVAILABLE 1
 static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
 static const struct gpio_dt_spec ptt_lock_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -253,7 +258,8 @@ static int ptt_lock_init(void)
 }
 
 /* Input source toggle: BTN5 (sw4) switches between PDM mic and line-in. */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
 #define SRC_TOGGLE_AVAILABLE 1
 static const struct gpio_dt_spec src_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
 static const struct gpio_dt_spec src_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -330,6 +336,7 @@ static int src_toggle_init(void)
 	return 0;
 #endif
 }
+#endif
 
 /* BAP preset base: kept as-is per project requirement.
  * For LC3Plus 5ms, QoS fields are overridden at runtime.
@@ -649,6 +656,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 		debug_lc3_enc_set(1);
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
 
 		/* PTT gate: broadcast silence when button is not held.
@@ -674,6 +682,13 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 				local_pcm[i] = (int16_t)mixed;
 			}
 		}
+#else
+		if (atomic_set(&uplink_audio_ready, 0) != 0) {
+			memcpy(local_pcm, mixed_uplink_pcm, sizeof(local_pcm));
+		} else {
+			memset(local_pcm, 0, sizeof(local_pcm));
+		}
+#endif
 
 		uint32_t t0 = k_cycle_get_32();
 
@@ -829,11 +844,13 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		/* Mix all valid decoded BISes and play to speaker */
-		/* One LC3 frame (80 samples) = 5 ring blocks (16 samples each) */
+		/* Mix all valid decoded BISes into one PCM frame. */
+		/* One LC3 frame = AUDIO_I2S_BLKS_PER_FRAME ring blocks. */
 		for (int blk = 0; blk < AUDIO_I2S_BLKS_PER_FRAME; blk++) {
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 			uint16_t pi = ring_prod_idx;
 			uint32_t *ring_blk = playback_ring.fifo[pi];
+#endif
 
 			/* Mix all valid decoded BISes for this block */
 			for (int j = 0; j < AUDIO_I2S_SAMPLES_PER_BLOCK; j++) {
@@ -856,15 +873,19 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 				/* Convert to int16 and duplicate to both L/R channels */
 				int16_t sample = (int16_t)mixed_sample;
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 				ring_blk[j] = ((uint32_t)((uint16_t)sample) |
 					       ((uint32_t)((uint16_t)sample) << 16));
+#endif
 
 				/* Store mixed uplink sample for encoder */
 				mixed_uplink_pcm[blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j] = sample;
 			}
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 			/* Advance producer index */
 			ring_prod_idx = (pi + 1U) % playback_ring.num_blks;
+#endif
 		}
 
 		/* Signal encoder that uplink audio is ready */
@@ -1267,6 +1288,8 @@ int main(void)
 #endif
 
 	printk("Starting GRPTLK Broadcaster\n");
+	printk("Audio mode: %s\n",
+	       IS_ENABLED(CONFIG_GRPTLK_LOCAL_AUDIO_IO) ? "local I/O + relay" : "relay-only");
 	led_err = led_init();
 	if (led_err) {
 		printk("led_init failed: %d\n", led_err);
@@ -1274,8 +1297,10 @@ int main(void)
 		(void)led_set_broadcast_running(false);
 	}
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 	(void)ptt_init();
 	(void)ptt_lock_init();
+#endif
 
 	/* Debug GPIO (optional, for logic analyzer timing analysis) */
 	(void)debug_gpio_init();
@@ -1292,12 +1317,14 @@ int main(void)
 		return err;
 	}
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 	/* Sync codec to software boot default (MIC). codec_mic_path_prepare() in
 	 * audio_init() applies LINE-IN routing when CONFIG_GRPTLK_AUDIO_SOURCE_LINE_IN=1,
 	 * but our boot state is MIC (src_line_in_active=0). */
 	(void)audio_input_source_switch(false);
 
 	(void)src_toggle_init();
+#endif
 
 	err = clk_sync_init(preset_active.qos.interval);
 	if (err) {
@@ -1305,7 +1332,9 @@ int main(void)
 		return err;
 	}
 
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 	(void)vol_buttons_init();
+#endif
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	/* T2 LC3 encoder init */

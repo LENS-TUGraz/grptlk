@@ -34,11 +34,13 @@ int audio_init(struct audio_ring *ring, audio_rx_cb_t rx_cb);
 int audio_start(void);
 
 /* Adjust output volume by step_db dB (+3 = up, -3 = down).
- * Clamped to [−64 dB, 0 dB]. Only available on CS47L63-equipped boards. */
+ * Clamped to [−64 dB, 0 dB]. Returns -ENOTSUP when the active backend does
+ * not expose local output volume control. */
 int audio_volume_adjust(int8_t step_db);
 
-/* Switch audio input between 3.5mm line-in and PDM mic at runtime.
- * Returns -EPERM if audio has not been started yet. */
+/* Switch the active local audio input source at runtime.
+ * Returns -EPERM if audio has not been started yet and -ENOTSUP when the
+ * active backend does not expose local input switching. */
 int audio_input_source_switch(bool use_line_in);
 
 /* Return the number of DMA playback underruns since the last call and

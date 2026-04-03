@@ -42,8 +42,8 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_broadcast)
 
 # Supported targets:
-#   nrf5340_audio_dk/nrf5340/cpuapp  — CS47L63 codec + mic + speaker
-#   nrf5340dk/nrf5340/cpuapp         — relay mode (no audio codec)
+#   nrf5340_audio_dk/nrf5340/cpuapp  — local audio I/O + CS47L63 backend
+#   nrf5340dk/nrf5340/cpuapp         — relay mode (no local audio I/O)
 #
 # Source tree layout:
 #   src/
@@ -68,19 +68,29 @@ target_sources(app PRIVATE
   src/io/debug_gpio.c
 )
 
-# CS47L63 codec + HFCLKAUDIO clock sync sources (nrf5340_audio_dk only)
-if(CONFIG_HW_CODEC_CIRRUS_LOGIC)
-  target_sources(app PRIVATE
-    src/audio/backends/cs47l63.c
-    src/audio/drivers/audio_i2s.c
-    src/audio/drivers/cs47l63_comm.c
-    src/audio/sync/clk_sync.c
-  )
+# Local audio path uses the real codec backend; relay-only path uses stubs.
+if(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
+  if(CONFIG_HW_CODEC_CIRRUS_LOGIC)
+    target_sources(app PRIVATE
+      src/audio/backends/cs47l63.c
+      src/audio/drivers/audio_i2s.c
+      src/audio/drivers/cs47l63_comm.c
+      src/audio/sync/clk_sync.c
+    )
 
-  if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
+    if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
+      message(FATAL_ERROR
+        "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
+    endif()
+
+    add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
+  else()
     message(FATAL_ERROR
-      "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
+      "CONFIG_GRPTLK_LOCAL_AUDIO_IO requires a local audio backend")
   endif()
-
-  add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
+else()
+  target_sources(app PRIVATE
+    src/audio/backends/null_audio.c
+    src/audio/sync/clk_sync_stub.c
+  )
 endif()

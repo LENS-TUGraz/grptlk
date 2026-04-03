@@ -11,6 +11,12 @@
 #define BROADCAST_LED_AVAILABLE 1
 static const struct gpio_dt_spec broadcast_led =
 	GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+#elif CONFIG_BOARD_NRF5340DK_NRF5340_CPUAPP && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led2), okay) && \
+	DT_NODE_HAS_STATUS(DT_GPIO_CTLR(DT_ALIAS(led2), gpios), okay)
+#define BROADCAST_LED_AVAILABLE 1
+static const struct gpio_dt_spec broadcast_led =
+	GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 #elif CONFIG_BOARD_HWN001_NRF54L15_CPUAPP && \
 	DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay) && \
 	DT_NODE_HAS_STATUS(DT_GPIO_CTLR(DT_ALIAS(led0), gpios), okay)
