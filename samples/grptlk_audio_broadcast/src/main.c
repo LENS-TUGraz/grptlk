@@ -378,7 +378,7 @@ static void override_preset_for_lc3plus_5ms(void)
 	/* rtn=2: two retransmit opportunities per BIG event. Reduces streak_max from
 	 * 3-4 to 0-1 in burst-loss conditions, keeping PLC below the audible threshold.
 	 * latency=10ms = (rtn+1)*interval = 3*5ms, the required minimum for rtn=2. */
-	preset_active.qos.latency = 10U;
+	preset_active.qos.latency = 5U;
 	preset_active.qos.rtn = 2U;
 	preset_active.codec_cfg.id = GRPTLK_VENDOR_CODEC_ID;
 	preset_active.codec_cfg.cid = GRPTLK_VENDOR_COMPANY_ID;
@@ -416,6 +416,10 @@ static K_SEM_DEFINE(mic_frame_sem, 0, 1);
  * The TX thread reads the freshest encoded frame or sends silence. */
 static uint8_t encoded_shared[GRPTLK_CODEC_SDU_BYTES];
 static atomic_t encoded_data_ready = ATOMIC_INIT(0);
+#if defined(CONFIG_GRPTLK_RELAY)
+/* Pre-encoded LC3 silence frame, written once at boot and used when uplink is absent. */
+static uint8_t lc3_silence_frame[GRPTLK_CODEC_SDU_BYTES];
+#endif
 
 /* Mixed uplink audio from decoder → encoder */
 static int16_t mixed_uplink_pcm[PCM_SAMPLES_PER_FRAME];
@@ -1046,6 +1050,28 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	/* Only process VALID packets */
 	bool valid = (buf != NULL && buf->len > 0 && !(info->flags & BT_ISO_FLAGS_ERROR));
 
+#if defined(CONFIG_GRPTLK_RELAY)
+	/* Relay mode: forward raw LC3 bytes directly to TX thread, or pre-encoded silence. */
+	{
+		const uint8_t *relay_src = valid ? buf->data : lc3_silence_frame;
+		uint16_t relay_len = valid ? MIN(buf->len, sizeof(encoded_shared))
+					   : sizeof(encoded_shared);
+
+		memcpy(encoded_shared, relay_src, relay_len);
+		atomic_set(&encoded_data_ready, 1);
+
+		/* Prime the TX pump on the very first relay packet. */
+		static atomic_t relay_primed = ATOMIC_INIT(0);
+
+		if (atomic_cas(&relay_primed, 0, 1)) {
+			k_sem_give(&tx_sem);
+		}
+	}
+	/* Decoder/encoder threads stay dormant — never give decoder_sem. */
+	debug_iso_recv_set(0);
+	return;
+#endif
+
 	struct rx_bis_frame *frame = &rx_frames[bis_idx];
 	frame->len = 0U;
 	frame->received = true;
@@ -1357,6 +1383,23 @@ int main(void)
 	if (lc3_encoder == NULL) {
 		printk("Failed to setup LC3 encoder\n");
 		return -EIO;
+	}
+#endif
+
+#if defined(CONFIG_GRPTLK_RELAY)
+	{
+		int16_t silence_pcm[PCM_SAMPLES_PER_FRAME] = {0};
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+		uint16_t silence_len;
+
+		sw_codec_lc3_enc_run(silence_pcm, sizeof(silence_pcm), LC3_USE_BITRATE_FROM_INIT,
+				     0, sizeof(lc3_silence_frame), lc3_silence_frame, &silence_len);
+#else
+		lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, silence_pcm, 1,
+			   preset_active.qos.sdu, lc3_silence_frame);
+#endif
+		printk("[relay] LC3 silence frame pre-encoded (%u bytes)\n",
+		       (unsigned)sizeof(lc3_silence_frame));
 	}
 #endif
 

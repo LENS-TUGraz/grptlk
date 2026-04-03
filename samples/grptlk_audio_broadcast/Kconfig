@@ -19,11 +19,26 @@ endchoice
 
 config GRPTLK_NUM_CHAN
 	int "Number of ISO channels (BISes)"
-	default 5
+	default 2
 	range 2 5
 	help
 	  Number of isochronous channels to support. Includes 1 downlink BIS
 	  plus (n-1) uplink BISes for push-to-talk.
+
+config GRPTLK_RELAY
+	bool "Enable raw uplink-to-downlink relay"
+	default y if !BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
+	default n
+	depends on GRPTLK_NUM_CHAN = 2
+	depends on !GRPTLK_DOWNLINK_APPENDIX
+	help
+	  Forward the single uplink LC3 payload from BIS2 directly to downlink
+	  BIS1 without decoding, mixing, or re-encoding it first.
+
+	  This is intended for low-latency relay boards with exactly one uplink
+	  BIS. It defaults to enabled on non-nRF5340 Audio DK boards when
+	  GRPTLK_NUM_CHAN=2 and is unavailable when the 4-byte downlink appendix
+	  is enabled.
 
 choice GRPTLK_AUDIO_FRAME_DURATION
 	prompt "Audio frame duration"
