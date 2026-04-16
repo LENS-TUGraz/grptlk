@@ -42,12 +42,13 @@ int audio_init(struct audio_ring *ring, audio_rx_cb_t rx_cb);
 int audio_start(void);
 
 /* Adjust output volume by step_db dB (+3 = up, -3 = down).
- * Clamped to [−64 dB, 0 dB]. Only available on CS47L63-equipped boards. */
+ * Backend-specific clamping is applied by the selected hardware codec. */
 int audio_volume_adjust(int8_t step_db);
 
 /* Switch audio input source at runtime.
- * use_line_in=true → LINE-IN jack; false → PDM mic.
- * Only available on CS47L63-equipped boards. */
+ * use_line_in=true → LINE-IN jack on backends that support it;
+ * false → the backend's microphone input.
+ * Returns -ENOTSUP on fixed-source backends such as MAX9867. */
 int audio_input_source_switch(bool use_line_in);
 
 /* Return the number of DMA playback underruns since the last call and

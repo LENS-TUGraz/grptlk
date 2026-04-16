@@ -20,71 +20,9 @@ atomic_t ptt_active = ATOMIC_INIT(0);
 atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
-#define PTT_AVAILABLE 1
-static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
-static struct gpio_callback ptt_cb_data;
-
-static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-
-	if (atomic_get(&src_line_in_active)) {
-		return; /* PTT is MIC-only */
-	}
-
-	if (gpio_pin_get_dt(&ptt_btn) > 0) {
-		atomic_set(&ptt_active, 1);
-		clk_sync_reset();
-		printk("[PTT] pressed\n");
-		k_sem_give(uplink_tx_sem);
-	} else {
-		atomic_set(&ptt_active, 0);
-#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
-		extern void ptt_session_bis_reset(void);
-		ptt_session_bis_reset();
-#endif
-		printk("[PTT] released\n");
-	}
-}
-
-static int ptt_init(void)
-{
-	int err;
-
-	if (!gpio_is_ready_dt(&ptt_btn)) {
-		printk("PTT button GPIO not ready\n");
-		return -ENODEV;
-	}
-	err = gpio_pin_configure_dt(&ptt_btn, GPIO_INPUT);
-	if (err) {
-		printk("PTT button configure failed: %d\n", err);
-		return err;
-	}
-	err = gpio_pin_interrupt_configure_dt(&ptt_btn, GPIO_INT_EDGE_BOTH);
-	if (err) {
-		printk("PTT interrupt configure failed: %d\n", err);
-		return err;
-	}
-	gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
-	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
-
-	printk("PTT init: sw2 ready, mic disabled at boot\n");
-	return 0;
-}
-#else
-#define PTT_AVAILABLE 0
-static int ptt_init(void)
-{
-	printk("PTT: no sw2 alias - always TX\n");
-	return 0;
-}
-#endif
-
 /* PTT-lock: sw3 (toggle) + led0 (status). SPI-backed LED write deferred
- * to work item for ISR safety. */
+ * to work item for ISR safety.
+ * Declared before PTT block so ptt_isr can observe lock state. */
 #if DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 #define PTT_LOCK_AVAILABLE 1
 static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
@@ -164,6 +102,75 @@ static int ptt_lock_init(void)
 static int ptt_lock_init(void)
 {
 	printk("PTT-lock: sw3/led0 not available\n");
+	return 0;
+}
+#endif
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
+#define PTT_AVAILABLE 1
+static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static struct gpio_callback ptt_cb_data;
+
+static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	if (atomic_get(&src_line_in_active)) {
+		return; /* PTT is MIC-only */
+	}
+
+#if PTT_LOCK_AVAILABLE
+	if (atomic_get(&ptt_lock_active)) {
+		return; /* lock owns ptt_active; sw2 is a no-op while engaged */
+	}
+#endif
+
+	if (gpio_pin_get_dt(&ptt_btn) > 0) {
+		atomic_set(&ptt_active, 1);
+		clk_sync_reset();
+		printk("[PTT] pressed\n");
+		k_sem_give(uplink_tx_sem);
+	} else {
+		atomic_set(&ptt_active, 0);
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+		extern void ptt_session_bis_reset(void);
+		ptt_session_bis_reset();
+#endif
+		printk("[PTT] released\n");
+	}
+}
+
+static int ptt_init(void)
+{
+	int err;
+
+	if (!gpio_is_ready_dt(&ptt_btn)) {
+		printk("PTT button GPIO not ready\n");
+		return -ENODEV;
+	}
+	err = gpio_pin_configure_dt(&ptt_btn, GPIO_INPUT);
+	if (err) {
+		printk("PTT button configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_interrupt_configure_dt(&ptt_btn, GPIO_INT_EDGE_BOTH);
+	if (err) {
+		printk("PTT interrupt configure failed: %d\n", err);
+		return err;
+	}
+	gpio_init_callback(&ptt_cb_data, ptt_isr, BIT(ptt_btn.pin));
+	gpio_add_callback(ptt_btn.port, &ptt_cb_data);
+
+	printk("PTT init: sw2 ready, mic disabled at boot\n");
+	return 0;
+}
+#else
+#define PTT_AVAILABLE 0
+static int ptt_init(void)
+{
+	printk("PTT: no sw2 alias - always TX\n");
 	return 0;
 }
 #endif
@@ -253,7 +260,8 @@ static int vol_buttons_init(void)
 #endif
 
 /* Source toggle: sw4 (BTN5) + led1. Deferred to work queue (SPI access). */
-#if DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#if defined(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS) && DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
 #define SRC_TOGGLE_AVAILABLE 1
 static const struct gpio_dt_spec src_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
 static const struct gpio_dt_spec src_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
@@ -322,7 +330,7 @@ static int src_toggle_init(void)
 #define SRC_TOGGLE_AVAILABLE 0
 static int src_toggle_init(void)
 {
-	printk("SRC toggle: sw4/led1 not available\n");
+	printk("SRC toggle: unavailable on selected codec\n");
 	return 0;
 }
 #endif

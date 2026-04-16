@@ -68,6 +68,25 @@ config LC3_DEC_CHAN_MAX
 
 endif
 
+choice GRPTLK_AUDIO_CODEC
+	prompt "Hardware audio codec"
+	default GRPTLK_AUDIO_CODEC_CIRRUS
+
+config GRPTLK_AUDIO_CODEC_CIRRUS
+	bool "Cirrus CS47L63"
+	help
+	  Use the nRF5340 Audio DK's onboard CS47L63 codec backend.
+
+config GRPTLK_AUDIO_CODEC_MAX9867
+	bool "MAX9867"
+	help
+	  Use the sample-local MAX9867 backend with the analog microphone
+	  wired to MICRP. Build with FILE_SUFFIX=max9867 (or the legacy
+	  FILE_SUFFIX=le_audio_playground alias) so the sample picks up the
+	  external-codec devicetree overlay.
+
+endchoice
+
 config GRPTLK_DEBUG_GPIO
 	bool "Enable debug GPIO pins for logic analyzer"
 	default n
@@ -109,12 +128,26 @@ config NRFX_I2S0
 config NRFX_CLOCK
 	default y
 
+config I2C
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config I2C_NRFX
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config NRFX_TWIM
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config NRFX_TWIM1
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
 config BT_ISO_MAX_CHAN
 	int
 	default GRPTLK_NUM_CHAN
 
 config HW_CODEC_CIRRUS_LOGIC
-	default y
+	depends on GRPTLK_AUDIO_CODEC_CIRRUS
+	default y if GRPTLK_AUDIO_CODEC_CIRRUS
+	default n if GRPTLK_AUDIO_CODEC_MAX9867
 
 config GRPTLK_UPLINK_BIS
 	int "Static uplink BIS index (1-based, BIS1 is downlink)"
@@ -144,13 +177,16 @@ config GRPTLK_UPLINK_RANDOM_PER_PTT
 	  A new random BIS is selected each time PTT is released and pressed again.
 
 config GRPTLK_AUDIO_SOURCE_LINE_IN
-	bool "Boot with LINE-IN as audio source (instead of PDM mic)"
+	bool "Boot with LINE-IN as audio source on CS47L63 builds"
+	default y if BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP && GRPTLK_AUDIO_CODEC_CIRRUS
 	default n
-	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP && HW_CODEC_CIRRUS_LOGIC
+	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP && HW_CODEC_CIRRUS_LOGIC && \
+		GRPTLK_AUDIO_CODEC_CIRRUS
 	help
-	  When enabled the CS47L63 codec is configured for the 3.5 mm LINE-IN
-	  jack (IN2L/IN2R) at startup instead of the onboard PDM microphone.
-	  Can be overridden at runtime with BTN5.
+	  When enabled, the CS47L63 path prefers the 3.5 mm LINE-IN jack
+	  (IN2L/IN2R) instead of the onboard digital microphone. Can be
+	  overridden at runtime with BTN5. MAX9867 builds always use the
+	  analog MICRP path and do not support source switching.
 
 endif # GRPTLK
 

@@ -90,7 +90,7 @@ static struct bt_bap_lc3_preset preset_active = BT_BAP_LC3_BROADCAST_PRESET_16_2
 #define GRPTLK_CODEC_INTERVAL_US 5000U
 #define GRPTLK_CODEC_SDU_BYTES	 20U
 #endif
-#define GRPTLK_DOWNLINK_APPENDIX_LEN	      4U
+#define GRPTLK_DOWNLINK_APPENDIX_LEN	  4U
 #define GRPTLK_MAX_UPLINK_BIS_BITMAP_BITS 30U
 
 #if defined(CONFIG_GRPTLK_AUDIO_FRAME_5_MS)
@@ -341,11 +341,19 @@ static void audio_rx_mono_frame(const int16_t *mono_frame)
 	k_sem_give(&mic_frame_sem);
 
 	if ((rx_frame_cnt++ % 200U) == 0U) {
-		int32_t sum = 0;
+		int32_t abs_sum = 0;
+		int32_t peak = 0;
 		for (int i = 0; i < 8; i++) {
-			sum += mono_frame[i];
+			int32_t sample = mono_frame[i];
+			int32_t abs_sample = (sample < 0) ? -sample : sample;
+
+			abs_sum += abs_sample;
+			if (abs_sample > peak) {
+				peak = abs_sample;
+			}
 		}
-		printk("[mic] frame=%u, samples[0-7].sum=%d\n", rx_frame_cnt, sum);
+		printk("[mic] frame=%u, samples[0-7].abs_sum=%d peak=%d\n", rx_frame_cnt, abs_sum,
+		       peak);
 	}
 }
 
@@ -355,8 +363,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 	int16_t mono_pcm[AUDIO_SAMPLES_PER_FRAME];
 	static uint32_t rx_frame_cnt;
 	static uint32_t downlink_appendix_log_cnt;
-	static uint32_t rx_plc_cnt;	/* frames decoded via PLC (no real packet) */
-	static uint32_t rx_dec_err_cnt; /* lc3_decode() hard failures */
+	static uint32_t rx_plc_cnt;	   /* frames decoded via PLC (no real packet) */
+	static uint32_t rx_dec_err_cnt;	   /* lc3_decode() hard failures */
 	static uint32_t rx_frame_drop_cnt; /* whole decoded frame dropped */
 
 	ARG_UNUSED(arg1);
@@ -383,8 +391,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 		uint16_t pcm_len;
 		bool bad_frame = (lc3_data == NULL);
 
-		ret = sw_codec_lc3_dec_run(lc3_data, lc3_len, sizeof(mono_pcm),
-					   0, mono_pcm, &pcm_len, bad_frame);
+		ret = sw_codec_lc3_dec_run(lc3_data, lc3_len, sizeof(mono_pcm), 0, mono_pcm,
+					   &pcm_len, bad_frame);
 #else
 		ret = lc3_decode(lc3_decoder, lc3_data, lc3_len, LC3_PCM_FORMAT_S16, mono_pcm, 1);
 #endif
@@ -456,7 +464,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 	while (1) {
 		int ret;
-		struct audio_encoded_frame ef = { 0 };
+		struct audio_encoded_frame ef = {0};
 
 		k_sem_take(&mic_frame_sem, K_FOREVER);
 
@@ -501,8 +509,8 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 		/* Verify encoded size matches expected */
 		if (encoded_len != octets_per_frame) {
-			printk("[enc] LC3 encode size mismatch: got %u, expected %d\n",
-			       encoded_len, octets_per_frame);
+			printk("[enc] LC3 encode size mismatch: got %u, expected %d\n", encoded_len,
+			       octets_per_frame);
 		}
 #else
 		ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, local_pcm, 1, octets_per_frame,
@@ -861,7 +869,8 @@ static int base_log_service_data(const struct bt_data *data)
 		{
 			uint16_t octets_per_frame;
 
-			if (base_extract_octets_per_frame(codec_cfg, codec_cfg_len, &octets_per_frame)) {
+			if (base_extract_octets_per_frame(codec_cfg, codec_cfg_len,
+							  &octets_per_frame)) {
 				update_downlink_codec_sdu_bytes(octets_per_frame);
 			}
 		}
@@ -1111,8 +1120,8 @@ static int lc3_workers_start(void)
 		return err;
 	}
 
-	err = sw_codec_lc3_enc_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
-				    32000, 1, &t2_pcm_bytes_req);
+	err = sw_codec_lc3_enc_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval, 32000, 1,
+				    &t2_pcm_bytes_req);
 	if (err) {
 		printk("sw_codec_lc3_enc_init failed: %d\n", err);
 		return err;
@@ -1309,7 +1318,8 @@ int main(void)
 			goto per_sync_lost_check;
 		}
 
-		err = sw_codec_lc3_dec_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval, 1);
+		err = sw_codec_lc3_dec_init(AUDIO_SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
+					    1);
 		if (err) {
 			printk("sw_codec_lc3_dec_init re-init failed: %d\n", err);
 			goto per_sync_lost_check;
