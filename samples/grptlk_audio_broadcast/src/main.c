@@ -28,8 +28,8 @@
 
 #define VOLUME_STEP_DB 3
 
-#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
-	DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && DT_NODE_HAS_STATUS(DT_ALIAS(sw0), okay) &&            \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw1), okay)
 #define VOL_BTN_AVAILABLE 1
 static const struct gpio_dt_spec vol_dn_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec vol_up_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -179,8 +179,8 @@ static int ptt_init(void)
 
 /* PTT lock toggle: BTN4 (sw3) cycles between PTT mode and always-TX mode.
  * When lock is active, LED1 (led0/rgb1_red) is lit and mic always transmits. */
-#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
-	DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && DT_NODE_HAS_STATUS(DT_ALIAS(sw3), okay) &&            \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay)
 #define PTT_LOCK_AVAILABLE 1
 static const struct gpio_dt_spec ptt_lock_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
 static const struct gpio_dt_spec ptt_lock_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
@@ -257,8 +257,9 @@ static int ptt_lock_init(void)
 #endif
 }
 
-/* Input source toggle: BTN5 (sw4) switches between PDM mic and line-in. */
-#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && \
+/* Input source toggle: BTN5 (sw4) switches between PDM mic and line-in.
+ * Only available on CS47L63 builds; MAX9867 is a fixed-source backend. */
+#if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && defined(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS) &&          \
 	DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
 #define SRC_TOGGLE_AVAILABLE 1
 static const struct gpio_dt_spec src_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
@@ -460,8 +461,8 @@ static K_SEM_DEFINE(decoder_proceed_sem, 0, 1); /* Decoder signals encoder */
 
 #if defined(CONFIG_GRPTLK_DOWNLINK_APPENDIX)
 #define GRPTLK_DOWNLINK_APPENDIX_ACTIVITY_HOLD_INTERVALS 6U
-BUILD_ASSERT(NUM_RX_BIS <= 30U,
-	     "GRPTLK_DOWNLINK_APPENDIX supports up to 30 uplink BISes (31 BIS BIG with BIS1 as downlink)");
+BUILD_ASSERT(NUM_RX_BIS <= 30U, "GRPTLK_DOWNLINK_APPENDIX supports up to 30 uplink BISes (31 BIS "
+				"BIG with BIS1 as downlink)");
 static bool uplink_interval_valid[NUM_RX_BIS];
 static uint8_t uplink_recent_age[NUM_RX_BIS];
 static bool uplink_recent_active[NUM_RX_BIS];
@@ -492,7 +493,8 @@ static void finalize_uplink_activity_interval(void)
 			uplink_recent_age[i] = 0U;
 			uplink_recent_active[i] = true;
 		} else if (uplink_recent_active[i]) {
-			if (uplink_recent_age[i] >= GRPTLK_DOWNLINK_APPENDIX_ACTIVITY_HOLD_INTERVALS) {
+			if (uplink_recent_age[i] >=
+			    GRPTLK_DOWNLINK_APPENDIX_ACTIVITY_HOLD_INTERVALS) {
 				uplink_recent_active[i] = false;
 			} else {
 				uplink_recent_age[i]++;
@@ -622,9 +624,8 @@ static int reset_uplink_decoder_state(uint8_t bis_idx)
 
 	return err;
 #else
-	lc3_decoders[bis_idx] =
-		lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
-				  &lc3_decoder_mem[bis_idx]);
+	lc3_decoders[bis_idx] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
+						  &lc3_decoder_mem[bis_idx]);
 	if (lc3_decoders[bis_idx] == NULL) {
 		printk("[uplink-reset] lc3_setup_decoder reset failed for BIS%u\n", bis_idx + 2U);
 		return -EIO;
@@ -700,7 +701,7 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		uint16_t encoded_len;
 
 		ret = sw_codec_lc3_enc_run(local_pcm, sizeof(local_pcm), LC3_USE_BITRATE_FROM_INIT,
-					    0, sizeof(encoded_shared), encoded_shared, &encoded_len);
+					   0, sizeof(encoded_shared), encoded_shared, &encoded_len);
 		uint32_t enc_us = k_cyc_to_us_floor32(k_cycle_get_32() - t0);
 
 		if (ret) {
@@ -795,8 +796,9 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 							   decoded_pcm[i], &pcm_len, true);
 			} else {
 				/* Valid packet - normal decode from the LC3 portion only */
-				ret = sw_codec_lc3_dec_run(frame->data, lc3_len, sizeof(decoded_pcm[i]),
-							   i, decoded_pcm[i], &pcm_len, false);
+				ret = sw_codec_lc3_dec_run(frame->data, lc3_len,
+							   sizeof(decoded_pcm[i]), i,
+							   decoded_pcm[i], &pcm_len, false);
 			}
 			if (ret) {
 				printk("sw_codec_lc3_dec_run failed for BIS%d: %d\n", i, ret);
@@ -827,8 +829,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < NUM_RX_BIS; i++) {
 				struct bis_prr_tracker *tracker = &prr_trackers[i];
 				uint8_t valid_count = 0;
-				uint8_t window_size =
-					tracker->window_filled ? PRR_WINDOW_SIZE : tracker->window_idx;
+				uint8_t window_size = tracker->window_filled ? PRR_WINDOW_SIZE
+									     : tracker->window_idx;
 
 				for (int j = 0; j < window_size; j++) {
 					valid_count += tracker->window[j];
@@ -863,8 +865,8 @@ static void decoder_thread_func(void *arg1, void *arg2, void *arg3)
 				/* Sum only valid BISes for this sample */
 				for (int i = 0; i < NUM_RX_BIS; i++) {
 					if (bis_valid[i]) {
-						mixed_sample +=
-							decoded_pcm[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
+						mixed_sample += decoded_pcm
+							[i][blk * AUDIO_I2S_SAMPLES_PER_BLOCK + j];
 					}
 				}
 
@@ -1054,8 +1056,8 @@ static void iso_recv(struct bt_iso_chan *chan, const struct bt_iso_recv_info *in
 	/* Relay mode: forward raw LC3 bytes directly to TX thread, or pre-encoded silence. */
 	{
 		const uint8_t *relay_src = valid ? buf->data : lc3_silence_frame;
-		uint16_t relay_len = valid ? MIN(buf->len, sizeof(encoded_shared))
-					   : sizeof(encoded_shared);
+		uint16_t relay_len =
+			valid ? MIN(buf->len, sizeof(encoded_shared)) : sizeof(encoded_shared);
 
 		memcpy(encoded_shared, relay_src, relay_len);
 		atomic_set(&encoded_data_ready, 1);
@@ -1370,8 +1372,8 @@ int main(void)
 		return err;
 	}
 
-	err = sw_codec_lc3_enc_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
-				     32000, 1, &t2_pcm_bytes_req);
+	err = sw_codec_lc3_enc_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, 32000, 1,
+				    &t2_pcm_bytes_req);
 	if (err) {
 		printk("sw_codec_lc3_enc_init failed: %d\n", err);
 		return err;
@@ -1392,42 +1394,41 @@ int main(void)
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 		uint16_t silence_len;
 
-		sw_codec_lc3_enc_run(silence_pcm, sizeof(silence_pcm), LC3_USE_BITRATE_FROM_INIT,
-				     0, sizeof(lc3_silence_frame), lc3_silence_frame, &silence_len);
+		sw_codec_lc3_enc_run(silence_pcm, sizeof(silence_pcm), LC3_USE_BITRATE_FROM_INIT, 0,
+				     sizeof(lc3_silence_frame), lc3_silence_frame, &silence_len);
 #else
-		lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, silence_pcm, 1,
-			   preset_active.qos.sdu, lc3_silence_frame);
+		lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, silence_pcm, 1, preset_active.qos.sdu,
+			   lc3_silence_frame);
 #endif
 		printk("[relay] LC3 silence frame pre-encoded (%u bytes)\n",
 		       (unsigned)sizeof(lc3_silence_frame));
 	}
 #endif
 
-	#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
-		/* T2 LC3 decoder init */
-		err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval,
-					    NUM_RX_BIS);
-		if (err) {
-			printk("sw_codec_lc3_dec_init failed: %d\n", err);
-			return err;
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+	/* T2 LC3 decoder init */
+	err = sw_codec_lc3_dec_init(SAMPLE_RATE_HZ, 16, preset_active.qos.interval, NUM_RX_BIS);
+	if (err) {
+		printk("sw_codec_lc3_dec_init failed: %d\n", err);
+		return err;
+	}
+#else
+	/* Setup LC3 decoders for each uplink BIS */
+	for (int i = 0; i < NUM_RX_BIS; i++) {
+		lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
+						    &lc3_decoder_mem[i]);
+		if (lc3_decoders[i] == NULL) {
+			printk("Failed to setup LC3 decoder %d\n", i);
+			return -EIO;
 		}
-	#else
-		/* Setup LC3 decoders for each uplink BIS */
-		for (int i = 0; i < NUM_RX_BIS; i++) {
-			lc3_decoders[i] = lc3_setup_decoder(preset_active.qos.interval, SAMPLE_RATE_HZ, 0,
-							    &lc3_decoder_mem[i]);
-			if (lc3_decoders[i] == NULL) {
-				printk("Failed to setup LC3 decoder %d\n", i);
-				return -EIO;
-			}
-		}
-	#endif
+	}
+#endif
 
-	#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
+#if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 	printk("LC3 codec: T2 Software LC3\n");
-	#else
+#else
 	printk("LC3 codec: Open-source liblc3\n");
-	#endif
+#endif
 #if defined(CONFIG_GRPTLK_INIT_LC3_CONSTANTLY)
 	printk("Uplink decoder mode: reset per-BIS decoder on valid packets, silence on misses\n");
 #else

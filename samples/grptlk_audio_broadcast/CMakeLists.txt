@@ -41,24 +41,6 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_broadcast)
 
-# Supported targets:
-#   nrf5340_audio_dk/nrf5340/cpuapp  — local audio I/O + CS47L63 backend
-#   nrf5340dk/nrf5340/cpuapp         — relay mode (no local audio I/O)
-#
-# Source tree layout:
-#   src/
-#     main.c                         — BLE BIG broadcaster + LC3 threads
-#     audio/
-#       audio.h                      — public audio API (init/start/volume)
-#       backends/cs47l63.c           — CS47L63 codec backend (I2S DMA, mic, DAC)
-#       backends/cs47l63_reg_conf.h  — CS47L63 register configuration tables
-#       drivers/audio_i2s.c          — nrfx I2S DMA low-level driver
-#       drivers/audio_i2s.h
-#       drivers/cs47l63_comm.c       — CS47L63 SPI communication layer
-#       drivers/cs47l63_comm.h
-#     io/
-#       led.c / led.h                — broadcast status LED
-
 target_include_directories(app PRIVATE src)
 
 # Common sources (all boards)
@@ -68,25 +50,32 @@ target_sources(app PRIVATE
   src/io/debug_gpio.c
 )
 
-# Local audio path uses the real codec backend; relay-only path uses stubs.
+# Local audio path uses the selected codec backend; relay-only path uses stubs.
 if(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
-  if(CONFIG_HW_CODEC_CIRRUS_LOGIC)
-    target_sources(app PRIVATE
-      src/audio/backends/cs47l63.c
-      src/audio/drivers/audio_i2s.c
-      src/audio/drivers/cs47l63_comm.c
-      src/audio/sync/clk_sync.c
-    )
+  target_sources(app PRIVATE
+    src/audio/audio.c
+    src/audio/drivers/audio_i2s.c
+    src/audio/sync/clk_sync.c
+  )
 
+  if(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS)
     if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
       message(FATAL_ERROR
         "cirrus-logic module not found (ZEPHYR_CIRRUS_LOGIC_MODULE_DIR missing)")
     endif()
 
+    target_sources(app PRIVATE
+      src/audio/backends/cs47l63.c
+      src/audio/drivers/cs47l63_comm.c
+    )
+
     add_subdirectory(${ZEPHYR_CIRRUS_LOGIC_MODULE_DIR} cirrus_logic_bin_dir)
+  elseif(CONFIG_GRPTLK_AUDIO_CODEC_MAX9867)
+    target_sources(app PRIVATE
+      src/audio/backends/max9867.c
+    )
   else()
-    message(FATAL_ERROR
-      "CONFIG_GRPTLK_LOCAL_AUDIO_IO requires a local audio backend")
+    message(FATAL_ERROR "No GRPTLK audio codec backend selected")
   endif()
 else()
   target_sources(app PRIVATE

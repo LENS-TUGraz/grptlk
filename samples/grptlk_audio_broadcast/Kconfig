@@ -141,7 +141,7 @@ config NRFX_CLOCK
 
 config GRPTLK_LOCAL_AUDIO_IO
 	bool "Enable local audio I/O"
-	default y if HW_CODEC_CIRRUS_LOGIC
+	default y if BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
 	default n
 	help
 	  Enable local audio capture/playback plumbing for boards that have a
@@ -150,16 +150,29 @@ config GRPTLK_LOCAL_AUDIO_IO
 
 if GRPTLK_LOCAL_AUDIO_IO
 
-if HW_CODEC_CIRRUS_LOGIC
+choice GRPTLK_AUDIO_CODEC
+	prompt "Hardware audio codec"
+	default GRPTLK_AUDIO_CODEC_CIRRUS
 
-config GRPTLK_AUDIO_SOURCE_LINE_IN
-	bool "Use 3.5mm line-in as audio source (instead of PDM mic)"
-	default n
-	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP
+config GRPTLK_AUDIO_CODEC_CIRRUS
+	bool "Cirrus CS47L63"
 	help
-	  When enabled, configures the CS47L63 to capture audio from the
-	  3.5mm analog line-in jack instead of the onboard PDM microphone.
-	  Connect a line-level source to J5 on the nRF5340 Audio DK.
+	  Use the nRF5340 Audio DK's onboard CS47L63 codec backend.
+
+config GRPTLK_AUDIO_CODEC_MAX9867
+	bool "MAX9867"
+	help
+	  Use the sample-local MAX9867 backend on the LE Audio Playground
+	  board. Build with FILE_SUFFIX=max9867 (or the legacy
+	  FILE_SUFFIX=le_audio_playground alias) so the sample picks up the
+	  external-codec devicetree overlay.
+
+endchoice
+
+config HW_CODEC_CIRRUS_LOGIC
+	depends on GRPTLK_AUDIO_CODEC_CIRRUS
+	default y if GRPTLK_AUDIO_CODEC_CIRRUS
+	default n if GRPTLK_AUDIO_CODEC_MAX9867
 
 config NRFX_I2S
 	default y
@@ -167,7 +180,28 @@ config NRFX_I2S
 config NRFX_I2S0
 	default y
 
-endif # HW_CODEC_CIRRUS_LOGIC
+config I2C
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config I2C_NRFX
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config NRFX_TWIM
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config NRFX_TWIM1
+	default y if GRPTLK_AUDIO_CODEC_MAX9867
+
+config GRPTLK_AUDIO_SOURCE_LINE_IN
+	bool "Use 3.5mm line-in as audio source (instead of PDM mic)"
+	default n
+	depends on BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP && GRPTLK_AUDIO_CODEC_CIRRUS
+	help
+	  When enabled, configures the CS47L63 to capture audio from the
+	  3.5mm analog line-in jack instead of the onboard PDM microphone.
+	  Connect a line-level source to J5 on the nRF5340 Audio DK. MAX9867
+	  builds always use the analog MICRP path and do not support source
+	  switching.
 
 endif # GRPTLK_LOCAL_AUDIO_IO
 
