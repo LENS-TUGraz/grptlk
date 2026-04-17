@@ -14,6 +14,9 @@
 #include "audio/sync/clk_sync.h"
 #include "io/led.h"
 #include "io/debug_gpio.h"
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+#include "vad/vad.h"
+#endif
 #include <stdint.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -119,14 +122,14 @@ static int vol_buttons_init(void)
 
 #if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 /* Input source toggle: boot default is MIC. */
-static atomic_t src_line_in_active = ATOMIC_INIT(0);
+atomic_t src_line_in_active = ATOMIC_INIT(0);
 
 /* PTT button (BTN3 = sw2): PTT starts inactive at boot. */
 #if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO) && DT_NODE_HAS_STATUS(DT_ALIAS(sw2), okay)
 #define PTT_AVAILABLE 1
 static const struct gpio_dt_spec ptt_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 static struct gpio_callback ptt_cb_data;
-static atomic_t ptt_active = ATOMIC_INIT(0);
+atomic_t ptt_active = ATOMIC_INIT(0);
 
 static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
@@ -143,7 +146,7 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 }
 #else
 #define PTT_AVAILABLE 0
-static atomic_t ptt_active = ATOMIC_INIT(1);
+atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
 static int ptt_init(void)
@@ -194,7 +197,7 @@ static struct k_work ptt_lock_toggle_work;
 static struct k_work_delayable ptt_lock_long_work;
 static atomic_t ptt_lock_long_fired = ATOMIC_INIT(0);
 static const struct gpio_dt_spec ptt_vad_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-static atomic_t ptt_vad_active = ATOMIC_INIT(0);
+atomic_t ptt_vad_active = ATOMIC_INIT(0);
 #else
 #define PTT_VAD_AVAILABLE 0
 #endif
@@ -237,6 +240,7 @@ static void ptt_lock_long_work_handler(struct k_work *work)
 		atomic_set(&ptt_vad_active, 0);
 		gpio_pin_set_dt(&ptt_vad_led, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
+		vad_reset();
 		printk("[PTT-VAD] disabled\n");
 	} else {
 		atomic_set(&ptt_vad_active, 1);
@@ -732,6 +736,12 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 
 #if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
+
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+		if (atomic_get(&ptt_vad_active)) {
+			vad_process_frame(local_pcm, AUDIO_SAMPLES_PER_FRAME);
+		}
+#endif
 
 		/* PTT gate: broadcast silence when button is not held.
 		 * Bypassed in LINE-IN mode — audio transmits unconditionally.
@@ -1397,6 +1407,14 @@ int main(void)
 #if defined(CONFIG_GRPTLK_LOCAL_AUDIO_IO)
 	(void)ptt_init();
 	(void)ptt_lock_init();
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+	err = vad_init(CONFIG_GRPTLK_VAD_AGGRESSIVENESS,
+		       CONFIG_GRPTLK_VAD_ONSET_FRAMES,
+		       CONFIG_GRPTLK_VAD_HANGOVER_FRAMES, NULL);
+	if (err) {
+		printk("vad_init failed: %d\n", err);
+	}
+#endif
 #endif
 
 	/* Debug GPIO (optional, for logic analyzer timing analysis) */
