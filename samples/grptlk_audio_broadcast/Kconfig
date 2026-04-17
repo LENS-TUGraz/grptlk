@@ -19,7 +19,7 @@ endchoice
 
 config GRPTLK_NUM_CHAN
 	int "Number of ISO channels (BISes)"
-	default 2
+	default 5
 	range 2 5
 	help
 	  Number of isochronous channels to support. Includes 1 downlink BIS
