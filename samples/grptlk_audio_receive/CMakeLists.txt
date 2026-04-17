@@ -21,6 +21,27 @@ target_sources(app PRIVATE
   src/audio/sync/clk_sync.c
 )
 
+if(CONFIG_GRPTLK_PTT_VAD)
+  target_sources(app PRIVATE
+    src/vad/vad.c
+    src/vad/fvad/fvad.c
+    src/vad/fvad/vad/vad_core.c
+    src/vad/fvad/vad/vad_filterbank.c
+    src/vad/fvad/vad/vad_gmm.c
+    src/vad/fvad/vad/vad_sp.c
+    src/vad/fvad/signal_processing/division_operations.c
+    src/vad/fvad/signal_processing/energy.c
+    src/vad/fvad/signal_processing/get_scaling_square.c
+    src/vad/fvad/signal_processing/resample_48khz.c
+    src/vad/fvad/signal_processing/resample_by_2_internal.c
+    src/vad/fvad/signal_processing/resample_fractional.c
+    src/vad/fvad/signal_processing/spl_inl.c
+  )
+  target_include_directories(app PRIVATE
+    src/vad/fvad
+  )
+endif()
+
 if(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS)
   if(NOT ZEPHYR_CIRRUS_LOGIC_MODULE_DIR)
     message(FATAL_ERROR

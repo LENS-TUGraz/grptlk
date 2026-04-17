@@ -22,6 +22,9 @@
 #include "io/buttons.h"
 #include "io/led.h"
 #include "io/debug_gpio.h"
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+#include "vad/vad.h"
+#endif
 
 #if defined(CONFIG_GRPTLK_LC3_CODEC_T2)
 #include "sw_codec_lc3.h"
@@ -473,6 +476,12 @@ static void encoder_thread_func(void *arg1, void *arg2, void *arg3)
 		}
 
 		memcpy(local_pcm, mic_pcm_shared, sizeof(local_pcm));
+
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+		if (atomic_get(&ptt_vad_active)) {
+			vad_process_frame(local_pcm, AUDIO_SAMPLES_PER_FRAME);
+		}
+#endif
 
 		static uint32_t enc_dbg_cnt;
 		int32_t pcm_sum = 0;
@@ -1199,6 +1208,15 @@ int main(void)
 		printk("buttons_init failed: %d\n", err);
 		return err;
 	}
+
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+	err = vad_init(CONFIG_GRPTLK_VAD_AGGRESSIVENESS,
+		       CONFIG_GRPTLK_VAD_ONSET_FRAMES,
+		       CONFIG_GRPTLK_VAD_HANGOVER_FRAMES, &tx_sem);
+	if (err) {
+		printk("vad_init failed: %d\n", err);
+	}
+#endif
 
 	/* Debug GPIO (optional, for logic analyzer timing analysis) */
 	(void)debug_gpio_init();

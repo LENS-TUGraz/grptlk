@@ -196,6 +196,48 @@ config GRPTLK_PTT_VAD
 	  presses. Short press (<800 ms) toggles PTT-lock as usual. Long press
 	  (>=800 ms) toggles VAD mode (green LED) instead of toggling the lock.
 
+if GRPTLK_PTT_VAD
+
+config GRPTLK_VAD_AGGRESSIVENESS
+	int "VAD aggressiveness (0=quality, 3=aggressive filtering)"
+	default 2
+	range 0 3
+	help
+	  Controls libfvad filtering mode. 0 preserves more speech at the cost
+	  of more false triggers, 3 aggressively filters noise but may clip
+	  quiet speech. 2 is a good default for noisy environments.
+
+config GRPTLK_VAD_ONSET_FRAMES
+	int "VAD onset frames (consecutive speech before TX activation)"
+	default 3
+	range 1 10
+	help
+	  Number of consecutive 10 ms speech frames required before the VOX
+	  state machine activates PTT. Higher values reduce false triggers
+	  but increase onset latency. 3 = 30 ms onset delay.
+
+config GRPTLK_VAD_HANGOVER_FRAMES
+	int "VAD hangover frames (silence before TX deactivation)"
+	default 30
+	range 5 100
+	help
+	  Number of consecutive 10 ms silence frames after last detected speech
+	  before PTT is deactivated. Prevents TX from cutting off during
+	  natural speech pauses. 30 = 300 ms hangover.
+
+config GRPTLK_VAD_ENERGY_THRESHOLD
+	int "VAD energy gate — minimum peak amplitude to consider speech"
+	default 200
+	range 0 10000
+	help
+	  Frames whose peak absolute sample value is below this threshold are
+	  forced to silence regardless of what libfvad reports. Filters out
+	  low-level background noise that the VAD algorithm still triggers on.
+	  0 disables the energy gate. Typical mic noise floor is 50-150;
+	  200 is a conservative default. Raise for noisier environments.
+
+endif # GRPTLK_PTT_VAD
+
 endif # GRPTLK
 
 source "Kconfig.zephyr"

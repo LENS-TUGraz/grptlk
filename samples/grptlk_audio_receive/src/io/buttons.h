@@ -6,6 +6,10 @@
 extern atomic_t ptt_active;
 extern atomic_t src_line_in_active;
 
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+extern atomic_t ptt_vad_active;
+#endif
+
 int buttons_init(struct k_sem *tx_sem);
 
 #endif /* GRPTLK_BUTTONS_H_ */

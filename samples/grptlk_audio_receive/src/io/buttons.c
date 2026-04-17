@@ -1,6 +1,9 @@
 #include "io/buttons.h"
 #include "audio/audio.h"
 #include "audio/sync/clk_sync.h"
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+#include "vad/vad.h"
+#endif
 
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
@@ -37,7 +40,7 @@ static struct k_work ptt_lock_work;
 static struct k_work_delayable ptt_lock_long_work;
 static atomic_t ptt_lock_long_fired = ATOMIC_INIT(0);
 static const struct gpio_dt_spec ptt_vad_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-static atomic_t ptt_vad_active = ATOMIC_INIT(0);
+atomic_t ptt_vad_active = ATOMIC_INIT(0);
 #else
 #define PTT_VAD_AVAILABLE 0
 #endif
@@ -86,6 +89,7 @@ static void ptt_lock_long_work_handler(struct k_work *work)
 		atomic_set(&ptt_vad_active, 0);
 		gpio_pin_set_dt(&ptt_vad_led, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
+		vad_reset();
 		printk("[PTT-VAD] disabled\n");
 	} else {
 		atomic_set(&ptt_vad_active, 1);
@@ -193,6 +197,12 @@ static void ptt_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 #if PTT_LOCK_AVAILABLE
 	if (atomic_get(&ptt_lock_active)) {
 		return; /* lock owns ptt_active; sw2 is a no-op while engaged */
+	}
+#endif
+
+#if PTT_VAD_AVAILABLE
+	if (atomic_get(&ptt_vad_active)) {
+		return; /* VAD owns ptt_active; sw2 is a no-op while engaged */
 	}
 #endif
 
