@@ -13,5 +13,6 @@
 	aliases {
 		sw3 = &button4;
 		led0 = &rgb1_red;
+		led1 = &rgb1_green;
 	};
 };

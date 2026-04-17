@@ -31,12 +31,29 @@ static struct gpio_callback ptt_lock_cb_data;
 static atomic_t ptt_lock_active = ATOMIC_INIT(0);
 static struct k_work ptt_lock_work;
 
+#if defined(CONFIG_GRPTLK_PTT_VAD) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#define PTT_VAD_AVAILABLE 1
+#define PTT_LOCK_LONG_PRESS_MS 800
+static struct k_work_delayable ptt_lock_long_work;
+static atomic_t ptt_lock_long_fired = ATOMIC_INIT(0);
+static const struct gpio_dt_spec ptt_vad_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static atomic_t ptt_vad_active = ATOMIC_INIT(0);
+#else
+#define PTT_VAD_AVAILABLE 0
+#endif
+
 static void ptt_lock_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	if (atomic_get(&src_line_in_active)) {
 		return; /* PTT-lock is MIC-only */
 	}
+#if PTT_VAD_AVAILABLE
+	if (atomic_get(&ptt_vad_active)) {
+		printk("[PTT-LOCK] blocked — VAD active\n");
+		return;
+	}
+#endif
 	if (atomic_get(&ptt_lock_active)) {
 		atomic_set(&ptt_lock_active, 0);
 		gpio_pin_set_dt(&ptt_lock_led, 0);
@@ -56,14 +73,52 @@ static void ptt_lock_work_handler(struct k_work *work)
 	}
 }
 
+#if PTT_VAD_AVAILABLE
+static void ptt_lock_long_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	atomic_set(&ptt_lock_long_fired, 1);
+	if (atomic_get(&ptt_lock_active)) {
+		printk("[PTT-VAD] blocked — PTT-lock active\n");
+		return;
+	}
+	if (atomic_get(&ptt_vad_active)) {
+		atomic_set(&ptt_vad_active, 0);
+		gpio_pin_set_dt(&ptt_vad_led, 0);
+		gpio_pin_set_dt(&ptt_lock_led, 0);
+		printk("[PTT-VAD] disabled\n");
+	} else {
+		atomic_set(&ptt_vad_active, 1);
+		gpio_pin_set_dt(&ptt_vad_led, 1);
+		gpio_pin_set_dt(&ptt_lock_led, 1);
+		printk("[PTT-VAD] enabled\n");
+	}
+}
+#endif
+
 static void ptt_lock_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
+#if PTT_VAD_AVAILABLE
+	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
+		atomic_set(&ptt_lock_long_fired, 0);
+		k_work_schedule(&ptt_lock_long_work, K_MSEC(PTT_LOCK_LONG_PRESS_MS));
+	} else {
+		if (k_work_cancel_delayable(&ptt_lock_long_work) == 0) {
+			/* Timer was still pending → short press */
+			if (!atomic_get(&ptt_lock_long_fired)) {
+				k_work_submit(&ptt_lock_work);
+			}
+		}
+		/* else: long press already fired while held — nothing to do */
+	}
+#else
 	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
 		k_work_submit(&ptt_lock_work);
 	}
+#endif
 }
 
 static int ptt_lock_init(void)
@@ -71,6 +126,9 @@ static int ptt_lock_init(void)
 	int err;
 
 	k_work_init(&ptt_lock_work, ptt_lock_work_handler);
+#if PTT_VAD_AVAILABLE
+	k_work_init_delayable(&ptt_lock_long_work, ptt_lock_long_work_handler);
+#endif
 
 	if (!gpio_is_ready_dt(&ptt_lock_btn) || !gpio_is_ready_dt(&ptt_lock_led)) {
 		printk("PTT-lock GPIO not ready\n");
@@ -86,6 +144,17 @@ static int ptt_lock_init(void)
 		printk("PTT-lock LED configure failed: %d\n", err);
 		return err;
 	}
+#if PTT_VAD_AVAILABLE
+	if (!gpio_is_ready_dt(&ptt_vad_led)) {
+		printk("PTT-VAD LED GPIO not ready\n");
+		return -ENODEV;
+	}
+	err = gpio_pin_configure_dt(&ptt_vad_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		printk("PTT-VAD LED configure failed: %d\n", err);
+		return err;
+	}
+#endif
 	err = gpio_pin_interrupt_configure_dt(&ptt_lock_btn, GPIO_INT_EDGE_BOTH);
 	if (err) {
 		printk("PTT-lock interrupt configure failed: %d\n", err);

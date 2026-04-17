@@ -205,6 +205,14 @@ config GRPTLK_AUDIO_SOURCE_LINE_IN
 
 endif # GRPTLK_LOCAL_AUDIO_IO
 
+config GRPTLK_PTT_VAD
+	bool "PTT VAD mode (long-press detection on PTT-lock button)"
+	default y
+	help
+	  When enabled, the PTT-lock button (sw3) distinguishes short and long
+	  presses. Short press (<800 ms) toggles PTT-lock as usual. Long press
+	  (>=800 ms) toggles VAD mode (green LED) instead of toggling the lock.
+
 endif # GRPTLK
 
 source "Kconfig.zephyr"
