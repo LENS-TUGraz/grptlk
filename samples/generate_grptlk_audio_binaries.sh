@@ -7,6 +7,7 @@ WORKSPACE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SAMPLES_DIR="${WORKSPACE}/grptlk/samples"
 BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
+CHANNELS=("5" "2")
 
 BUILD_JOBS=(
   # Nordic nRF5340 Audio DK variants
@@ -59,42 +60,67 @@ ALL_BINS_DIR="${BINARIES_DIR}/all_bins"
 rm -rf "${BINARIES_DIR}"
 mkdir -p "${ALL_BINS_DIR}"
 
-TOTAL=${#BUILD_JOBS[@]}
+# Count broadcaster jobs for total calculation
+BCST_COUNT=0
+for job in "${BUILD_JOBS[@]}"; do
+  IFS='|' read -r sn _ _ _ <<< "${job}"
+  [[ "${sn}" == "grptlk_audio_broadcast" ]] && ((BCST_COUNT++))
+done
+RECV_COUNT=$(( ${#BUILD_JOBS[@]} - BCST_COUNT ))
+TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT ))
 BUILT=()
+IDX=0
 
-for i in "${!BUILD_JOBS[@]}"; do
-  JOB="${BUILD_JOBS[$i]}"
-  IDX=$((i + 1))
+for ch in "${CHANNELS[@]}"; do
+  for i in "${!BUILD_JOBS[@]}"; do
+    JOB="${BUILD_JOBS[$i]}"
 
-  IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE OUTPUT_HEX <<< "${JOB}"
+    IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${JOB}"
 
-  SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
-  BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
+    # Receiver built once (syncs to whatever BIG exists) — skip extra channel counts
+    if [[ "${SAMPLE_NAME}" != "grptlk_audio_broadcast" && "${ch}" != "5" ]]; then
+      continue
+    fi
 
-  info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
+    IDX=$((IDX + 1))
 
-  [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
+    # Broadcaster: inject channel count flag and add _Xch suffix
+    # Receiver: keep original name, no channel flag (adapts to BIG)
+    if [[ "${SAMPLE_NAME}" == "grptlk_audio_broadcast" ]]; then
+      EXTRA_CMAKE="${EXTRA_CMAKE} -DCONFIG_GRPTLK_NUM_CHAN=${ch}"
+      OUTPUT_HEX="${BASE_HEX%.hex}_${ch}ch.hex"
+    else
+      OUTPUT_HEX="${BASE_HEX}"
+    fi
 
-  (
-    cd "${SAMPLE_DIR}"
-    west build \
-      --pristine always \
-      --board "${BOARD}" \
-      --build-dir "${BUILD_DIR_NAME}" \
-      -- ${EXTRA_CMAKE}
-  )
+    SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
+    BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
 
-  HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
-  APP_HEX="${BUILD_DIR}/${SAMPLE_NAME}/zephyr/zephyr.hex"
-  OUT_HEX="${ALL_BINS_DIR}/${OUTPUT_HEX}"
+    info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=${ch}  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
 
-  [[ -f "${HCI_HEX}" ]] || fail "hci_ipc hex not found: ${HCI_HEX}"
-  [[ -f "${APP_HEX}" ]] || fail "App hex not found: ${APP_HEX}"
+    [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
 
-  mergehex -m "${HCI_HEX}" "${APP_HEX}" -o "${OUT_HEX}"
+    (
+      cd "${SAMPLE_DIR}"
+      west build \
+        --pristine always \
+        --board "${BOARD}" \
+        --build-dir "${BUILD_DIR_NAME}" \
+        -- ${EXTRA_CMAKE}
+    )
 
-  log "Merged → ${OUT_HEX}"
-  BUILT+=("${OUTPUT_HEX}")
+    HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
+    APP_HEX="${BUILD_DIR}/${SAMPLE_NAME}/zephyr/zephyr.hex"
+    OUT_HEX="${ALL_BINS_DIR}/${OUTPUT_HEX}"
+
+    [[ -f "${HCI_HEX}" ]] || fail "hci_ipc hex not found: ${HCI_HEX}"
+    [[ -f "${APP_HEX}" ]] || fail "App hex not found: ${APP_HEX}"
+
+    mergehex -m "${HCI_HEX}" "${APP_HEX}" -o "${OUT_HEX}"
+
+    log "Merged → ${OUT_HEX}"
+    BUILT+=("${OUTPUT_HEX}")
+  done
 done
 
 info "Build complete — ${#BUILT[@]}/${TOTAL} binaries in all_bins/"
@@ -133,11 +159,14 @@ for device in "${DEVICES[@]}"; do
       dest="${BINARIES_DIR}/${device}/${timing}/${strategy}"
       mkdir -p "${dest}"
 
-      # Broadcaster — always exists for every strategy
-      bcst_src="$(find_bin "grptlk_bcst_${device}_${tag}_${strategy}.hex")"
-      cp "${bcst_src}" "${dest}/bcst_${device}_${timing}_${strategy}.hex"
+      # Broadcaster — one binary per channel count
+      for ch in "${CHANNELS[@]}"; do
+        ch_tag="${ch}ch"
+        bcst_src="$(find_bin "grptlk_bcst_${device}_${tag}_${strategy}_${ch_tag}.hex")"
+        cp "${bcst_src}" "${dest}/bcst_${device}_${timing}_${strategy}_${ch_tag}.hex"
+      done
 
-      # Receiver — occupation_aware has no dedicated recv, reuse partly_random
+      # Receiver — single binary (syncs to whatever BIG exists)
       if [[ "${strategy}" == "occupation_aware" ]]; then
         recv_src="$(find_bin "grptlk_recv_${device}_${tag}_partly_random.hex")"
       else

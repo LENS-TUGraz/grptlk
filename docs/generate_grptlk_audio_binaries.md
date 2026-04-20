@@ -6,53 +6,62 @@ The script `samples/generate_grptlk_audio_binaries.sh` builds all GRPTLK audio f
 
 1. Builds every broadcaster + receiver combination using `west build`
 2. Merges each app hex with its `hci_ipc` hex via `mergehex`
-3. Stores all raw build artifacts in `binaries/all_bins/`
-4. Copies and renames binaries into per-device folder structure
+3. Builds broadcaster variants for each channel count (5ch and 2ch)
+4. Stores all raw build artifacts in `binaries/all_bins/`
+5. Copies and renames binaries into per-device folder structure (3 binaries per folder)
 
 ## Output folder structure
 
 ```
 binaries/
-├── all_bins/                              # All 20 raw hex files (original names)
+├── all_bins/                              # All 32 raw hex files (original names)
 │
 ├── nrf5340_audio_dk/
 │   ├── 5ms/
 │   │   ├── fully_random/
-│   │   │   ├── bcst_nrf5340_audio_dk_5ms_fully_random.hex
+│   │   │   ├── bcst_nrf5340_audio_dk_5ms_fully_random_5ch.hex
+│   │   │   ├── bcst_nrf5340_audio_dk_5ms_fully_random_2ch.hex
 │   │   │   └── recv_nrf5340_audio_dk_5ms_fully_random.hex
 │   │   ├── partly_random/
-│   │   │   ├── bcst_nrf5340_audio_dk_5ms_partly_random.hex
+│   │   │   ├── bcst_nrf5340_audio_dk_5ms_partly_random_5ch.hex
+│   │   │   ├── bcst_nrf5340_audio_dk_5ms_partly_random_2ch.hex
 │   │   │   └── recv_nrf5340_audio_dk_5ms_partly_random.hex
 │   │   └── occupation_aware/
-│   │       ├── bcst_nrf5340_audio_dk_5ms_occupation_aware.hex
+│   │       ├── bcst_nrf5340_audio_dk_5ms_occupation_aware_5ch.hex
+│   │       ├── bcst_nrf5340_audio_dk_5ms_occupation_aware_2ch.hex
 │   │       └── recv_nrf5340_audio_dk_5ms_occupation_aware.hex
 │   └── 10ms/
 │       ├── fully_random/
-│       │   ├── bcst_nrf5340_audio_dk_10ms_fully_random.hex
+│       │   ├── bcst_nrf5340_audio_dk_10ms_fully_random_5ch.hex
+│       │   ├── bcst_nrf5340_audio_dk_10ms_fully_random_2ch.hex
 │       │   └── recv_nrf5340_audio_dk_10ms_fully_random.hex
 │       ├── partly_random/
-│       │   ├── bcst_nrf5340_audio_dk_10ms_partly_random.hex
+│       │   ├── bcst_nrf5340_audio_dk_10ms_partly_random_5ch.hex
+│       │   ├── bcst_nrf5340_audio_dk_10ms_partly_random_2ch.hex
 │       │   └── recv_nrf5340_audio_dk_10ms_partly_random.hex
 │       └── occupation_aware/
-│           ├── bcst_nrf5340_audio_dk_10ms_occupation_aware.hex
+│           ├── bcst_nrf5340_audio_dk_10ms_occupation_aware_5ch.hex
+│           ├── bcst_nrf5340_audio_dk_10ms_occupation_aware_2ch.hex
 │           └── recv_nrf5340_audio_dk_10ms_occupation_aware.hex
 │
 └── le_audio_playground/
     ├── 5ms/
-    │   ├── fully_random/ ...
-    │   ├── partly_random/ ...
-    │   └── occupation_aware/ ...
+    │   ├── fully_random/ ...       (3 hex files: 2 bcst + 1 recv)
+    │   ├── partly_random/ ...      (3 hex files)
+    │   └── occupation_aware/ ...   (3 hex files)
     └── 10ms/
-        ├── fully_random/ ...
-        ├── partly_random/ ...
-        └── occupation_aware/ ...
+        ├── fully_random/ ...       (3 hex files)
+        ├── partly_random/ ...      (3 hex files)
+        └── occupation_aware/ ...   (3 hex files)
 ```
 
 ## How to use
 
 1. Navigate to `binaries/<your_device>/<timing>/<strategy>/`
-2. Flash the `bcst_*.hex` file onto the broadcaster device
+2. Flash a `bcst_*_Xch.hex` file onto the broadcaster — pick `_5ch` or `_2ch`
 3. Flash the `recv_*.hex` file onto the receiver device(s)
+
+> **Note:** The broadcaster determines how many BISes exist in the BIG. The receiver adapts to whatever BIG is advertised.
 
 ## Configurations
 
@@ -69,6 +78,15 @@ binaries/
 |--------|-------------|
 | `5ms` | 5 ms audio frame interval |
 | `10ms` | 10 ms audio frame interval |
+
+### Channel counts (broadcaster only)
+
+The broadcaster determines how many BISes the BIG contains. The receiver adapts automatically.
+
+| Channels | Suffix | Description |
+|----------|--------|-------------|
+| `5ch` | `_5ch` | Broadcaster creates 5 BISes: 1 downlink + 4 uplink (default) |
+| `2ch` | `_2ch` | Broadcaster creates 2 BISes: 1 downlink + 1 uplink |
 
 ### Uplink strategies
 
