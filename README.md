@@ -32,3 +32,9 @@ Each option is available with a `5 ms` or `10 ms` ISO interval.
 Use `tools/flash_grptlk_audio.py` to flash a board; it lets you choose the target, ISO interval, and uplink option, then automatically selects the matching binary from `samples/binaries/`.
 
 More detailed information about the different modes is available in `docs/`.
+
+## Relay Mode
+
+Flash an nRF5340 DK as broadcaster using one of the prebuilt binaries in `samples/binaries/nrf5340dk/` (e.g. `5ms/bcst_nrf5340dk_5ms_2ch.hex`), then pair it with the matching receiver binary (e.g. `samples/binaries/nrf5340_audio_dk/5ms/fully_random/recv_nrf5340_audio_dk_5ms_fully_random.hex`).
+
+In this configuration the broadcaster has no audio io. It forwards everything it receives on the uplink BIS directly (no LC3 decode, no mixing, no LC3 encode), giving the lowest possible end-to-end latency. The uplink selection variant of the receiver binary (`fully_random`, `partly_random`, `occupation_aware`) does not matter in this mode. A `10ms/` variant is available under the same folder structure.

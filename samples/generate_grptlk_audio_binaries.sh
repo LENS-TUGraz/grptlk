@@ -7,7 +7,7 @@ WORKSPACE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SAMPLES_DIR="${WORKSPACE}/grptlk/samples"
 BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
-CHANNELS=("5" "2")
+CHANNELS=("5" "2")  # GRPTLK_NUM_CHAN values: 5=4 uplink BISes, 2=1 uplink BIS (NUM_CHAN includes 1 downlink)
 
 BUILD_JOBS=(
   # Nordic nRF5340 Audio DK variants
@@ -41,6 +41,14 @@ BUILD_JOBS=(
   "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y -DEXTRA_CONF_FILE=boards/nrf5340_audio_dk_nrf5340_cpuapp_le_audio_playground.conf -DEXTRA_DTC_OVERLAY_FILE=boards/nrf5340_audio_dk_nrf5340_cpuapp_le_audio_playground.overlay|grptlk_bcst_le_audio_playground_10ms_T2_occupation_aware.hex"
 )
 
+# nRF5340 DK (non-audio) — broadcaster only, 2ch (1 uplink BIS) only
+# With a single uplink BIS, uplink selection strategy is irrelevant — fully random only.
+# GRPTLK_RELAY defaults to y on this board.
+NRF5340DK_BUILD_JOBS=(
+  "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_5ms_liblc3.hex"
+  "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_10ms_T2.hex"
+)
+
 log()  { echo "[grptlk] $*"; }
 info() { echo ""; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "$*"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
 fail() { echo "[ERROR] $*" >&2; exit 1; }
@@ -67,7 +75,7 @@ for job in "${BUILD_JOBS[@]}"; do
   [[ "${sn}" == "grptlk_audio_broadcast" ]] && ((BCST_COUNT++))
 done
 RECV_COUNT=$(( ${#BUILD_JOBS[@]} - BCST_COUNT ))
-TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT ))
+TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT + ${#NRF5340DK_BUILD_JOBS[@]} ))
 BUILT=()
 IDX=0
 
@@ -121,6 +129,43 @@ for ch in "${CHANNELS[@]}"; do
     log "Merged → ${OUT_HEX}"
     BUILT+=("${OUTPUT_HEX}")
   done
+done
+
+# nRF5340 DK — 2ch (1 uplink BIS) broadcaster only
+for job in "${NRF5340DK_BUILD_JOBS[@]}"; do
+  IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${job}"
+
+  IDX=$((IDX + 1))
+  EXTRA_CMAKE="${EXTRA_CMAKE} -DCONFIG_GRPTLK_NUM_CHAN=2"
+  OUTPUT_HEX="${BASE_HEX%.hex}_2ch.hex"
+
+  SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
+  BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
+
+  info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=2  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
+
+  [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
+
+  (
+    cd "${SAMPLE_DIR}"
+    west build \
+      --pristine always \
+      --board "${BOARD}" \
+      --build-dir "${BUILD_DIR_NAME}" \
+      -- ${EXTRA_CMAKE}
+  )
+
+  HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
+  APP_HEX="${BUILD_DIR}/${SAMPLE_NAME}/zephyr/zephyr.hex"
+  OUT_HEX="${ALL_BINS_DIR}/${OUTPUT_HEX}"
+
+  [[ -f "${HCI_HEX}" ]] || fail "hci_ipc hex not found: ${HCI_HEX}"
+  [[ -f "${APP_HEX}" ]] || fail "App hex not found: ${APP_HEX}"
+
+  mergehex -m "${HCI_HEX}" "${APP_HEX}" -o "${OUT_HEX}"
+
+  log "Merged → ${OUT_HEX}"
+  BUILT+=("${OUTPUT_HEX}")
 done
 
 info "Build complete — ${#BUILT[@]}/${TOTAL} binaries in all_bins/"
@@ -179,6 +224,18 @@ for device in "${DEVICES[@]}"; do
   done
 done
 
+# nRF5340 DK — bcst only, 2ch only, no strategy subfolder (strategy irrelevant with 1 uplink BIS)
+for timing in "${TIMINGS[@]}"; do
+  tag="$(timing_tag "${timing}")"
+  dest="${BINARIES_DIR}/nrf5340dk/${timing}"
+  mkdir -p "${dest}"
+
+  bcst_src="$(find_bin "grptlk_bcst_nrf5340dk_${tag}_2ch.hex")"
+  cp "${bcst_src}" "${dest}/bcst_nrf5340dk_${timing}_2ch.hex"
+
+  log "  nrf5340dk/${timing}  ✓"
+done
+
 # ---------------------------------------------------------------------------
 # Final summary
 # ---------------------------------------------------------------------------
@@ -203,6 +260,12 @@ for device in "${DEVICES[@]}"; do
         printf "      └─ %s\n" "$(basename "${hex}")"
       done
     done
+  done
+done
+for timing in "${TIMINGS[@]}"; do
+  printf "    nrf5340dk/%s/\n" "${timing}"
+  for hex in "${BINARIES_DIR}/nrf5340dk/${timing}"/*.hex; do
+    printf "      └─ %s\n" "$(basename "${hex}")"
   done
 done
 echo ""
