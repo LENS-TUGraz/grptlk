@@ -161,13 +161,13 @@ static int max9867_stream_path_configure(void)
 		return err;
 	}
 
-	err = max9867_reg_write(MAX9867_REG_L_MIC_GAIN, MAX9867_L_MIC_GAIN);
+	err = max9867_reg_write(MAX9867_REG_L_MIC_GAIN, MAX9867_L_MIC_GAIN_CFG);
 	if (err) {
 		printk("MAX9867 L_MIC_GAIN write failed: %d\n", err);
 		return err;
 	}
 
-	err = max9867_reg_write(MAX9867_REG_R_MIC_GAIN, MAX9867_R_MIC_GAIN_MICRP);
+	err = max9867_reg_write(MAX9867_REG_R_MIC_GAIN, MAX9867_R_MIC_GAIN_CFG);
 	if (err) {
 		printk("MAX9867 R_MIC_GAIN write failed: %d\n", err);
 		return err;
@@ -179,7 +179,7 @@ static int max9867_stream_path_configure(void)
 		return err;
 	}
 
-	err = max9867_reg_write(MAX9867_REG_ADC_INPUT, MAX9867_ADC_INPUT_RIGHT_MIC);
+	err = max9867_reg_write(MAX9867_REG_ADC_INPUT, MAX9867_ADC_INPUT_CFG);
 	if (err) {
 		printk("MAX9867 ADC_INPUT write failed: %d\n", err);
 		return err;
@@ -204,9 +204,10 @@ static int max9867_stream_path_configure(void)
 		return err;
 	}
 
-	printk("MAX9867 mic path: analog-right (MICRP), adc_lvl=0x%02x, "
-	       "l_mic_gain=0x%02x r_mic_gain=0x%02x, capture=right\n",
-	       adc_lvl_reg, MAX9867_L_MIC_GAIN, MAX9867_R_MIC_GAIN_MICRP);
+	printk("MAX9867 mic path: side=%s adc_lvl=0x%02x "
+	       "l_mic_gain=0x%02x r_mic_gain=0x%02x adc_input=0x%02x\n",
+	       MAX9867_MIC_SIDE_NAME, adc_lvl_reg,
+	       MAX9867_L_MIC_GAIN_CFG, MAX9867_R_MIC_GAIN_CFG, MAX9867_ADC_INPUT_CFG);
 
 	if ((status & 0x02U) == 0U) {
 		printk("MAX9867 PLL not locked before stream enable (status=0x%02x)\n", status);
@@ -234,9 +235,14 @@ int audio_backend_init(struct audio_backend_config *config)
 	}
 
 	config->capture_enabled = true;
+#if defined(CONFIG_GRPTLK_MAX9867_MIC_SIDE_LEFT)
+	config->capture_channel_hint = AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT;
+#else
 	config->capture_channel_hint = AUDIO_BACKEND_CAPTURE_CHANNEL_RIGHT;
+#endif
 	codec_stream_configured = false;
-	printk("[audio] codec=max9867 source=micrp capture=right\n");
+	printk("[audio] codec=max9867 mic_side=%s capture=%s\n",
+	       MAX9867_MIC_SIDE_NAME, MAX9867_MIC_SIDE_NAME);
 
 	return 0;
 }

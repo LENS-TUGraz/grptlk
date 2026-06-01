@@ -4,9 +4,9 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(grptlk_audio_receive)
 
-if(NOT CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP)
+if(NOT CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP AND NOT CONFIG_BOARD_RBV2H)
   message(FATAL_ERROR
-    "grptlk_audio_receive only supports nrf5340_audio_dk/nrf5340/cpuapp")
+    "grptlk_audio_receive supports nrf5340_audio_dk/nrf5340/cpuapp or rbv2h/nrf5340/cpuapp")
 endif()
 
 target_include_directories(app PRIVATE src)
@@ -14,8 +14,10 @@ target_include_directories(app PRIVATE src)
 target_sources(app PRIVATE
   src/main.c
   src/io/buttons.c
+  src/io/encoder.c
   src/io/led.c
   src/io/debug_gpio.c
+  src/io/battery.c
   src/audio/audio.c
   src/audio/drivers/audio_i2s.c
   src/audio/sync/clk_sync.c

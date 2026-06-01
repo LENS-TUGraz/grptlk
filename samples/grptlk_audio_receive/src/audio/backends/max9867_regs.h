@@ -34,11 +34,29 @@
 #define MAX9867_SIDETONE_DISABLED		       0x00 /* sidetone off */
 #define MAX9867_DAC_LVL				       0x30 /* DAC level +18 dB */
 #define MAX9867_ADC_LVL_0_DB_BOTH		       0x33 /* left 0 dB, right 0 dB */
-#define MAX9867_L_MIC_GAIN			       0x34 /* preamp 0 dB, PGA 0 dB */
-#define MAX9867_R_MIC_GAIN_MICRP		       0x2E /* preamp 0 dB, PGA +6 dB */
 #define MAX9867_DIGMIC_DISABLED			       0x00 /* use analog mic path */
-#define MAX9867_ADC_INPUT_RIGHT_MIC		       0x10 /* right ADC = mic */
-#define MAX9867_MODE_DEFAULT			       0x02 /* current stream mode */
+/* INPUTCONFIG (0x14) bit map (from MAX9867 datasheet + Linux driver):
+ *   bit 7 = Line→ADC_L, bit 6 = Mic→ADC_L,
+ *   bit 5 = Line→ADC_R, bit 4 = Mic→ADC_R.
+ */
+#if defined(CONFIG_GRPTLK_MAX9867_MIC_SIDE_LEFT)
+#define MAX9867_L_MIC_GAIN_CFG	0x2E
+#define MAX9867_R_MIC_GAIN_CFG	0x00
+#define MAX9867_ADC_INPUT_CFG	0x40 /* Mic→ADC_L */
+#define MAX9867_MIC_SIDE_NAME	"left"
+#else
+#define MAX9867_L_MIC_GAIN_CFG	0x00
+#define MAX9867_R_MIC_GAIN_CFG	0x2E
+#define MAX9867_ADC_INPUT_CFG	0x10 /* Mic→ADC_R */
+#define MAX9867_MIC_SIDE_NAME	"right"
+#endif
+#if defined(CONFIG_GRPTLK_MAX9867_HPMODE_STEREO_DIFF)
+#define MAX9867_MODE_DEFAULT 0x00 /* HPMODE=000 stereo differential */
+#elif defined(CONFIG_GRPTLK_MAX9867_HPMODE_STEREO_SINGLE)
+#define MAX9867_MODE_DEFAULT 0x04 /* HPMODE=100 stereo single-ended */
+#else
+#define MAX9867_MODE_DEFAULT 0x02 /* HPMODE=010 stereo capless */
+#endif
 #define MAX9867_PWR_MGMT_PLAYBACK_CAPTURE_ANALOG_RIGHT 0x8F /* enable DAC/ADC L+R */
 
 #define MAX9867_VOL_MIN_REG	0x00

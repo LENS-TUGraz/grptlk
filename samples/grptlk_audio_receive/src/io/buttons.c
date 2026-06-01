@@ -1,4 +1,5 @@
 #include "io/buttons.h"
+#include "io/encoder.h"
 #include "audio/audio.h"
 #include "audio/sync/clk_sync.h"
 #if defined(CONFIG_GRPTLK_PTT_VAD)
@@ -23,6 +24,10 @@ atomic_t ptt_active = ATOMIC_INIT(0);
 atomic_t ptt_active = ATOMIC_INIT(1);
 #endif
 
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+atomic_t ptt_vad_active = ATOMIC_INIT(0);
+#endif
+
 /* PTT-lock: sw3 (toggle) + led0 (status). SPI-backed LED write deferred
  * to work item for ISR safety.
  * Declared before PTT block so ptt_isr can observe lock state. */
@@ -34,13 +39,13 @@ static struct gpio_callback ptt_lock_cb_data;
 static atomic_t ptt_lock_active = ATOMIC_INIT(0);
 static struct k_work ptt_lock_work;
 
-#if defined(CONFIG_GRPTLK_PTT_VAD) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#if defined(CONFIG_GRPTLK_PTT_VAD) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay) && \
+	!DT_NODE_HAS_STATUS(DT_ALIAS(mute_switch), okay)
 #define PTT_VAD_AVAILABLE 1
 #define PTT_LOCK_LONG_PRESS_MS 800
 static struct k_work_delayable ptt_lock_long_work;
 static atomic_t ptt_lock_long_fired = ATOMIC_INIT(0);
 static const struct gpio_dt_spec ptt_vad_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-atomic_t ptt_vad_active = ATOMIC_INIT(0);
 #else
 #define PTT_VAD_AVAILABLE 0
 #endif
@@ -175,6 +180,98 @@ static int ptt_lock_init(void)
 static int ptt_lock_init(void)
 {
 	printk("PTT-lock: sw3/led0 not available\n");
+	return 0;
+}
+#endif
+
+/* Mute slide-switch: master VAD enable. Switch ON → VAD on, OFF → VAD off.
+ * Overrides PTT-lock and shadows momentary PTT (via ptt_vad_active gate). */
+#if defined(CONFIG_GRPTLK_PTT_VAD) && DT_NODE_HAS_STATUS(DT_ALIAS(mute_switch), okay) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(led0), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+#define MUTE_SWITCH_AVAILABLE 1
+static const struct gpio_dt_spec mute_switch_in = GPIO_DT_SPEC_GET(DT_ALIAS(mute_switch), gpios);
+static const struct gpio_dt_spec mute_switch_red_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec mute_switch_grn_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static struct gpio_callback mute_switch_cb_data;
+static struct k_work mute_switch_work;
+
+static void mute_switch_apply(int on)
+{
+#if PTT_LOCK_AVAILABLE
+	if (on && atomic_get(&ptt_lock_active)) {
+		atomic_set(&ptt_lock_active, 0);
+		atomic_set(&ptt_active, 0);
+		gpio_pin_set_dt(&ptt_lock_led, 0);
+	}
+#endif
+	if (on) {
+		atomic_set(&ptt_vad_active, 1);
+		gpio_pin_set_dt(&mute_switch_red_led, 1);
+		gpio_pin_set_dt(&mute_switch_grn_led, 1);
+		printk("[MUTE-SW] VAD enabled\n");
+	} else {
+		atomic_set(&ptt_vad_active, 0);
+		gpio_pin_set_dt(&mute_switch_red_led, 0);
+		gpio_pin_set_dt(&mute_switch_grn_led, 0);
+		vad_reset();
+		printk("[MUTE-SW] VAD disabled\n");
+	}
+}
+
+static void mute_switch_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	mute_switch_apply(gpio_pin_get_dt(&mute_switch_in) > 0);
+}
+
+static void mute_switch_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+	k_work_submit(&mute_switch_work);
+}
+
+static int mute_switch_init(void)
+{
+	int err;
+
+	k_work_init(&mute_switch_work, mute_switch_work_handler);
+
+	if (!gpio_is_ready_dt(&mute_switch_in) || !gpio_is_ready_dt(&mute_switch_red_led) ||
+	    !gpio_is_ready_dt(&mute_switch_grn_led)) {
+		printk("Mute-switch GPIO not ready\n");
+		return -ENODEV;
+	}
+	err = gpio_pin_configure_dt(&mute_switch_in, GPIO_INPUT);
+	if (err) {
+		printk("Mute-switch input configure failed: %d\n", err);
+		return err;
+	}
+	err = gpio_pin_configure_dt(&mute_switch_red_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		return err;
+	}
+	err = gpio_pin_configure_dt(&mute_switch_grn_led, GPIO_OUTPUT_INACTIVE);
+	if (err) {
+		return err;
+	}
+	err = gpio_pin_interrupt_configure_dt(&mute_switch_in, GPIO_INT_EDGE_BOTH);
+	if (err) {
+		printk("Mute-switch interrupt configure failed: %d\n", err);
+		return err;
+	}
+	gpio_init_callback(&mute_switch_cb_data, mute_switch_isr, BIT(mute_switch_in.pin));
+	gpio_add_callback(mute_switch_in.port, &mute_switch_cb_data);
+
+	mute_switch_apply(gpio_pin_get_dt(&mute_switch_in) > 0);
+	printk("Mute-switch: VAD master enable wired\n");
+	return 0;
+}
+#else
+#define MUTE_SWITCH_AVAILABLE 0
+static int mute_switch_init(void)
+{
 	return 0;
 }
 #endif
@@ -430,7 +527,17 @@ int buttons_init(struct k_sem *tx_sem)
 		return err;
 	}
 
+	err = mute_switch_init();
+	if (err) {
+		return err;
+	}
+
 	err = vol_buttons_init();
+	if (err) {
+		return err;
+	}
+
+	err = encoder_init();
 	if (err) {
 		return err;
 	}

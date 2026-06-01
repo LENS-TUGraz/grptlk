@@ -1,0 +1,16 @@
+/ {
+	aliases {
+		/delete-property/ sw0;
+		/delete-property/ sw1;
+		/delete-property/ sw2;
+		sw2 = &smart_button;
+		mute-switch = &mute_button;
+	};
+};
+
+/* 787k/2M VBAT divider → ~565k source Z; needs ≥40us acquisition. */
+&adc {
+	channel@0 {
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+	};
+};

@@ -6,8 +6,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 
-#if IS_ENABLED(CONFIG_BOARD_NRF5340_AUDIO_DK_NRF5340_CPUAPP) &&                                    \
-	DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(led2)) &&                                                 \
+#if DT_NODE_HAS_STATUS_OKAY(DT_ALIAS(led2)) &&                                                     \
 	DT_NODE_HAS_STATUS_OKAY(DT_GPIO_CTLR(DT_ALIAS(led2), gpios))
 #define RECEIVE_LED_AVAILABLE 1
 static const struct gpio_dt_spec receive_led = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);

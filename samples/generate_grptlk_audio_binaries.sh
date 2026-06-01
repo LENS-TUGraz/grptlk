@@ -7,7 +7,15 @@ WORKSPACE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SAMPLES_DIR="${WORKSPACE}/grptlk/samples"
 BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
+BOARD_ROOT_ARG="-DBOARD_ROOT=${WORKSPACE}"
 CHANNELS=("5" "2")  # GRPTLK_NUM_CHAN values: 5=4 uplink BISes, 2=1 uplink BIS (NUM_CHAN includes 1 downlink)
+MISSING_ONLY=false
+for arg in "$@"; do
+  case "${arg}" in
+    --missing-only) MISSING_ONLY=true ;;
+    *) echo "[ERROR] Unknown argument: ${arg}" >&2; exit 1 ;;
+  esac
+done
 
 BUILD_JOBS=(
   # Nordic nRF5340 Audio DK variants
@@ -49,6 +57,16 @@ NRF5340DK_BUILD_JOBS=(
   "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_10ms_T2.hex"
 )
 
+# rbv2h — recv only (no broadcaster ported)
+RBV2H_BUILD_JOBS=(
+  # Fully Random
+  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_5ms_liblc3_fully_random.hex"
+  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_10ms_T2_fully_random.hex"
+  # Partly Random
+  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_rbv2h_5ms_liblc3_partly_random.hex"
+  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_rbv2h_10ms_T2_partly_random.hex"
+)
+
 log()  { echo "[grptlk] $*"; }
 info() { echo ""; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "$*"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
 fail() { echo "[ERROR] $*" >&2; exit 1; }
@@ -65,7 +83,9 @@ log "mergehex: $(mergehex --version 2>&1 | head -1)"
 log "workspace: ${WORKSPACE}"
 
 ALL_BINS_DIR="${BINARIES_DIR}/all_bins"
-rm -rf "${BINARIES_DIR}"
+if [[ "${MISSING_ONLY}" == false ]]; then
+  rm -rf "${BINARIES_DIR}"
+fi
 mkdir -p "${ALL_BINS_DIR}"
 
 # Count broadcaster jobs for total calculation
@@ -75,7 +95,7 @@ for job in "${BUILD_JOBS[@]}"; do
   [[ "${sn}" == "grptlk_audio_broadcast" ]] && ((BCST_COUNT++))
 done
 RECV_COUNT=$(( ${#BUILD_JOBS[@]} - BCST_COUNT ))
-TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT + ${#NRF5340DK_BUILD_JOBS[@]} ))
+TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT + ${#NRF5340DK_BUILD_JOBS[@]} + ${#RBV2H_BUILD_JOBS[@]} ))
 BUILT=()
 IDX=0
 
@@ -104,6 +124,12 @@ for ch in "${CHANNELS[@]}"; do
     SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
     BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
 
+    if [[ "${MISSING_ONLY}" == true && -f "${ALL_BINS_DIR}/${OUTPUT_HEX}" ]]; then
+      log "Skipping (exists): ${OUTPUT_HEX}"
+      BUILT+=("${OUTPUT_HEX}")
+      continue
+    fi
+
     info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=${ch}  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
 
     [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
@@ -114,7 +140,7 @@ for ch in "${CHANNELS[@]}"; do
         --pristine always \
         --board "${BOARD}" \
         --build-dir "${BUILD_DIR_NAME}" \
-        -- ${EXTRA_CMAKE}
+        -- ${BOARD_ROOT_ARG} ${EXTRA_CMAKE}
     )
 
     HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
@@ -142,6 +168,12 @@ for job in "${NRF5340DK_BUILD_JOBS[@]}"; do
   SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
   BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
 
+  if [[ "${MISSING_ONLY}" == true && -f "${ALL_BINS_DIR}/${OUTPUT_HEX}" ]]; then
+    log "Skipping (exists): ${OUTPUT_HEX}"
+    BUILT+=("${OUTPUT_HEX}")
+    continue
+  fi
+
   info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=2  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
 
   [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
@@ -152,7 +184,49 @@ for job in "${NRF5340DK_BUILD_JOBS[@]}"; do
       --pristine always \
       --board "${BOARD}" \
       --build-dir "${BUILD_DIR_NAME}" \
-      -- ${EXTRA_CMAKE}
+      -- ${BOARD_ROOT_ARG} ${EXTRA_CMAKE}
+  )
+
+  HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
+  APP_HEX="${BUILD_DIR}/${SAMPLE_NAME}/zephyr/zephyr.hex"
+  OUT_HEX="${ALL_BINS_DIR}/${OUTPUT_HEX}"
+
+  [[ -f "${HCI_HEX}" ]] || fail "hci_ipc hex not found: ${HCI_HEX}"
+  [[ -f "${APP_HEX}" ]] || fail "App hex not found: ${APP_HEX}"
+
+  mergehex -m "${HCI_HEX}" "${APP_HEX}" -o "${OUT_HEX}"
+
+  log "Merged → ${OUT_HEX}"
+  BUILT+=("${OUTPUT_HEX}")
+done
+
+# rbv2h — recv only
+for job in "${RBV2H_BUILD_JOBS[@]}"; do
+  IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${job}"
+
+  IDX=$((IDX + 1))
+  OUTPUT_HEX="${BASE_HEX}"
+
+  SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
+  BUILD_DIR="${SAMPLE_DIR}/${BUILD_DIR_NAME}"
+
+  if [[ "${MISSING_ONLY}" == true && -f "${ALL_BINS_DIR}/${OUTPUT_HEX}" ]]; then
+    log "Skipping (exists): ${OUTPUT_HEX}"
+    BUILT+=("${OUTPUT_HEX}")
+    continue
+  fi
+
+  info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
+
+  [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
+
+  (
+    cd "${SAMPLE_DIR}"
+    west build \
+      --pristine always \
+      --board "${BOARD}" \
+      --build-dir "${BUILD_DIR_NAME}" \
+      -- ${BOARD_ROOT_ARG} ${EXTRA_CMAKE}
   )
 
   HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
@@ -236,6 +310,24 @@ for timing in "${TIMINGS[@]}"; do
   log "  nrf5340dk/${timing}  ✓"
 done
 
+# rbv2h — recv only, per timing, per strategy
+for timing in "${TIMINGS[@]}"; do
+  tag="$(timing_tag "${timing}")"
+  for strategy in "${STRATEGIES[@]}"; do
+    dest="${BINARIES_DIR}/rbv2h/${timing}/${strategy}"
+    mkdir -p "${dest}"
+
+    if [[ "${strategy}" == "occupation_aware" ]]; then
+      recv_src="$(find_bin "grptlk_recv_rbv2h_${tag}_partly_random.hex")"
+    else
+      recv_src="$(find_bin "grptlk_recv_rbv2h_${tag}_${strategy}.hex")"
+    fi
+    cp "${recv_src}" "${dest}/recv_rbv2h_${timing}_${strategy}.hex"
+
+    log "  rbv2h/${timing}/${strategy}  ✓"
+  done
+done
+
 # ---------------------------------------------------------------------------
 # Final summary
 # ---------------------------------------------------------------------------
@@ -266,6 +358,14 @@ for timing in "${TIMINGS[@]}"; do
   printf "    nrf5340dk/%s/\n" "${timing}"
   for hex in "${BINARIES_DIR}/nrf5340dk/${timing}"/*.hex; do
     printf "      └─ %s\n" "$(basename "${hex}")"
+  done
+done
+for timing in "${TIMINGS[@]}"; do
+  for strategy in "${STRATEGIES[@]}"; do
+    printf "    rbv2h/%s/%s/\n" "${timing}" "${strategy}"
+    for hex in "${BINARIES_DIR}/rbv2h/${timing}/${strategy}"/*.hex; do
+      printf "      └─ %s\n" "$(basename "${hex}")"
+    done
   done
 done
 echo ""

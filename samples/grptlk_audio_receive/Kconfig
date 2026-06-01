@@ -87,6 +87,41 @@ config GRPTLK_AUDIO_CODEC_MAX9867
 
 endchoice
 
+choice GRPTLK_MAX9867_HPMODE
+	prompt "MAX9867 headphone output mode"
+	depends on GRPTLK_AUDIO_CODEC_MAX9867
+	default GRPTLK_MAX9867_HPMODE_STEREO_CAP
+
+config GRPTLK_MAX9867_HPMODE_STEREO_DIFF
+	bool "Stereo differential (capless, full P/N drive)"
+	help
+	  Each speaker is wired across a LOUTP/LOUTN (or ROUTP/ROUTN) pair
+	  with no external DC-blocking caps. Used by rbv2h.
+
+config GRPTLK_MAX9867_HPMODE_STEREO_CAP
+	bool "Stereo capless (P drives, N at midrail)"
+	help
+	  Speakers reference midrail on the N pin. Compatible with the
+	  LE Audio Playground single-ended-with-caps wiring.
+
+config GRPTLK_MAX9867_HPMODE_STEREO_SINGLE
+	bool "Stereo single-ended (external DC-block caps on P)"
+
+endchoice
+
+choice GRPTLK_MAX9867_MIC_SIDE
+	prompt "MAX9867 mic input side"
+	depends on GRPTLK_AUDIO_CODEC_MAX9867
+	default GRPTLK_MAX9867_MIC_SIDE_RIGHT
+
+config GRPTLK_MAX9867_MIC_SIDE_RIGHT
+	bool "Right (MICRP/MICRN) — LE Audio Playground"
+
+config GRPTLK_MAX9867_MIC_SIDE_LEFT
+	bool "Left (MICLP/MICLN) — rbv2h"
+
+endchoice
+
 config GRPTLK_DEBUG_GPIO
 	bool "Enable debug GPIO pins for logic analyzer"
 	default n
@@ -237,6 +272,47 @@ config GRPTLK_VAD_ENERGY_THRESHOLD
 	  200 is a conservative default. Raise for noisier environments.
 
 endif # GRPTLK_PTT_VAD
+
+config GRPTLK_ENCODER
+	bool "Rotary encoder volume control"
+	depends on SENSOR && QDEC_NRFX
+	help
+	  Drive volume via rotary encoder on the qdec0 alias.
+
+if GRPTLK_ENCODER
+
+config GRPTLK_ENCODER_DEG_PER_STEP
+	int "Degrees per volume step (one detent)"
+	default 12
+	help
+	  With steps=120 on the QDEC peripheral one quadrature count is 3
+	  degrees. A 24-detent encoder yields 12 deg/detent.
+
+config GRPTLK_ENCODER_VOLUME_STEP_DB
+	int "dB per detent"
+	default 1
+
+config GRPTLK_ENCODER_INVERT
+	bool "Invert encoder direction"
+
+endif # GRPTLK_ENCODER
+
+config GRPTLK_BATTERY
+	bool "LIPO voltage + charger status monitor"
+	depends on ADC && GPIO
+	help
+	  Periodically sample LIPO voltage (ADC AIN3 via 787k/2M divider)
+	  and MCP73833 STAT1/STAT2 charger pins. Prints one RTT line per
+	  sample. Requires lipo1/lipo2 DT aliases and zephyr,user io-channels.
+
+if GRPTLK_BATTERY
+
+config GRPTLK_BATTERY_PERIOD_S
+	int "Battery print period (seconds)"
+	default 5
+	range 1 3600
+
+endif # GRPTLK_BATTERY
 
 endif # GRPTLK
 

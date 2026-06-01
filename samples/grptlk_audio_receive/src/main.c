@@ -19,6 +19,7 @@
 #include "audio/audio.h"
 #include "audio/drivers/audio_i2s.h"
 #include "audio/sync/clk_sync.h"
+#include "io/battery.h"
 #include "io/buttons.h"
 #include "io/led.h"
 #include "io/debug_gpio.h"
@@ -595,6 +596,7 @@ void ptt_session_bis_reset(void)
 {
 	ptt_session_bis = 0xFFU;
 	ptt_wait_no_free_log_cnt = 0U;
+	printk("[ptt] session reset, ptt_session_bis cleared\n");
 }
 #endif
 
@@ -619,8 +621,17 @@ static void tx_thread(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		while (atomic_get(&tx_in_progress) != 0) {
-			k_sleep(K_USEC(100));
+		{
+			uint32_t spin_us = 0;
+			while (atomic_get(&tx_in_progress) != 0) {
+				k_sleep(K_USEC(100));
+				spin_us += 100U;
+				if (spin_us >= 50000U) {
+					printk("[tx] STUCK tx_in_progress=1 for >50ms active_bis=%u ptt=%ld\n",
+					       active_uplink_bis, atomic_get(&ptt_active));
+					spin_us = 0;
+				}
+			}
 		}
 
 		ul_chan = iso_select_uplink_chan();
@@ -659,6 +670,7 @@ static int uplink_send_next(struct bt_iso_chan *chan, const struct audio_encoded
 	net_buf_add_mem(buf, ef->data, ef->len);
 
 	atomic_set(&tx_in_progress, 1);
+	printk("[tx] send bis[%u] seq=%u\n", active_uplink_bis, seq_num);
 
 	err = bt_iso_chan_send(chan, buf, seq_num);
 	if (err < 0) {
@@ -676,8 +688,19 @@ static void iso_sent(struct bt_iso_chan *chan)
 {
 	debug_iso_sent_set(1);
 
+	int8_t idx = -1;
+	for (uint8_t i = 0; i < CONFIG_GRPTLK_UPLINK_BIS; i++) {
+		if (chan == bis[i]) {
+			idx = (int8_t)i;
+			break;
+		}
+	}
+
 	if (chan == bis[active_uplink_bis]) {
 		atomic_set(&tx_in_progress, 0);
+	} else {
+		printk("[iso_sent] STALE chan=bis[%d] active=bis[%u] ptt=%ld\n",
+		       idx, active_uplink_bis, atomic_get(&ptt_active));
 	}
 
 	debug_iso_sent_set(0);
@@ -1220,6 +1243,8 @@ int main(void)
 
 	/* Debug GPIO (optional, for logic analyzer timing analysis) */
 	(void)debug_gpio_init();
+
+	(void)battery_init();
 
 	k_timer_init(&bis1_activity_timer, bis1_activity_timeout_handler, NULL);
 	k_work_init(&bis1_disconnect_work, bis1_disconnect_work_handler);
