@@ -86,6 +86,9 @@ static void ptt_lock_long_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	atomic_set(&ptt_lock_long_fired, 1);
+	if (atomic_get(&src_line_in_active)) {
+		return; /* PTT/VAD controls are MIC-only */
+	}
 	if (atomic_get(&ptt_lock_active)) {
 		printk("[PTT-VAD] blocked — PTT-lock active\n");
 		return;
@@ -110,6 +113,9 @@ static void ptt_lock_isr(const struct device *dev, struct gpio_callback *cb, uin
 	ARG_UNUSED(dev);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
+	if (atomic_get(&src_line_in_active)) {
+		return; /* PTT/VAD controls are MIC-only */
+	}
 #if PTT_VAD_AVAILABLE
 	if (gpio_pin_get_dt(&ptt_lock_btn) > 0) {
 		atomic_set(&ptt_lock_long_fired, 0);
@@ -197,6 +203,9 @@ static struct k_work mute_switch_work;
 
 static void mute_switch_apply(int on)
 {
+	if (atomic_get(&src_line_in_active)) {
+		return; /* VAD controls are MIC-only */
+	}
 #if PTT_LOCK_AVAILABLE
 	if (on && atomic_get(&ptt_lock_active)) {
 		atomic_set(&ptt_lock_active, 0);
@@ -435,34 +444,65 @@ static int vol_buttons_init(void)
 }
 #endif
 
-/* Source toggle: sw4 (BTN5) + led1. Deferred to work queue (SPI access). */
-#if defined(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS) && DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && \
-	DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
+/* Source toggle: sw4 (BTN5) + led1. Deferred to work queue for codec access. */
+#if (defined(CONFIG_GRPTLK_AUDIO_CODEC_CIRRUS) || defined(CONFIG_GRPTLK_AUDIO_CODEC_MAX9867)) && \
+	DT_NODE_HAS_STATUS(DT_ALIAS(sw4), okay) && DT_NODE_HAS_STATUS(DT_ALIAS(led1), okay)
 #define SRC_TOGGLE_AVAILABLE 1
 static const struct gpio_dt_spec src_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
 static const struct gpio_dt_spec src_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static struct gpio_callback src_cb_data;
 static struct k_work src_toggle_work;
 
+static void line_in_enter_state_apply(void)
+{
+	atomic_set(&ptt_active, 0);
+#if defined(CONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT)
+	extern void ptt_session_bis_reset(void);
+	ptt_session_bis_reset();
+#endif
+#if PTT_LOCK_AVAILABLE
+	if (atomic_get(&ptt_lock_active)) {
+		atomic_set(&ptt_lock_active, 0);
+		gpio_pin_set_dt(&ptt_lock_led, 0);
+	}
+#endif
+#if defined(CONFIG_GRPTLK_PTT_VAD)
+	atomic_set(&ptt_vad_active, 0);
+	vad_reset();
+#endif
+#if PTT_VAD_AVAILABLE
+	(void)k_work_cancel_delayable(&ptt_lock_long_work);
+	atomic_set(&ptt_lock_long_fired, 0);
+	gpio_pin_set_dt(&ptt_vad_led, 0);
+#endif
+#if MUTE_SWITCH_AVAILABLE
+	gpio_pin_set_dt(&mute_switch_red_led, 0);
+	gpio_pin_set_dt(&mute_switch_grn_led, 0);
+#endif
+}
+
 static void src_toggle_work_handler(struct k_work *work)
 {
+	const bool use_line_in = atomic_get(&src_line_in_active) == 0;
+	int err;
+
 	ARG_UNUSED(work);
-	if (atomic_get(&src_line_in_active)) {
-		atomic_set(&src_line_in_active, 0);
-		gpio_pin_set_dt(&src_led, 0);
-		audio_input_source_switch(false);
-	} else {
+
+	err = audio_input_source_switch(use_line_in);
+	if (err) {
+		printk("[SRC] switch to %s failed: %d\n", use_line_in ? "line-in" : "mic", err);
+		return;
+	}
+
+	if (use_line_in) {
+		line_in_enter_state_apply();
 		atomic_set(&src_line_in_active, 1);
 		gpio_pin_set_dt(&src_led, 1);
-		/* Reset PTT state — buttons are no-ops in LINE-IN mode */
-		atomic_set(&ptt_active, 0);
-#if PTT_LOCK_AVAILABLE
-		if (atomic_get(&ptt_lock_active)) {
-			atomic_set(&ptt_lock_active, 0);
-			gpio_pin_set_dt(&ptt_lock_led, 0);
-		}
-#endif
-		audio_input_source_switch(true);
+		printk("[SRC] line-in enabled, continuous uplink active\n");
+	} else {
+		atomic_set(&src_line_in_active, 0);
+		gpio_pin_set_dt(&src_led, 0);
+		printk("[SRC] microphone enabled, normal PTT active\n");
 	}
 }
 

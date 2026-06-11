@@ -62,6 +62,7 @@ static int capture_channel_sanitize(int capture_channel_hint)
 	switch (capture_channel_hint) {
 	case AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT:
 	case AUDIO_BACKEND_CAPTURE_CHANNEL_RIGHT:
+	case AUDIO_BACKEND_CAPTURE_CHANNEL_MIX:
 	case AUDIO_BACKEND_CAPTURE_CHANNEL_AUTO:
 		return capture_channel_hint;
 	default:
@@ -74,13 +75,14 @@ static inline int32_t abs_s16(int16_t s)
 	return (s < 0) ? -(int32_t)s : (int32_t)s;
 }
 
-static inline uint8_t mic_channel_pick(int32_t left_peak, int32_t right_peak)
+static inline int capture_channel_pick(int32_t left_peak, int32_t right_peak)
 {
 	if (selected_capture_channel >= 0) {
-		return (uint8_t)selected_capture_channel;
+		return selected_capture_channel;
 	}
 
-	return (right_peak > left_peak) ? 1U : 0U;
+	return (right_peak > left_peak) ? AUDIO_BACKEND_CAPTURE_CHANNEL_RIGHT
+				       : AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT;
 }
 
 static inline void i2s_word_unpack(uint32_t word, int16_t *left, int16_t *right)
@@ -126,13 +128,19 @@ static void stereo_peak_analyze_words(const uint32_t *rx_words, int32_t *left_pe
 }
 
 static void extract_selected_channel_to_mono(const uint32_t *rx_words, int16_t *mono,
-					     uint8_t channel)
+					     int capture_channel)
 {
 	for (size_t i = 0; i < AUDIO_I2S_SAMPLES_PER_BLOCK; i++) {
 		int16_t left;
 		int16_t right;
+
 		i2s_word_unpack(rx_words[i], &left, &right);
-		mono[i] = (channel == 0U) ? left : right;
+		if (capture_channel == AUDIO_BACKEND_CAPTURE_CHANNEL_MIX) {
+			mono[i] = (int16_t)(((int32_t)left + (int32_t)right) / 2);
+		} else {
+			mono[i] = (capture_channel == AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT) ? left
+										 : right;
+		}
 	}
 }
 
@@ -141,7 +149,7 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 	int16_t *dst = &mic_accum[mic_accum_blk * AUDIO_I2S_SAMPLES_PER_BLOCK];
 	int32_t left_peak;
 	int32_t right_peak;
-	uint8_t ch;
+	int capture_channel;
 
 	stereo_peak_analyze_words(rx_words, &left_peak, &right_peak);
 
@@ -152,8 +160,8 @@ static void i2s_process_rx_block(const uint32_t *rx_words)
 		       selected_capture_channel, (int)left_peak, (int)right_peak);
 	}
 
-	ch = mic_channel_pick(left_peak, right_peak);
-	extract_selected_channel_to_mono(rx_words, dst, ch);
+	capture_channel = capture_channel_pick(left_peak, right_peak);
+	extract_selected_channel_to_mono(rx_words, dst, capture_channel);
 
 	if (++mic_accum_blk >= AUDIO_I2S_BLKS_PER_FRAME) {
 		mic_accum_blk = 0;

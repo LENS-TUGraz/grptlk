@@ -18,6 +18,7 @@
 static const struct i2c_dt_spec codec_i2c = I2C_DT_SPEC_GET(MAX9867_NODE);
 static uint8_t current_volume_reg = MAX9867_VOL_DEFAULT_REG;
 static bool codec_stream_configured;
+static bool current_line_in;
 
 static const int16_t volume_half_db_table[MAX9867_VOL_MAX_REG + 1] = {
 	12,  11,  10,	9,    8,    7,	  6,	4,    2,    0,	  -2,	-4,   -6,  -8,
@@ -198,12 +199,13 @@ static int max9867_stream_path_configure(void)
 	}
 
 	err = max9867_reg_write(MAX9867_REG_PWR_MGMT,
-				MAX9867_PWR_MGMT_PLAYBACK_CAPTURE_ANALOG_RIGHT);
+					MAX9867_PWR_MGMT_PLAYBACK_CAPTURE_ANALOG_RIGHT);
 	if (err) {
 		printk("MAX9867 power-up write failed: %d\n", err);
 		return err;
 	}
 
+	current_line_in = false;
 	printk("MAX9867 mic path: side=%s adc_lvl=0x%02x "
 	       "l_mic_gain=0x%02x r_mic_gain=0x%02x adc_input=0x%02x\n",
 	       MAX9867_MIC_SIDE_NAME, adc_lvl_reg,
@@ -214,6 +216,41 @@ static int max9867_stream_path_configure(void)
 	}
 
 	return 0;
+}
+
+static int max9867_capture_source_configure(bool use_line_in)
+{
+	const uint8_t adc_input =
+		use_line_in ? MAX9867_ADC_INPUT_LINE_STEREO : MAX9867_ADC_INPUT_CFG;
+	const uint8_t power_mgmt = use_line_in ? MAX9867_PWR_MGMT_PLAYBACK_CAPTURE_LINE_STEREO
+					      : MAX9867_PWR_MGMT_PLAYBACK_CAPTURE_ANALOG_RIGHT;
+	int err;
+
+	err = max9867_reg_write(MAX9867_REG_PWR_MGMT, MAX9867_PWR_MGMT_SHUTDOWN);
+	if (err) {
+		return err;
+	}
+
+	if (use_line_in) {
+		err = max9867_reg_write(MAX9867_REG_L_LINE_LVL,
+					 MAX9867_LINE_LVL_0_DB_PLAYBACK_MUTED);
+		if (err) {
+			return err;
+		}
+
+		err = max9867_reg_write(MAX9867_REG_R_LINE_LVL,
+					 MAX9867_LINE_LVL_0_DB_PLAYBACK_MUTED);
+		if (err) {
+			return err;
+		}
+	}
+
+	err = max9867_reg_write(MAX9867_REG_ADC_INPUT, adc_input);
+	if (err) {
+		return err;
+	}
+
+	return max9867_reg_write(MAX9867_REG_PWR_MGMT, power_mgmt);
 }
 
 int audio_backend_init(struct audio_backend_config *config)
@@ -283,8 +320,38 @@ int audio_backend_volume_adjust(int8_t step_db)
 
 int audio_backend_input_source_switch(bool use_line_in, int *capture_channel_hint)
 {
-	ARG_UNUSED(use_line_in);
-	ARG_UNUSED(capture_channel_hint);
+	int err;
 
-	return -ENOTSUP;
+	if (capture_channel_hint == NULL) {
+		return -EINVAL;
+	}
+
+	if (!codec_stream_configured) {
+		return -EPERM;
+	}
+
+	err = max9867_capture_source_configure(use_line_in);
+	if (err) {
+		int rollback_err = max9867_capture_source_configure(current_line_in);
+
+		if (rollback_err) {
+			printk("MAX9867 source rollback failed: %d\n", rollback_err);
+		}
+		return err;
+	}
+
+	current_line_in = use_line_in;
+	if (use_line_in) {
+		*capture_channel_hint = AUDIO_BACKEND_CAPTURE_CHANNEL_MIX;
+		printk("[audio] codec=max9867 source=line-in capture=mix\n");
+	} else {
+#if defined(CONFIG_GRPTLK_MAX9867_MIC_SIDE_LEFT)
+		*capture_channel_hint = AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT;
+#else
+		*capture_channel_hint = AUDIO_BACKEND_CAPTURE_CHANNEL_RIGHT;
+#endif
+		printk("[audio] codec=max9867 source=mic capture=%s\n", MAX9867_MIC_SIDE_NAME);
+	}
+
+	return 0;
 }

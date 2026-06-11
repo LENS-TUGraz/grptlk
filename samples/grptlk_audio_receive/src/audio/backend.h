@@ -8,6 +8,7 @@ enum audio_backend_capture_channel {
 	AUDIO_BACKEND_CAPTURE_CHANNEL_AUTO = -1,
 	AUDIO_BACKEND_CAPTURE_CHANNEL_LEFT = 0,
 	AUDIO_BACKEND_CAPTURE_CHANNEL_RIGHT = 1,
+	AUDIO_BACKEND_CAPTURE_CHANNEL_MIX = 2,
 };
 
 struct audio_backend_config {

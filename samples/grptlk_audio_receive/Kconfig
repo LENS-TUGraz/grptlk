@@ -80,10 +80,10 @@ config GRPTLK_AUDIO_CODEC_CIRRUS
 config GRPTLK_AUDIO_CODEC_MAX9867
 	bool "MAX9867"
 	help
-	  Use the sample-local MAX9867 backend with the analog microphone
-	  wired to MICRP. Build with FILE_SUFFIX=max9867 (or the legacy
-	  FILE_SUFFIX=le_audio_playground alias) so the sample picks up the
-	  external-codec devicetree overlay.
+	  Use the sample-local MAX9867 backend with analog microphone and
+	  line-input capture support. Build with FILE_SUFFIX=max9867 (or the
+	  legacy FILE_SUFFIX=le_audio_playground alias) so the sample picks up
+	  the external-codec devicetree overlay.
 
 endchoice
 
@@ -220,8 +220,8 @@ config GRPTLK_AUDIO_SOURCE_LINE_IN
 	help
 	  When enabled, the CS47L63 path prefers the 3.5 mm LINE-IN jack
 	  (IN2L/IN2R) instead of the onboard digital microphone. Can be
-	  overridden at runtime with BTN5. MAX9867 builds always use the
-	  analog MICRP path and do not support source switching.
+	  overridden at runtime with BTN5. MAX9867 builds boot with the
+	  configured analog microphone and support runtime switching with BTN5.
 
 config GRPTLK_PTT_VAD
 	bool "PTT VAD mode (long-press detection on PTT-lock button)"
