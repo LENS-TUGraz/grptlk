@@ -8,7 +8,17 @@ SAMPLES_DIR="${WORKSPACE}/grptlk/samples"
 BINARIES_DIR="${SAMPLES_DIR}/binaries"
 BUILD_DIR_NAME="build_gen"
 BOARD_ROOT_ARG="-DBOARD_ROOT=${WORKSPACE}"
-CHANNELS=("5" "2")  # GRPTLK_NUM_CHAN values: 5=4 uplink BISes, 2=1 uplink BIS (NUM_CHAN includes 1 downlink)
+# Per-timing GRPTLK_NUM_CHAN matrix (NUM_CHAN includes 1 downlink BIS).
+# 5 ms cannot fit 5 BISes — uses 3ch as its "many-BIS" variant.
+# 5 ms  → 3ch + 2ch        (5ch infeasible at 5 ms)
+# 10 ms → 5ch + 3ch + 2ch
+channels_for_timing() {
+  case "$1" in
+    5ms)  echo "3 2" ;;
+    10ms) echo "5 3 2" ;;
+    *)    fail "channels_for_timing: unknown timing '$1'" ;;
+  esac
+}
 MISSING_ONLY=false
 for arg in "$@"; do
   case "${arg}" in
@@ -18,20 +28,20 @@ for arg in "$@"; do
 done
 
 BUILD_JOBS=(
-  # Nordic nRF5340 Audio DK variants
-  # Fully Random
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_fully_random.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_fully_random.hex"
-  # Partly Random
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_partly_random.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
-  "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_partly_random.hex"
-  # Occupation Aware
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_occupation_aware.hex"
-  "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_occupation_aware.hex"
+  # Nordic nRF5340 Audio DK variants — TEMPORARILY DISABLED (le_audio_playground only).
+  # # Fully Random
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
+  # "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_fully_random.hex"
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_fully_random.hex"
+  # "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_fully_random.hex"
+  # # Partly Random
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_partly_random.hex"
+  # "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_nrf5340_audio_dk_5ms_liblc3_partly_random.hex"
+  # "grptlk_audio_receive|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_nrf5340_audio_dk_10ms_T2_partly_random.hex"
+  # # Occupation Aware
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y|grptlk_bcst_nrf5340_audio_dk_5ms_liblc3_occupation_aware.hex"
+  # "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y|grptlk_bcst_nrf5340_audio_dk_10ms_T2_occupation_aware.hex"
 
   # LE Audio Playground variants
   # Fully Random
@@ -49,27 +59,37 @@ BUILD_JOBS=(
   "grptlk_audio_broadcast|nrf5340_audio_dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_DOWNLINK_APPENDIX=y -DEXTRA_CONF_FILE=boards/nrf5340_audio_dk_nrf5340_cpuapp_le_audio_playground.conf -DEXTRA_DTC_OVERLAY_FILE=boards/nrf5340_audio_dk_nrf5340_cpuapp_le_audio_playground.overlay|grptlk_bcst_le_audio_playground_10ms_T2_occupation_aware.hex"
 )
 
-# nRF5340 DK (non-audio) — broadcaster only, 2ch (1 uplink BIS) only
-# With a single uplink BIS, uplink selection strategy is irrelevant — fully random only.
-# GRPTLK_RELAY defaults to y on this board.
-NRF5340DK_BUILD_JOBS=(
-  "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_5ms_liblc3.hex"
-  "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_10ms_T2.hex"
-)
+# nRF5340 DK (non-audio) — TEMPORARILY DISABLED (le_audio_playground only).
+# Originally: broadcaster only, 2ch (1 uplink BIS), GRPTLK_RELAY=y default.
+# NRF5340DK_BUILD_JOBS=(
+#   "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_5ms_liblc3.hex"
+#   "grptlk_audio_broadcast|nrf5340dk/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_INIT_LC3_CONSTANTLY=y|grptlk_bcst_nrf5340dk_10ms_T2.hex"
+# )
+NRF5340DK_BUILD_JOBS=()
 
-# rbv2h — recv only (no broadcaster ported)
-RBV2H_BUILD_JOBS=(
-  # Fully Random
-  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_5ms_liblc3_fully_random.hex"
-  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_10ms_T2_fully_random.hex"
-  # Partly Random
-  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_rbv2h_5ms_liblc3_partly_random.hex"
-  "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_rbv2h_10ms_T2_partly_random.hex"
-)
+# rbv2h — TEMPORARILY DISABLED (le_audio_playground only).
+# Originally: recv only (no broadcaster ported).
+# RBV2H_BUILD_JOBS=(
+#   # Fully Random
+#   "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_5ms_liblc3_fully_random.hex"
+#   "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y -DCONFIG_GRPTLK_UPLINK_RANDOM_PER_PTT=n -DCONFIG_GRPTLK_UPLINK_RANDOM=y|grptlk_recv_rbv2h_10ms_T2_fully_random.hex"
+#   # Partly Random
+#   "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_5_MS=y|grptlk_recv_rbv2h_5ms_liblc3_partly_random.hex"
+#   "grptlk_audio_receive|rbv2h/nrf5340/cpuapp|-DCONFIG_GRPTLK_AUDIO_FRAME_10_MS=y|grptlk_recv_rbv2h_10ms_T2_partly_random.hex"
+# )
+RBV2H_BUILD_JOBS=()
 
 log()  { echo "[grptlk] $*"; }
 info() { echo ""; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "$*"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; }
 fail() { echo "[ERROR] $*" >&2; exit 1; }
+
+timing_of_job() {
+  case "$1" in
+    *AUDIO_FRAME_5_MS=y*)  echo "5ms"  ;;
+    *AUDIO_FRAME_10_MS=y*) echo "10ms" ;;
+    *) fail "timing_of_job: cannot determine timing from '$1'" ;;
+  esac
+}
 
 check_tool() {
   command -v "$1" &>/dev/null || fail "'$1' not found in PATH. Ensure the nRF Connect toolchain is activated."
@@ -88,37 +108,41 @@ if [[ "${MISSING_ONLY}" == false ]]; then
 fi
 mkdir -p "${ALL_BINS_DIR}"
 
-# Count broadcaster jobs for total calculation
-BCST_COUNT=0
+# Total build count: broadcasters expand per channels_for_timing(timing); receivers built once.
+TOTAL=0
 for job in "${BUILD_JOBS[@]}"; do
-  IFS='|' read -r sn _ _ _ <<< "${job}"
-  [[ "${sn}" == "grptlk_audio_broadcast" ]] && ((BCST_COUNT++))
+  IFS='|' read -r sn _ extra _ <<< "${job}"
+  if [[ "${sn}" == "grptlk_audio_broadcast" ]]; then
+    read -ra chs <<< "$(channels_for_timing "$(timing_of_job "${extra}")")"
+    TOTAL=$(( TOTAL + ${#chs[@]} ))
+  else
+    TOTAL=$(( TOTAL + 1 ))
+  fi
 done
-RECV_COUNT=$(( ${#BUILD_JOBS[@]} - BCST_COUNT ))
-TOTAL=$(( BCST_COUNT * ${#CHANNELS[@]} + RECV_COUNT + ${#NRF5340DK_BUILD_JOBS[@]} + ${#RBV2H_BUILD_JOBS[@]} ))
+TOTAL=$(( TOTAL + ${#NRF5340DK_BUILD_JOBS[@]} + ${#RBV2H_BUILD_JOBS[@]} ))
 BUILT=()
 IDX=0
 
-for ch in "${CHANNELS[@]}"; do
-  for i in "${!BUILD_JOBS[@]}"; do
-    JOB="${BUILD_JOBS[$i]}"
+for JOB in "${BUILD_JOBS[@]}"; do
+  IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${JOB}"
+  TIMING="$(timing_of_job "${EXTRA_CMAKE}")"
 
-    IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${JOB}"
+  # Broadcaster fans out per timing's channel matrix; receiver builds once (NUM_CHAN-agnostic).
+  if [[ "${SAMPLE_NAME}" == "grptlk_audio_broadcast" ]]; then
+    read -ra JOB_CHANNELS <<< "$(channels_for_timing "${TIMING}")"
+  else
+    JOB_CHANNELS=("none")
+  fi
 
-    # Receiver built once (syncs to whatever BIG exists) — skip extra channel counts
-    if [[ "${SAMPLE_NAME}" != "grptlk_audio_broadcast" && "${ch}" != "5" ]]; then
-      continue
-    fi
-
+  for ch in "${JOB_CHANNELS[@]}"; do
     IDX=$((IDX + 1))
 
-    # Broadcaster: inject channel count flag and add _Xch suffix
-    # Receiver: keep original name, no channel flag (adapts to BIG)
-    if [[ "${SAMPLE_NAME}" == "grptlk_audio_broadcast" ]]; then
-      EXTRA_CMAKE="${EXTRA_CMAKE} -DCONFIG_GRPTLK_NUM_CHAN=${ch}"
-      OUTPUT_HEX="${BASE_HEX%.hex}_${ch}ch.hex"
-    else
+    if [[ "${ch}" == "none" ]]; then
+      EFFECTIVE_CMAKE="${EXTRA_CMAKE}"
       OUTPUT_HEX="${BASE_HEX}"
+    else
+      EFFECTIVE_CMAKE="${EXTRA_CMAKE} -DCONFIG_GRPTLK_NUM_CHAN=${ch}"
+      OUTPUT_HEX="${BASE_HEX%.hex}_${ch}ch.hex"
     fi
 
     SAMPLE_DIR="${SAMPLES_DIR}/${SAMPLE_NAME}"
@@ -130,7 +154,7 @@ for ch in "${CHANNELS[@]}"; do
       continue
     fi
 
-    info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=${ch}  ${EXTRA_CMAKE}  →  ${OUTPUT_HEX}"
+    info "[BUILD ${IDX}/${TOTAL}] ${SAMPLE_NAME}  board=${BOARD}  ch=${ch}  ${EFFECTIVE_CMAKE}  →  ${OUTPUT_HEX}"
 
     [[ -d "${SAMPLE_DIR}" ]] || fail "Sample directory not found: ${SAMPLE_DIR}"
 
@@ -140,7 +164,7 @@ for ch in "${CHANNELS[@]}"; do
         --pristine always \
         --board "${BOARD}" \
         --build-dir "${BUILD_DIR_NAME}" \
-        -- ${BOARD_ROOT_ARG} ${EXTRA_CMAKE}
+        -- ${BOARD_ROOT_ARG} ${EFFECTIVE_CMAKE}
     )
 
     HCI_HEX="${BUILD_DIR}/hci_ipc/zephyr/zephyr.hex"
@@ -157,7 +181,8 @@ for ch in "${CHANNELS[@]}"; do
   done
 done
 
-# nRF5340 DK — 2ch (1 uplink BIS) broadcaster only
+# nRF5340 DK — 2ch (1 uplink BIS) broadcaster only — TEMPORARILY DISABLED
+: <<'DISABLED'
 for job in "${NRF5340DK_BUILD_JOBS[@]}"; do
   IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${job}"
 
@@ -199,8 +224,10 @@ for job in "${NRF5340DK_BUILD_JOBS[@]}"; do
   log "Merged → ${OUT_HEX}"
   BUILT+=("${OUTPUT_HEX}")
 done
+DISABLED
 
-# rbv2h — recv only
+# rbv2h — recv only — TEMPORARILY DISABLED
+: <<'DISABLED'
 for job in "${RBV2H_BUILD_JOBS[@]}"; do
   IFS='|' read -r SAMPLE_NAME BOARD EXTRA_CMAKE BASE_HEX <<< "${job}"
 
@@ -241,6 +268,7 @@ for job in "${RBV2H_BUILD_JOBS[@]}"; do
   log "Merged → ${OUT_HEX}"
   BUILT+=("${OUTPUT_HEX}")
 done
+DISABLED
 
 info "Build complete — ${#BUILT[@]}/${TOTAL} binaries in all_bins/"
 
@@ -249,7 +277,9 @@ info "Build complete — ${#BUILT[@]}/${TOTAL} binaries in all_bins/"
 # ---------------------------------------------------------------------------
 info "Organizing binaries into per-device folders …"
 
-DEVICES=("nrf5340_audio_dk" "le_audio_playground")
+# TEMPORARILY scoped down — stock nrf5340_audio_dk disabled, playground only.
+DEVICES=("le_audio_playground")
+# DEVICES=("nrf5340_audio_dk" "le_audio_playground")
 TIMINGS=("5ms" "10ms")
 STRATEGIES=("fully_random" "partly_random" "occupation_aware")
 
@@ -274,12 +304,13 @@ timing_tag() {
 for device in "${DEVICES[@]}"; do
   for timing in "${TIMINGS[@]}"; do
     tag="$(timing_tag "${timing}")"
+    read -ra timing_chs <<< "$(channels_for_timing "${timing}")"
     for strategy in "${STRATEGIES[@]}"; do
       dest="${BINARIES_DIR}/${device}/${timing}/${strategy}"
       mkdir -p "${dest}"
 
       # Broadcaster — one binary per channel count
-      for ch in "${CHANNELS[@]}"; do
+      for ch in "${timing_chs[@]}"; do
         ch_tag="${ch}ch"
         bcst_src="$(find_bin "grptlk_bcst_${device}_${tag}_${strategy}_${ch_tag}.hex")"
         cp "${bcst_src}" "${dest}/bcst_${device}_${timing}_${strategy}_${ch_tag}.hex"
@@ -298,6 +329,8 @@ for device in "${DEVICES[@]}"; do
   done
 done
 
+# nRF5340 DK + rbv2h organize — TEMPORARILY DISABLED
+: <<'DISABLED'
 # nRF5340 DK — bcst only, 2ch only, no strategy subfolder (strategy irrelevant with 1 uplink BIS)
 for timing in "${TIMINGS[@]}"; do
   tag="$(timing_tag "${timing}")"
@@ -327,6 +360,7 @@ for timing in "${TIMINGS[@]}"; do
     log "  rbv2h/${timing}/${strategy}  ✓"
   done
 done
+DISABLED
 
 # ---------------------------------------------------------------------------
 # Final summary
@@ -354,6 +388,8 @@ for device in "${DEVICES[@]}"; do
     done
   done
 done
+# nrf5340dk + rbv2h summary — TEMPORARILY DISABLED
+: <<'DISABLED'
 for timing in "${TIMINGS[@]}"; do
   printf "    nrf5340dk/%s/\n" "${timing}"
   for hex in "${BINARIES_DIR}/nrf5340dk/${timing}"/*.hex; do
@@ -368,4 +404,5 @@ for timing in "${TIMINGS[@]}"; do
     done
   done
 done
+DISABLED
 echo ""
