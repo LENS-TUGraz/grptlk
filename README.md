@@ -1,6 +1,6 @@
-# GRPTLK Audio Workspace
+# GRPTLK/COYOTE Audio Workspace
 
-This repository is the west manifest and sample workspace for the GRPTLK audio setup. It contains the GRPTLK audio broadcaster and receiver samples, prebuilt nRF5340 Audio DK binaries, the flashing helper script, and short mode descriptions in `docs/`.
+This repository is the west manifest and sample workspace for the GRPTLK/COYOTE audio setup. It contains the GRPTLK audio broadcaster and receiver samples, prebuilt nRF5340 Audio DK binaries, the flashing helper script, and short mode descriptions in `docs/`.
 
 ## Workspace Setup
 
